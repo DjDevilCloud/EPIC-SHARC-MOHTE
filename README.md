@@ -1,4 +1,4 @@
-# EPIC-SHARC MOHTE v0.1.0 Current Status: Early but functional research prototype.
+# EPIC-SHARC MOHTE v0.1.0.
 
 Emitter Prismal Instructional Core with Signature-Hierarchy Attention Routing Cache + Mixture of Hierarchical Toroidal Experts.
 
