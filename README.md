@@ -55,6 +55,7 @@ For the detailed architecture writeup, see [`ARCHITECTUREOVERVIEW.md`](./ARCHITE
 ## Default Configuration
 
 The default runtime configuration lives in [`config.py`](./config.py) via `PrismalWaveConfig`.
+NOTE: The default config is turned down on purpose to be lighter, you will want to turn up hmote_depth, hmote_branching, hierarchical_nest_depth, and recursive_hmoe_depth for the deeper levels.
 
 Key defaults:
 
