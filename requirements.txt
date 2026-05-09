@@ -1,0 +1,11 @@
+numpy
+torch
+
+# Optional features used by some data paths and utilities.
+# Install these if you want the broader dataset and precision feature set:
+# - bitsandbytes: leaf precision / quantization paths
+# - pyarrow: parquet corpus support
+# - pandas: parquet fallback and dataset utilities
+# pandas
+# pyarrow
+# bitsandbytes

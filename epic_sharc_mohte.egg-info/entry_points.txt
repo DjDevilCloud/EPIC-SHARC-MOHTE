@@ -1,0 +1,3 @@
+[console_scripts]
+epic-sharc-mohte = cli:main
+epic-sharc-mohte-gui = gui:main
