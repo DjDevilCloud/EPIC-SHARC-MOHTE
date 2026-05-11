@@ -1,6 +1,6 @@
 # EPIC-SHARC MOHTE v0.1.1.
 
-This project is my attempt at improving the current AI architecture paradigm of current RNN, Transformer and Mamba stacks. It is an early research prototype but is fully trainable.
+This project is my attempt at improving the current AI architecture paradigm of RNN, Transformer and Mamba stacks. It is an early research prototype but is fully trainable.
 
 Emitter Prismal Instructional Core with Signature-Hierarchy Attention Routing Cache + Mixture of Hierarchical Toroidal Experts.
 
