@@ -88,23 +88,31 @@ class PrismalWaveConfig:
     mot_expert_scale: float = 0.05
     mot_routing_temperature: float = 0.65
     use_topk_mot: bool = True
-    mot_top_k: int = 4
+    mot_top_k: int = 8
     use_signature_lattice_attention: bool = True
-    signature_lattice_dim: int = 512
-    signature_lattice_buckets: int = 32
-    signature_lattice_candidates: int = 4
+    signature_lattice_dim: int = 256
+    signature_lattice_buckets: int = 16
+    signature_lattice_candidates: int = 24
     signature_lattice_weight: float = 0.28
     signature_lattice_decay: float = 0.85
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
     use_token_memory_cross_attention: bool = True
-    use_token_memory_generation_cache: bool = True
+    use_token_memory_generation_cache: bool = False
     token_memory_window: int = 96
-    token_memory_top_k: int = 8
+    token_memory_top_k: int = 4
     token_memory_weight: float = 0.18
     token_memory_copy_bias: float = 0.75
     token_memory_rare_token_cutoff: int = 2
     token_memory_copy_min_confidence: float = 0.35
+    use_token_copy_cross_attention: bool = True
+    use_token_copy_generation_cache: bool = True
+    token_copy_window: int = 96
+    token_copy_top_k: int = 4
+    token_copy_weight: float = 0.18
+    token_copy_bias_strength: float = 0.75
+    token_copy_rare_token_cutoff: int = 2
+    token_copy_min_confidence: float = 0.35
     use_pronunciation_signatures: bool = True
     hierarchical_tier_char_weight: float = 1.00
     hierarchical_tier_piece_weight: float = 0.25
@@ -124,9 +132,9 @@ class PrismalWaveConfig:
     recursive_hmoe_balance_weight: float = 0.18
     recursive_hmoe_child_mixture_weight: float = 0.20
     recursive_hmoe_agreement_weight: float = 0.12
-    torus_depth: int = 4
-    torus_height: int = 4
-    torus_width: int = 4
+    torus_depth: int = 3
+    torus_height: int = 3
+    torus_width: int = 3
     torus_local_field_radius: int = 1
     torus_global_bus_slots: int = 4
     torus_global_bus_decay: float = 0.92
@@ -206,6 +214,28 @@ class PrismalWaveConfig:
     eos_id: int = 2
 
     def __post_init__(self) -> None:
+        def _sync_alias(canonical_name: str, alias_name: str) -> None:
+            fields = type(self).__dataclass_fields__
+            canonical_default = fields[canonical_name].default
+            alias_default = fields[alias_name].default
+            canonical_value = getattr(self, canonical_name)
+            alias_value = getattr(self, alias_name)
+            if canonical_value != canonical_default:
+                setattr(self, alias_name, canonical_value)
+            elif alias_value != alias_default:
+                setattr(self, canonical_name, alias_value)
+                setattr(self, alias_name, alias_value)
+            else:
+                setattr(self, alias_name, canonical_value)
+
+        _sync_alias("use_token_memory_cross_attention", "use_token_copy_cross_attention")
+        _sync_alias("use_token_memory_generation_cache", "use_token_copy_generation_cache")
+        _sync_alias("token_memory_window", "token_copy_window")
+        _sync_alias("token_memory_top_k", "token_copy_top_k")
+        _sync_alias("token_memory_weight", "token_copy_weight")
+        _sync_alias("token_memory_copy_bias", "token_copy_bias_strength")
+        _sync_alias("token_memory_rare_token_cutoff", "token_copy_rare_token_cutoff")
+        _sync_alias("token_memory_copy_min_confidence", "token_copy_min_confidence")
         if self.hmote_depth <= 0:
             self.hmote_depth = 1
         if self.hmote_branching <= 0:
@@ -257,6 +287,8 @@ class PrismalWaveConfig:
         self.use_signature_lattice_generation_cache = bool(self.use_signature_lattice_generation_cache)
         self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
         self.use_token_memory_generation_cache = bool(self.use_token_memory_generation_cache)
+        self.use_token_copy_cross_attention = bool(self.use_token_copy_cross_attention)
+        self.use_token_copy_generation_cache = bool(self.use_token_copy_generation_cache)
         if self.signature_lattice_dim < 1:
             self.signature_lattice_dim = 256
         if self.signature_lattice_buckets < 1:
@@ -285,6 +317,14 @@ class PrismalWaveConfig:
             self.token_memory_copy_min_confidence = 0.0
         if self.token_memory_copy_min_confidence > 1.0:
             self.token_memory_copy_min_confidence = 1.0
+        self.token_copy_window = self.token_memory_window
+        self.token_copy_top_k = self.token_memory_top_k
+        self.token_copy_weight = self.token_memory_weight
+        self.token_copy_bias_strength = self.token_memory_copy_bias
+        self.token_copy_rare_token_cutoff = self.token_memory_rare_token_cutoff
+        self.token_copy_min_confidence = self.token_memory_copy_min_confidence
+        self.use_token_copy_cross_attention = self.use_token_memory_cross_attention
+        self.use_token_copy_generation_cache = self.use_token_memory_generation_cache
         if self.torus_local_field_radius < 1:
             self.torus_local_field_radius = 1
         if self.torus_global_bus_slots < 1:
