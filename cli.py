@@ -179,6 +179,18 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--use-signature-lattice-generation-cache", dest="use_signature_lattice_generation_cache", action="store_true")
         p.add_argument("--no-signature-lattice-generation-cache", dest="use_signature_lattice_generation_cache", action="store_false")
         p.set_defaults(use_signature_lattice_generation_cache=default_cfg.use_signature_lattice_generation_cache)
+        p.add_argument("--use-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_true")
+        p.add_argument("--no-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_false")
+        p.set_defaults(use_token_memory_cross_attention=default_cfg.use_token_memory_cross_attention)
+        p.add_argument("--use-token-memory-generation-cache", dest="use_token_memory_generation_cache", action="store_true")
+        p.add_argument("--no-token-memory-generation-cache", dest="use_token_memory_generation_cache", action="store_false")
+        p.set_defaults(use_token_memory_generation_cache=default_cfg.use_token_memory_generation_cache)
+        p.add_argument("--token-memory-window", type=int, default=default_cfg.token_memory_window)
+        p.add_argument("--token-memory-top-k", type=int, default=default_cfg.token_memory_top_k)
+        p.add_argument("--token-memory-weight", type=float, default=default_cfg.token_memory_weight)
+        p.add_argument("--token-memory-copy-bias", type=float, default=default_cfg.token_memory_copy_bias)
+        p.add_argument("--token-memory-rare-token-cutoff", type=int, default=default_cfg.token_memory_rare_token_cutoff)
+        p.add_argument("--token-memory-copy-min-confidence", type=float, default=default_cfg.token_memory_copy_min_confidence)
         p.add_argument("--use-pronunciation-signatures", dest="use_pronunciation_signatures", action="store_true")
         p.add_argument("--no-pronunciation-signatures", dest="use_pronunciation_signatures", action="store_false")
         p.set_defaults(use_pronunciation_signatures=default_cfg.use_pronunciation_signatures)
@@ -451,6 +463,14 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         signature_lattice_decay=getattr(args, "signature_lattice_decay", default_cfg.signature_lattice_decay),
         signature_lattice_chunk_len=getattr(args, "signature_lattice_chunk_len", default_cfg.signature_lattice_chunk_len),
         use_signature_lattice_generation_cache=getattr(args, "use_signature_lattice_generation_cache", default_cfg.use_signature_lattice_generation_cache),
+        use_token_memory_cross_attention=getattr(args, "use_token_memory_cross_attention", default_cfg.use_token_memory_cross_attention),
+        use_token_memory_generation_cache=getattr(args, "use_token_memory_generation_cache", default_cfg.use_token_memory_generation_cache),
+        token_memory_window=getattr(args, "token_memory_window", default_cfg.token_memory_window),
+        token_memory_top_k=getattr(args, "token_memory_top_k", default_cfg.token_memory_top_k),
+        token_memory_weight=getattr(args, "token_memory_weight", default_cfg.token_memory_weight),
+        token_memory_copy_bias=getattr(args, "token_memory_copy_bias", default_cfg.token_memory_copy_bias),
+        token_memory_rare_token_cutoff=getattr(args, "token_memory_rare_token_cutoff", default_cfg.token_memory_rare_token_cutoff),
+        token_memory_copy_min_confidence=getattr(args, "token_memory_copy_min_confidence", default_cfg.token_memory_copy_min_confidence),
         use_pronunciation_signatures=getattr(args, "use_pronunciation_signatures", default_cfg.use_pronunciation_signatures),
         use_speculative_decoding=args.use_speculative_decoding,
         speculative_draft_tokens=args.speculative_draft_tokens,

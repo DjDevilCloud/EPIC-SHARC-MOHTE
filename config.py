@@ -32,12 +32,12 @@ class PrismalWaveConfig:
     muon_momentum_beta: float = 0.95
     muon_nesterov: bool = True
     muon_ns_steps: int = 8
-    muon_extra_scale_factor: float = 1.0
+    muon_extra_scale_factor: float = 0.5
     muon_scalar_optimizer: str = "adamw"
-    d_model: int = 1024
+    d_model: int = 512
     n_layers: int = 1
-    n_emitters: int = 4096
-    n_slots: int = 2048
+    n_emitters: int = 256
+    n_slots: int = 128
     n_paths: int = 1
     top_k_emitters: int = 8
     top_k_slots: int = 4
@@ -46,7 +46,7 @@ class PrismalWaveConfig:
     dropout: float = 0.005
     ff_mult: int = 4
     use_factorized_embedding: bool = True
-    factorized_embedding_dim: int = 2048
+    factorized_embedding_dim: int = 256
     use_turbo_quantization: bool = False
     turbo_quantization_bits: int = 3
     turbo_quantization_method: str = "turbo"
@@ -65,7 +65,7 @@ class PrismalWaveConfig:
     hmote_branching: int = 1
     hierarchical_nest_depth: int = 1
     hierarchical_child_torus_scale: float = 0.125
-    hierarchical_leaf_torus_size: int = 1
+    hierarchical_leaf_torus_size: int = 0.125
     hierarchical_byte_tier: bool = True
     hierarchical_d_model_scale: float = 0.5
     hierarchical_min_d_model: int = 64
@@ -74,59 +74,67 @@ class PrismalWaveConfig:
     hierarchical_recursive_depth_scale: float = 0.25
     hierarchical_fixed_point_scale: float = 0.25
     per_family_torus_enabled: bool = True
-    per_family_torus_scale: float = 0.25
-    family_specialist_d_model: int = 1024
-    family_specialist_gate_threshold: float = 0.15
+    per_family_torus_scale: float = 0.5
+    family_specialist_d_model: int = 256
+    family_specialist_gate_threshold: float = 0.12
     leaf_cell_enabled: bool = True
-    leaf_cell_dim: int = 128
-    leaf_router_confidence_threshold: float = 0.95
-    max_families_per_nest: int = 12
-    family_budget: int = 12
-    family_specialist_bank_size: int = 4
+    leaf_cell_dim: int = 64
+    leaf_router_confidence_threshold: float = 0.75
+    max_families_per_nest: int = 16
+    family_budget: int = 16
+    family_specialist_bank_size: int = 6
     use_mixture_of_torus: bool = True
-    mot_num_experts: int = 8
+    mot_num_experts: int = 4
     mot_expert_scale: float = 0.05
-    mot_routing_temperature: float = 0.8
+    mot_routing_temperature: float = 0.65
     use_topk_mot: bool = True
-    mot_top_k: int = 2
+    mot_top_k: int = 4
     use_signature_lattice_attention: bool = True
-    signature_lattice_dim: int = 1024
+    signature_lattice_dim: int = 512
     signature_lattice_buckets: int = 32
     signature_lattice_candidates: int = 4
     signature_lattice_weight: float = 0.28
     signature_lattice_decay: float = 0.85
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
+    use_token_memory_cross_attention: bool = True
+    use_token_memory_generation_cache: bool = True
+    token_memory_window: int = 96
+    token_memory_top_k: int = 8
+    token_memory_weight: float = 0.18
+    token_memory_copy_bias: float = 0.75
+    token_memory_rare_token_cutoff: int = 2
+    token_memory_copy_min_confidence: float = 0.35
     use_pronunciation_signatures: bool = True
     hierarchical_tier_char_weight: float = 1.00
-    hierarchical_tier_piece_weight: float = 0.82
-    hierarchical_tier_word_weight: float = 0.62
-    hierarchical_tier_phrase_weight: float = 0.44
-    hierarchical_tier_line_weight: float = 0.26
-    hierarchical_tier_special_weight: float = 0.16
-    hierarchical_leaf_char_boost: float = 1.10
-    hierarchical_leaf_piece_boost: float = 1.10
+    hierarchical_tier_piece_weight: float = 0.25
+    hierarchical_tier_word_weight: float = 0.85
+    hierarchical_tier_phrase_weight: float = 0.15
+    hierarchical_tier_line_weight: float = 0.05
+    hierarchical_tier_special_weight: float = 0.15
+    hierarchical_leaf_char_boost: float = 1.05
+    hierarchical_leaf_piece_boost: float = 1.05
     recursive_hmoe_depth: int = 1
     recursive_hmoe_branching: int = 1
-    recursive_hmoe_coarse_top_k: int = 4
-    recursive_hmoe_fine_top_k: int = 8
-    recursive_hmoe_child_torus_depth: int = 2
-    recursive_hmoe_child_torus_height: int = 2
-    recursive_hmoe_child_torus_width: int = 2
-    recursive_hmoe_balance_weight: float = 0.08
-    recursive_hmoe_child_mixture_weight: float = 0.08
-    recursive_hmoe_agreement_weight: float = 0.08
+    recursive_hmoe_coarse_top_k: int = 12
+    recursive_hmoe_fine_top_k: int = 12
+    recursive_hmoe_child_torus_depth: int = 1
+    recursive_hmoe_child_torus_height: int = 1
+    recursive_hmoe_child_torus_width: int = 1
+    recursive_hmoe_balance_weight: float = 0.18
+    recursive_hmoe_child_mixture_weight: float = 0.20
+    recursive_hmoe_agreement_weight: float = 0.12
     torus_depth: int = 4
     torus_height: int = 4
     torus_width: int = 4
     torus_local_field_radius: int = 1
-    torus_global_bus_slots: int = 128
+    torus_global_bus_slots: int = 4
     torus_global_bus_decay: float = 0.92
     torus_global_bus_write_scale: float = 0.32
     torus_write_radius: int = 2
     torus_scout_read_radius: int = 4
-    torus_transport: float = 0.15
-    torus_write_strength: float = 0.65
+    torus_transport: float = 0.25
+    torus_write_strength: float = 0.95
     torus_relay_write_radius: int = 2
     torus_inner_temperature: float = 0.20
     torus_outer_temperature: float = 1.00
@@ -136,11 +144,11 @@ class PrismalWaveConfig:
     torus_relay_temperature_1: float = 0.20
     torus_relay_temperature_2: float = 0.40
     torus_relay_temperature_3: float = 0.80
-    torus_activity_threshold: float = 0.016
-    torus_active_target_fraction: float = 0.65
-    torus_active_balance_weight: float = 0.25
+    torus_activity_threshold: float = 0.25
+    torus_active_target_fraction: float = 0.75
+    torus_active_balance_weight: float = 0.3
     use_torus_race_lanes: bool = True
-    torus_lane_count: int = 2
+    torus_lane_count: int = 1
     torus_scout_density: float = 0.85
     torus_lane_select_threshold_1: float = 0.45
     torus_lane_select_threshold_2: float = 0.70
@@ -150,11 +158,11 @@ class PrismalWaveConfig:
     torus_chunk_len: int = 16
     use_fixed_point_solver: bool = True
     use_chunk_solver_training: bool = False
-    chunk_solver_training_iterations: int = 2
+    chunk_solver_training_iterations: int = 1
     chunk_solver_training_relaxation: float = 1.0
-    chunk_solver_training_substeps: int = 12
+    chunk_solver_training_substeps: int = 8
     chunk_solver_training_audit_every: int = 18
-    fixed_point_iterations: int = 2
+    fixed_point_iterations: int = 1
     fixed_point_tolerance: float = 1e-4
     fixed_point_relaxation: float = 0.002
     emitter_family_share: float = 0.0001
@@ -176,9 +184,9 @@ class PrismalWaveConfig:
     path_noise: float = 0.005
     torus_weight: float = 0.35
     frequency_weight: float = 0.75
-    signature_loss_weight: float = 0.25
+    signature_loss_weight: float = 0.35
     signature_level_loss_weight: float = 0.25
-    signature_relation_loss_weight: float = 0.15
+    signature_relation_loss_weight: float = 0.25
     signature_contrastive_weight: float = 0.95
     routing_entropy_weight: float = 0.1
     diversity_weight: float = 0.15
@@ -247,6 +255,8 @@ class PrismalWaveConfig:
             self.mot_top_k = 1
         self.use_signature_lattice_attention = bool(self.use_signature_lattice_attention)
         self.use_signature_lattice_generation_cache = bool(self.use_signature_lattice_generation_cache)
+        self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
+        self.use_token_memory_generation_cache = bool(self.use_token_memory_generation_cache)
         if self.signature_lattice_dim < 1:
             self.signature_lattice_dim = 256
         if self.signature_lattice_buckets < 1:
@@ -261,6 +271,20 @@ class PrismalWaveConfig:
             self.signature_lattice_decay = 1.0
         if self.signature_lattice_chunk_len < 1:
             self.signature_lattice_chunk_len = 8
+        if self.token_memory_window < 1:
+            self.token_memory_window = 32
+        if self.token_memory_top_k < 1:
+            self.token_memory_top_k = 4
+        if self.token_memory_weight < 0.0:
+            self.token_memory_weight = 0.0
+        if self.token_memory_copy_bias < 0.0:
+            self.token_memory_copy_bias = 0.0
+        if self.token_memory_rare_token_cutoff < 0:
+            self.token_memory_rare_token_cutoff = 0
+        if self.token_memory_copy_min_confidence < 0.0:
+            self.token_memory_copy_min_confidence = 0.0
+        if self.token_memory_copy_min_confidence > 1.0:
+            self.token_memory_copy_min_confidence = 1.0
         if self.torus_local_field_radius < 1:
             self.torus_local_field_radius = 1
         if self.torus_global_bus_slots < 1:
