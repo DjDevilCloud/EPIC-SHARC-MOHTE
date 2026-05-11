@@ -1,0 +1,7 @@
+EPIC-SHARC MOHTE quickstart sample.
+
+This tiny corpus exists so the README, CLI help text, and pretokenize demo point at a real shipped path.
+
+A torus is a donut-shaped surface. In this project, torus routing and hierarchy-aware memory are the main ideas being exercised.
+
+Use this folder for the quickstart, then replace it with your own corpus for actual experiments.

@@ -34,7 +34,7 @@ class PrismalWaveConfig:
     muon_ns_steps: int = 8
     muon_extra_scale_factor: float = 0.5
     muon_scalar_optimizer: str = "adamw"
-    d_model: int = 512
+    d_model: int = 1024
     n_layers: int = 1
     n_emitters: int = 256
     n_slots: int = 128
@@ -65,7 +65,7 @@ class PrismalWaveConfig:
     hmote_branching: int = 1
     hierarchical_nest_depth: int = 1
     hierarchical_child_torus_scale: float = 0.125
-    hierarchical_leaf_torus_size: int = 0.125
+    hierarchical_leaf_torus_size: int = 2
     hierarchical_byte_tier: bool = True
     hierarchical_d_model_scale: float = 0.5
     hierarchical_min_d_model: int = 64
@@ -98,7 +98,7 @@ class PrismalWaveConfig:
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
     use_token_memory_cross_attention: bool = True
-    use_token_memory_generation_cache: bool = True
+    use_token_memory_generation_cache: bool = False
     token_memory_window: int = 96
     token_memory_top_k: int = 4
     token_memory_weight: float = 0.18
@@ -106,7 +106,7 @@ class PrismalWaveConfig:
     token_memory_rare_token_cutoff: int = 2
     token_memory_copy_min_confidence: float = 0.35
     use_token_copy_cross_attention: bool = True
-    use_token_copy_generation_cache: bool = True
+    use_token_copy_generation_cache: bool = False
     token_copy_window: int = 96
     token_copy_top_k: int = 4
     token_copy_weight: float = 0.18
@@ -247,7 +247,7 @@ class PrismalWaveConfig:
         if self.hierarchical_child_torus_scale <= 0:
             self.hierarchical_child_torus_scale = 0.5
         if self.hierarchical_leaf_torus_size < 2:
-            self.hierarchical_leaf_torus_size = 2
+            raise ValueError("hierarchical_leaf_torus_size must be at least 2")
         if self.hierarchical_d_model_scale <= 0:
             self.hierarchical_d_model_scale = 0.5
         if self.hierarchical_min_d_model < 1:

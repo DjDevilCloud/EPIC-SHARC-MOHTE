@@ -320,7 +320,9 @@ class HierarchicalParameterNest(nn.Module):
             ),
         )
         self.child_torus_scale = float(getattr(cfg, "hierarchical_child_torus_scale", 0.5))
-        self.leaf_size = max(2, getattr(cfg, "hierarchical_leaf_torus_size", 4))
+        self.leaf_size = int(getattr(cfg, "hierarchical_leaf_torus_size", 4))
+        if self.leaf_size < 2:
+            raise ValueError("hierarchical_leaf_torus_size must be at least 2")
         self.byte_tier = bool(getattr(cfg, "hierarchical_byte_tier", True))
         self.is_leaf_nest = self.level >= self.hierarchical_depth - 1
         dim_scale = float(getattr(cfg, "hierarchical_d_model_scale", 0.5))

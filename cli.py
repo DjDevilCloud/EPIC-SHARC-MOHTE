@@ -47,7 +47,10 @@ except ImportError:  # pragma: no cover - supports direct script launching.
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="EPIC-SHARC MOHTE", description="Standalone Prismal Torus prototype")
+    parser = argparse.ArgumentParser(
+        prog="EPIC-SHARC MOHTE",
+        description="Standalone Prismal Torus prototype. Quickstart sample data lives in demo/corpus/",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     default_cfg = PrismalWaveConfig()
@@ -279,7 +282,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(profile_runtime=default_cfg.profile_runtime)
 
     train_p = sub.add_parser("train", help="Train on a text corpus")
-    train_p.add_argument("--data", required=True, help="File or directory of txt/jsonl/parquet data")
+    train_p.add_argument(
+        "--data",
+        required=True,
+        help="File or directory of txt/jsonl/parquet data; try demo/corpus/ for the shipped quickstart sample",
+    )
     train_p.add_argument("--save-dir", required=True)
     train_p.add_argument("--resume-checkpoint", default="", help="Path to an existing model.pt to continue training from")
     train_p.add_argument("--continue-checkpoint", default="", help="Path to an existing model.pt to initialize weights from without resuming optimizer state")
@@ -358,7 +365,11 @@ def build_parser() -> argparse.ArgumentParser:
     infer_p.set_defaults(torch_compile=True)
 
     bench_p = sub.add_parser("benchmark", help="Benchmark training/inference throughput")
-    bench_p.add_argument("--data", required=True)
+    bench_p.add_argument(
+        "--data",
+        required=True,
+        help="File or directory of txt/jsonl/parquet data; try demo/corpus/ for the shipped quickstart sample",
+    )
     bench_p.add_argument("--steps", type=int, default=16)
     bench_p.add_argument("--batch-size", type=int, default=8)
     bench_p.add_argument("--seq-len", type=int, default=128)

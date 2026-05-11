@@ -502,8 +502,14 @@ def pretokenize_corpus(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Pre-tokenize a txt/jsonl/parquet corpus into memmap windows.")
-    parser.add_argument("--data", required=True, help="Path to a txt, md, jsonl, parquet file, or directory")
+    parser = argparse.ArgumentParser(
+        description="Pre-tokenize a txt/jsonl/parquet corpus into memmap windows. Try demo/corpus/ for the shipped sample."
+    )
+    parser.add_argument(
+        "--data",
+        required=True,
+        help="Path to a txt, md, jsonl, parquet file, or directory; demo/corpus/ is the shipped quickstart sample",
+    )
     parser.add_argument("--output-dir", default="pretokenized")
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--max-samples", type=int, default=0)

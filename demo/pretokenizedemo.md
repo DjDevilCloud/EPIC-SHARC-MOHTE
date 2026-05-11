@@ -1,10 +1,18 @@
 # Pretokenize Demo
 
-This folder is a tiny release-safe starting point for trying the repo without bundling any dataset.
+This folder ships the tiny release-safe corpus used by the quickstart, so the repo works without any extra setup.
 
 ## What To Put Here
 
-Create a small local corpus anywhere you like, or keep it inside this folder if you prefer. A simple layout is:
+The shipped sample corpus lives here:
+
+```text
+demo/
+  corpus/
+    tiny_example.txt
+```
+
+If you want to swap in your own data, keep the same folder layout:
 
 ```text
 demo/
@@ -41,6 +49,6 @@ After that, point training at the pretokenized output if that fits your workflow
 
 ## Notes
 
-- No sample dataset is shipped with the repository.
+- The shipped sample dataset is `demo/corpus/tiny_example.txt`.
 - The UI and CLI both work with a folder of raw text files.
 - Pretokenization is optional, not required.
