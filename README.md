@@ -1,4 +1,4 @@
-# EPIC-SHARC MOHTE v0.1.0.
+# EPIC-SHARC MOHTE v0.1.1.
 
 Emitter Prismal Instructional Core with Signature-Hierarchy Attention Routing Cache + Mixture of Hierarchical Toroidal Experts.
 
@@ -49,7 +49,7 @@ flowchart LR
     F --> O["Output heads<br/>(logits, signature level/relation, route stats)"]
     O --> P["Generation or training loss"]
 ```
-
+**NOTE** v0.1.1 added token cross-attention. This has not been updated in all of the documents yet.
 For the detailed architecture writeup, see [`ARCHITECTUREOVERVIEW.md`](./ARCHITECTUREOVERVIEW.md).
 
 ## Default Configuration
