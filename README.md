@@ -1,4 +1,4 @@
-# EPIC-SHARC MOHTE v0.1.0.
+# EPIC-SHARC MOHTE v0.1.1.
 
 Emitter Prismal Instructional Core with Signature-Hierarchy Attention Routing Cache + Mixture of Hierarchical Toroidal Experts.
 
@@ -49,30 +49,13 @@ flowchart LR
     F --> O["Output heads<br/>(logits, signature level/relation, route stats)"]
     O --> P["Generation or training loss"]
 ```
-
+**NOTE** v0.1.1 added token cross-attention. This has not been updated in all of the documents yet.
 For the detailed architecture writeup, see [`ARCHITECTUREOVERVIEW.md`](./ARCHITECTUREOVERVIEW.md).
 
 ## Default Configuration
 
 The default runtime configuration lives in [`config.py`](./config.py) via `PrismalWaveConfig`.
-NOTE: The default config is turned down on purpose to be lighter, you will want to turn up hmote_depth, hmote_branching, hierarchical_nest_depth, and recursive_hmoe_depth for the deeper levels.
-
-Key defaults:
-
-- `d_model = 1024`
-- `n_layers = 1`
-- `n_emitters = 4096`
-- `n_slots = 2048`
-- `n_paths = 1`
-- `use_factorized_embedding = true`
-- `use_turbo_quantization = false`
-- `use_torus_core = true`
-- `use_hmote = true`
-- `use_recursive_hmoe = true`
-- `use_signature_lattice_attention = true`
-- `use_signature_lattice_generation_cache = true`
-- `use_torus_race_lanes = true`
-- `use_speculative_decoding = true`
+NOTE: The default config is turned down on purpose to be lighter, you will want to turn up hmote_depth, hmote_branching, hierarchical_nest_depth, and recursive_hmoe_depth for the deeper levels. You may want to add more emitters and slots if you have the room. The architecture is highly configurable. On small datasets I have been able to hit almost 3B parameters full training on a single 12GB 40 series NVIDIA card.
 
 ## Core Modules
 
