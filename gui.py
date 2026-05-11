@@ -96,8 +96,10 @@ class PrismalWaveGUI(tk.Tk):
         self.resume_var = tk.StringVar(value="")
         self.save_dir_var = tk.StringVar(value="")
         self.epochs_var = tk.StringVar(value="1")
+        self.steps_var = tk.StringVar(value="200")
         self.batch_var = tk.StringVar(value="2")
         self.max_samples_var = tk.StringVar(value=str(DEFAULT_CFG.max_samples))
+        self.dataset_streaming_var = tk.BooleanVar(value=True)
         self.tokenizer_workers_var = tk.StringVar(value="1")
         self.lr_var = tk.StringVar(value=str(DEFAULT_CFG.lr))
         self.optimizer_var = tk.StringVar(value=DEFAULT_CFG.optimizer)
@@ -154,7 +156,15 @@ class PrismalWaveGUI(tk.Tk):
         self.after(100, self._poll_queue)
 
     def _bind_traces(self) -> None:
-        for var in (self.dataset_var, self.resume_var, self.epochs_var, self.batch_var, self.max_samples_var):
+        for var in (
+            self.dataset_var,
+            self.resume_var,
+            self.epochs_var,
+            self.steps_var,
+            self.batch_var,
+            self.max_samples_var,
+            self.dataset_streaming_var,
+        ):
             var.trace_add("write", lambda *_: self._refresh_run_dir())
 
     def _build_ui(self) -> None:
@@ -224,6 +234,7 @@ class PrismalWaveGUI(tk.Tk):
             params,
             [
                 ("Epochs", self.epochs_var),
+                ("Steps per epoch", self.steps_var),
                 ("Batch size", self.batch_var),
                 ("Max samples", self.max_samples_var),
                 ("Tokenizer workers", self.tokenizer_workers_var),
@@ -232,6 +243,11 @@ class PrismalWaveGUI(tk.Tk):
                 ("Min token freq", self.min_token_frequency_var),
             ],
         )
+        ttk.Checkbutton(
+            params,
+            text="Dataset Streaming",
+            variable=self.dataset_streaming_var,
+        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         opt_box = ttk.LabelFrame(tab, text="Optimizer", padding=8)
         opt_box.pack(fill="x", pady=(10, 0))
@@ -445,7 +461,10 @@ class PrismalWaveGUI(tk.Tk):
         source = _source_name(self.dataset_var.get())
         mode = "continue" if self.resume_var.get().strip() else "fresh"
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_name = _slugify(f"{source}_{mode}_bs{self.batch_var.get().strip() or '0'}_ep{self.epochs_var.get().strip() or '0'}_ms{self.max_samples_var.get().strip() or '0'}_{stamp}")
+        run_name = _slugify(
+            f"{source}_{mode}_bs{self.batch_var.get().strip() or '0'}_ep{self.epochs_var.get().strip() or '0'}"
+            f"_st{self.steps_var.get().strip() or '0'}_ms{self.max_samples_var.get().strip() or '0'}_{stamp}"
+        )
         self.save_dir_var.set(str(_unique_dir(CHECKPOINTS_DIR / run_name)))
 
     def _clear_log(self) -> None:
@@ -484,6 +503,8 @@ class PrismalWaveGUI(tk.Tk):
             str(save_dir),
             "--epochs",
             self.epochs_var.get().strip() or "0",
+            "--steps",
+            self.steps_var.get().strip() or "200",
             "--batch-size",
             self.batch_var.get().strip() or "1",
             "--max-samples",
@@ -510,6 +531,7 @@ class PrismalWaveGUI(tk.Tk):
             self.val_fraction_var.get().strip() or "0.1",
             "--min-token-frequency",
             self.min_token_frequency_var.get().strip() or "2",
+            "--dataset-streaming" if self.dataset_streaming_var.get() else "--no-dataset-streaming",
             "--post-prompt",
             self.post_prompt_var.get().strip(),
             "--post-output",

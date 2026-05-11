@@ -26,6 +26,7 @@ try:
         TextWindowDataset,
         build_collate_fn,
         _find_answer_start,
+        load_text_corpus,
         iter_text_corpus,
         split_text_window_dataset,
     )
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - supports direct script launching.
         TextWindowDataset,
         build_collate_fn,
         _find_answer_start,
+        load_text_corpus,
         iter_text_corpus,
         split_text_window_dataset,
     )
@@ -252,10 +254,7 @@ class ProgressTracker:
         done_batches = completed_batches if completed_batches is not None else (epoch_idx - 1) * self.batches_per_epoch + batch_idx
         elapsed = max(now - self.start_time, 1e-6)
         rate = done_batches / elapsed
-        timing_text = ""
-        if timings:
-            top_timings = sorted(timings.items(), key=lambda item: item[1], reverse=True)[:3]
-            timing_text = " " + " ".join(f"{key}={value:.1f}ms" for key, value in top_timings if value > 0.0)
+        timing_text = _format_timing_breakdown(timings or {})
         usage_text = ""
         if usage_entropy is not None:
             usage_text = f" usage={usage_entropy:.4f}"
@@ -560,6 +559,7 @@ def build_train_val_dataloaders(
     val_fraction: float = 0.1,
     max_samples: int = 1000,
     seed: int = 42,
+    streaming: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
     if isinstance(texts_or_source, (str, Path)):
         source = Path(texts_or_source)
@@ -579,6 +579,25 @@ def build_train_val_dataloaders(
                 seed=seed,
                 max_samples=max_samples,
             )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=len(train_dataset) >= batch_size,
+                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=False,
+                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+            )
+            return train_loader, val_loader
+        if not bool(streaming):
+            texts = load_text_corpus(source)
+            dataset = TextWindowDataset(texts, tokenizer, seq_len=seq_len, max_samples=max_samples)
+            train_dataset, val_dataset = split_text_window_dataset(dataset, val_fraction=val_fraction, seed=seed)
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=batch_size,
@@ -735,16 +754,95 @@ def _accumulate_timings(bucket: Dict[str, float], route_stats: Dict[str, torch.T
             bucket[key] = bucket.get(key, 0.0) + float(value)
 
 
-def _extract_timings(route_stats: Dict[str, torch.Tensor]) -> Dict[str, float]:
+def _extract_timings(route_stats: Dict[str, torch.Tensor], *, include_totals: bool = False) -> Dict[str, float]:
     timings: Dict[str, float] = {}
     for key, value in route_stats.items():
-        if not key.startswith("timing_") or key.endswith("_total_ms") or key.endswith("_step_ms"):
+        if not key.startswith("timing_") or (not include_totals and (key.endswith("_total_ms") or key.endswith("_step_ms"))):
             continue
         if torch.is_tensor(value):
             timings[key] = float(value.detach().mean().item())
         else:
             timings[key] = float(value)
     return timings
+
+
+def _format_timing_group(label: str, timings: Dict[str, float], keys: Sequence[tuple[str, str]]) -> tuple[str, set[str]]:
+    parts: list[str] = []
+    used: set[str] = set()
+    for short_name, timing_key in keys:
+        value = float(timings.get(timing_key, 0.0))
+        if value <= 0.0:
+            continue
+        parts.append(f"{short_name}={value:.1f}ms")
+        used.add(timing_key)
+    if not parts:
+        return "", used
+    return f"{label}(" + " / ".join(parts) + ")", used
+
+
+def _format_timing_breakdown(timings: Dict[str, float]) -> str:
+    if not timings:
+        return ""
+    groups: list[str] = []
+    used: set[str] = set()
+
+    encode_group, encode_used = _format_timing_group(
+        "encode",
+        timings,
+        [
+            ("total", "timing_encode_ms"),
+            ("embed", "timing_encode_embed_ms"),
+            ("condition", "timing_encode_condition_ms"),
+            ("registry", "timing_encode_registry_ms"),
+        ],
+    )
+    if encode_group:
+        groups.append(encode_group)
+        used.update(encode_used)
+
+    token_memory_group, token_memory_used = _format_timing_group(
+        "token_memory",
+        timings,
+        [
+            ("total", "timing_token_memory_total_ms"),
+            ("query", "timing_token_memory_query_ms"),
+            ("select", "timing_token_memory_select_ms"),
+            ("project", "timing_token_memory_project_ms"),
+            ("append", "timing_token_memory_append_ms"),
+        ],
+    )
+    if token_memory_group:
+        groups.append(token_memory_group)
+        used.update(token_memory_used)
+
+    path_group, path_used = _format_timing_group(
+        "path",
+        timings,
+        [
+            ("total", "timing_path_total_ms"),
+            ("core", "timing_path_core_ms"),
+            ("overlay", "timing_path_overlay_ms"),
+            ("finalize", "timing_path_finalize_ms"),
+            ("aggregate", "timing_path_aggregate_ms"),
+            ("loop", "timing_path_loop_ms"),
+            ("lane_select", "timing_lane_select_ms"),
+        ],
+    )
+    if path_group:
+        groups.append(path_group)
+        used.update(path_used)
+
+    residual = [
+        (key, value)
+        for key, value in timings.items()
+        if key not in used and value > 0.0
+    ]
+    residual.sort(key=lambda item: item[1], reverse=True)
+    if residual:
+        tail = "other(" + " / ".join(f"{key.removeprefix('timing_')}={value:.1f}ms" for key, value in residual[:4]) + ")"
+        groups.append(tail)
+
+    return " " + " ".join(groups) if groups else ""
 
 
 def _stat_value(route_stats: Dict[str, torch.Tensor], *keys: str, default: float = 0.0) -> float:
@@ -1552,7 +1650,7 @@ def train_model(
             effective_count = _stat_value(output.route_stats, "emitter_cell_effective_count", "avg_emitter_topk_effective_count")
             balance_loss = float(output.route_stats["emitter_balance_loss"].item()) if "emitter_balance_loss" in output.route_stats else None
             torus_coverage = float(output.route_stats["torus_coverage_loss"].item()) if "torus_coverage_loss" in output.route_stats else None
-            batch_timings = _extract_timings(output.route_stats)
+            batch_timings = _extract_timings(output.route_stats, include_totals=True)
             tracker.emit(
                 epoch_idx=epoch_idx,
                 batch_idx=batch_idx,
@@ -1581,7 +1679,7 @@ def train_model(
                 break
             if step_limit > 0 and step >= step_limit:
                 break
-            validation_points = _epoch_validation_points(batches_per_epoch)
+            validation_points = [] if streaming_mode else _epoch_validation_points(batches_per_epoch)
             validation_point_index = 0
             iterator = iter(dataloader)
             for batch_idx, (
@@ -1613,9 +1711,6 @@ def train_model(
                 while validation_point_index < len(validation_points) and batch_idx >= validation_points[validation_point_index]:
                     _run_validation(f"epoch {epoch_idx}/{epoch_count} @ end")
                     validation_point_index += 1
-            while validation_point_index < len(validation_points):
-                _run_validation(f"epoch {epoch_idx}/{epoch_count} @ end")
-                validation_point_index += 1
     else:
         iterator = iter(dataloader)
         batch_idx = 0
@@ -1646,7 +1741,7 @@ def train_model(
                 batch_idx=batch_idx,
             )
 
-    if epoch_count <= 0:
+    if epoch_count <= 0 or streaming_mode:
         _run_validation("final")
 
     elapsed = time.perf_counter() - start

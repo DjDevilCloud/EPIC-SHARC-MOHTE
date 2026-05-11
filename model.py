@@ -3607,14 +3607,15 @@ class TokenMemoryCrossAttention(nn.Module):
             else:
                 slot = self.window - 1
                 if self.window > 1:
-                    token_store[batch_idx, :-1] = token_store[batch_idx, 1:].clone()
-                    key_store[batch_idx, :-1] = key_store[batch_idx, 1:].clone()
-                    value_store[batch_idx, :-1] = value_store[batch_idx, 1:].clone()
-                    family_store[batch_idx, :-1] = family_store[batch_idx, 1:].clone()
-                    signature_store[batch_idx, :-1] = signature_store[batch_idx, 1:].clone()
-                    level_store[batch_idx, :-1] = level_store[batch_idx, 1:].clone()
-                    relation_store[batch_idx, :-1] = relation_store[batch_idx, 1:].clone()
-                    parent_store[batch_idx, :-1] = parent_store[batch_idx, 1:].clone()
+                    # Keep the window bounded without materializing overlapping slice clones.
+                    token_store[batch_idx] = torch.roll(token_store[batch_idx], shifts=-1, dims=0)
+                    key_store[batch_idx] = torch.roll(key_store[batch_idx], shifts=-1, dims=0)
+                    value_store[batch_idx] = torch.roll(value_store[batch_idx], shifts=-1, dims=0)
+                    family_store[batch_idx] = torch.roll(family_store[batch_idx], shifts=-1, dims=0)
+                    signature_store[batch_idx] = torch.roll(signature_store[batch_idx], shifts=-1, dims=0)
+                    level_store[batch_idx] = torch.roll(level_store[batch_idx], shifts=-1, dims=0)
+                    relation_store[batch_idx] = torch.roll(relation_store[batch_idx], shifts=-1, dims=0)
+                    parent_store[batch_idx] = torch.roll(parent_store[batch_idx], shifts=-1, dims=0)
                 lengths[batch_idx] = self.window
             token_store[batch_idx, slot] = int(token_ids[batch_idx].item()) if token_ids.dim() == 2 else int(token_ids[batch_idx])
             key_store[batch_idx, slot] = key[batch_idx]
@@ -3680,6 +3681,7 @@ class TokenMemoryCrossAttention(nn.Module):
         gate_terms: List[torch.Tensor] = []
         copy_conf_terms: List[torch.Tensor] = []
         copy_logits = torch.zeros(batch, self.vocab_size, device=device, dtype=dtype)
+        timing_totals: Dict[str, float] = {}
         scale = math.sqrt(float(self.d_model))
         zero_long = torch.zeros(batch, device=device, dtype=torch.long)
         special_token_ids = {
@@ -3702,10 +3704,16 @@ class TokenMemoryCrossAttention(nn.Module):
                 parent_context[:, step_idx, :] if parent_context is not None else None,
             )
             query_input = step_hidden if meta_context is None else step_hidden + meta_context
+            start_query = time.perf_counter()
             query = self.q_proj(query_input)
+            if bool(getattr(self.cfg, "profile_runtime", False)):
+                timing_totals["timing_token_memory_query_ms"] = timing_totals.get("timing_token_memory_query_ms", 0.0) + (
+                    (time.perf_counter() - start_query) * 1000.0
+                )
             memory_context = torch.zeros_like(step_hidden)
             step_copy_logits = torch.zeros(batch, self.vocab_size, device=device, dtype=dtype)
             step_confidence = torch.zeros(batch, device=device, dtype=dtype)
+            start_select = time.perf_counter()
             for batch_idx in range(batch):
                 length = int(memory_state.lengths[batch_idx].item())
                 if length <= 0:
@@ -3733,11 +3741,21 @@ class TokenMemoryCrossAttention(nn.Module):
                 step_confidence[batch_idx] = weights.max()
                 if self.copy_bias > 0.0 and self.vocab_size > 0:
                     selected_token_ids = memory_state.token_ids[batch_idx, :length].index_select(0, top_idx)
-                    token_counts = torch.bincount(
-                        memory_state.token_ids[batch_idx, :length].clamp_min(0).to(dtype=torch.long),
-                        minlength=self.vocab_size,
-                    )
-                    rare_mask = token_counts.index_select(0, selected_token_ids) <= self.rare_token_cutoff
+                    window_tokens = memory_state.token_ids[batch_idx, :length].clamp_min(0).to(dtype=torch.long)
+                    unique_tokens, unique_counts = torch.unique(window_tokens, sorted=True, return_counts=True)
+                    if unique_tokens.numel() > 0:
+                        lookup = torch.searchsorted(unique_tokens, selected_token_ids)
+                        valid_lookup = lookup < unique_tokens.numel()
+                        matched_tokens = torch.zeros_like(selected_token_ids, dtype=torch.bool)
+                        if valid_lookup.any():
+                            matched_lookup = lookup[valid_lookup]
+                            matched_tokens[valid_lookup] = unique_tokens.index_select(0, matched_lookup).eq(selected_token_ids[valid_lookup])
+                        token_counts = torch.zeros_like(selected_token_ids, dtype=unique_counts.dtype)
+                        if matched_tokens.any():
+                            token_counts[matched_tokens] = unique_counts.index_select(0, lookup[matched_tokens])
+                    else:
+                        token_counts = torch.zeros_like(selected_token_ids, dtype=torch.long)
+                    rare_mask = token_counts <= self.rare_token_cutoff
                     special_mask = torch.ones_like(selected_token_ids, dtype=torch.bool)
                     for special_id in special_token_ids:
                         special_mask = special_mask & selected_token_ids.ne(special_id)
@@ -3748,13 +3766,23 @@ class TokenMemoryCrossAttention(nn.Module):
                             selected_token_ids,
                             weights * usable_mask.to(dtype) * self.copy_bias * step_confidence[batch_idx].clamp(min=0.0, max=1.0),
                         )
+            if bool(getattr(self.cfg, "profile_runtime", False)):
+                timing_totals["timing_token_memory_select_ms"] = timing_totals.get("timing_token_memory_select_ms", 0.0) + (
+                    (time.perf_counter() - start_select) * 1000.0
+                )
+            start_project = time.perf_counter()
             gate = torch.sigmoid(self.gate_proj(query_input))
             delta = self.out_proj(memory_context)
             step_output = step_hidden + self.weight * gate * delta
+            if bool(getattr(self.cfg, "profile_runtime", False)):
+                timing_totals["timing_token_memory_project_ms"] = timing_totals.get("timing_token_memory_project_ms", 0.0) + (
+                    (time.perf_counter() - start_project) * 1000.0
+                )
             outputs.append(step_output.unsqueeze(1))
             gate_terms.append(gate.mean().detach())
             copy_conf_terms.append(step_confidence.mean().detach())
             copy_logits = step_copy_logits
+            start_append = time.perf_counter()
             memory_state = self._append_state(
                 memory_state,
                 token_ids=step_token_ids,
@@ -3766,6 +3794,10 @@ class TokenMemoryCrossAttention(nn.Module):
                 relation_ids=step_relation_ids,
                 parent_ids=step_parent_ids,
             )
+            if bool(getattr(self.cfg, "profile_runtime", False)):
+                timing_totals["timing_token_memory_append_ms"] = timing_totals.get("timing_token_memory_append_ms", 0.0) + (
+                    (time.perf_counter() - start_append) * 1000.0
+                )
 
         next_state: Optional[TokenMemoryState] = None
         if return_state:
@@ -3798,6 +3830,10 @@ class TokenMemoryCrossAttention(nn.Module):
             "token_memory_copy_logits": copy_logits.detach(),
             "copy_attention_candidate_count": torch.tensor(float(self.top_k), device=device),
         }
+        if timing_totals:
+            timing_totals["timing_token_memory_total_ms"] = sum(timing_totals.values())
+            for key, value in timing_totals.items():
+                stats[key] = torch.tensor(value, device=device)
         return torch.cat(outputs, dim=1), next_state, stats
 
 
@@ -4463,6 +4499,7 @@ class PrismalWaveModel(nn.Module):
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
         position_offset: int = 0,
+        timings: Optional[Dict[str, float]] = None,
     ) -> torch.Tensor:
         batch, seq_len = input_ids.shape
         position_offset = max(0, int(position_offset))
@@ -4474,16 +4511,42 @@ class PrismalWaveModel(nn.Module):
         pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device).unsqueeze(0)
         if self.cfg.max_seq_len > 0:
             pos = pos.clamp(max=self.cfg.max_seq_len - 1)
-        hidden = self.construction_embedding(input_ids) + self.position_embedding(pos)
-        if hasattr(self.torus_core, "condition_hidden"):
-            hidden = hidden + 0.25 * self.torus_core.condition_hidden(
-                hidden,
-                registry_context=None,
-                family_context=signature_family_ids[:, :seq_len] if signature_family_ids is not None else None,
-                level_context=signature_level_ids[:, :seq_len] if signature_level_ids is not None else None,
-                relation_context=signature_relation_ids[:, :seq_len] if signature_relation_ids is not None else None,
-                parent_context=parent_signature_ids[:, :seq_len] if parent_signature_ids is not None else None,
+        if timings is not None:
+            hidden = _profile_stage(
+                bool(getattr(self.cfg, "profile_runtime", False)),
+                input_ids.device,
+                timings,
+                "timing_encode_embed_ms",
+                lambda: self.construction_embedding(input_ids) + self.position_embedding(pos),
             )
+        else:
+            hidden = self.construction_embedding(input_ids) + self.position_embedding(pos)
+        if hasattr(self.torus_core, "condition_hidden"):
+            if timings is not None:
+                condition_hidden = _profile_stage(
+                    bool(getattr(self.cfg, "profile_runtime", False)),
+                    input_ids.device,
+                    timings,
+                    "timing_encode_condition_ms",
+                    lambda: self.torus_core.condition_hidden(
+                        hidden,
+                        registry_context=None,
+                        family_context=signature_family_ids[:, :seq_len] if signature_family_ids is not None else None,
+                        level_context=signature_level_ids[:, :seq_len] if signature_level_ids is not None else None,
+                        relation_context=signature_relation_ids[:, :seq_len] if signature_relation_ids is not None else None,
+                        parent_context=parent_signature_ids[:, :seq_len] if parent_signature_ids is not None else None,
+                    ),
+                )
+            else:
+                condition_hidden = self.torus_core.condition_hidden(
+                    hidden,
+                    registry_context=None,
+                    family_context=signature_family_ids[:, :seq_len] if signature_family_ids is not None else None,
+                    level_context=signature_level_ids[:, :seq_len] if signature_level_ids is not None else None,
+                    relation_context=signature_relation_ids[:, :seq_len] if signature_relation_ids is not None else None,
+                    parent_context=parent_signature_ids[:, :seq_len] if parent_signature_ids is not None else None,
+                )
+            hidden = hidden + 0.25 * condition_hidden
         if (
             signature_family_ids is not None
             or signature_ids is not None
@@ -4491,14 +4554,30 @@ class PrismalWaveModel(nn.Module):
             or signature_relation_ids is not None
             or parent_signature_ids is not None
         ):
-            registry_context = self._registry_context(
-                signature_family_ids=signature_family_ids[:, :seq_len] if signature_family_ids is not None else None,
-                signature_ids=signature_ids[:, :seq_len] if signature_ids is not None else None,
-                signature_level_ids=signature_level_ids[:, :seq_len] if signature_level_ids is not None else None,
-                signature_relation_ids=signature_relation_ids[:, :seq_len] if signature_relation_ids is not None else None,
-                parent_signature_ids=parent_signature_ids[:, :seq_len] if parent_signature_ids is not None else None,
-                reference=hidden,
-            )
+            if timings is not None:
+                registry_context = _profile_stage(
+                    bool(getattr(self.cfg, "profile_runtime", False)),
+                    input_ids.device,
+                    timings,
+                    "timing_encode_registry_ms",
+                    lambda: self._registry_context(
+                        signature_family_ids=signature_family_ids[:, :seq_len] if signature_family_ids is not None else None,
+                        signature_ids=signature_ids[:, :seq_len] if signature_ids is not None else None,
+                        signature_level_ids=signature_level_ids[:, :seq_len] if signature_level_ids is not None else None,
+                        signature_relation_ids=signature_relation_ids[:, :seq_len] if signature_relation_ids is not None else None,
+                        parent_signature_ids=parent_signature_ids[:, :seq_len] if parent_signature_ids is not None else None,
+                        reference=hidden,
+                    ),
+                )
+            else:
+                registry_context = self._registry_context(
+                    signature_family_ids=signature_family_ids[:, :seq_len] if signature_family_ids is not None else None,
+                    signature_ids=signature_ids[:, :seq_len] if signature_ids is not None else None,
+                    signature_level_ids=signature_level_ids[:, :seq_len] if signature_level_ids is not None else None,
+                    signature_relation_ids=signature_relation_ids[:, :seq_len] if signature_relation_ids is not None else None,
+                    parent_signature_ids=parent_signature_ids[:, :seq_len] if parent_signature_ids is not None else None,
+                    reference=hidden,
+                )
             hidden = hidden + registry_context
         return hidden
 
@@ -4575,6 +4654,7 @@ class PrismalWaveModel(nn.Module):
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
                 position_offset=position_offset,
+                timings=prep_timings if profile_enabled else None,
             ),
         )
         batch_size, seq_len = hidden.shape[:2]
@@ -4683,6 +4763,10 @@ class PrismalWaveModel(nn.Module):
                     return_state=not self.training and bool(getattr(self.cfg, "use_token_memory_generation_cache", True)),
                 ),
             )
+        if profile_enabled:
+            for key, value in token_memory_stats.items():
+                if key.startswith("timing_"):
+                    prep_timings[key] = prep_timings.get(key, 0.0) + float(value.detach().item() if torch.is_tensor(value) else float(value))
 
         input_signature = F.normalize(self.signature_head(hidden.mean(dim=1)), dim=-1)
 
@@ -4876,6 +4960,9 @@ class PrismalWaveModel(nn.Module):
                 level_arg = chunk_level_context if chunk_level_context is not None else torch.empty(0, device=input_ids.device)
                 relation_arg = chunk_relation_context if chunk_relation_context is not None else torch.empty(0, device=input_ids.device)
                 parent_arg = chunk_parent_context if chunk_parent_context is not None else torch.empty(0, device=input_ids.device)
+                if profile_enabled:
+                    _sync_for_timing(input_ids.device)
+                    start_chunk_core = time.perf_counter()
                 core_output, field_state, core_stats = checkpoint(
                     _run_chunk_core,
                     chunk_hidden,
@@ -4886,8 +4973,18 @@ class PrismalWaveModel(nn.Module):
                     parent_arg,
                     use_reentrant=False,
                 )
+                if profile_enabled:
+                    _sync_for_timing(input_ids.device)
+                    path_timings["timing_path_core_ms"] = path_timings.get("timing_path_core_ms", 0.0) + (time.perf_counter() - start_chunk_core) * 1000.0
+                    start_chunk_overlay = time.perf_counter()
                 chunk_output, field_state, chunk_stats = _run_chunk_overlay(core_output, field_state, core_stats)
+                if profile_enabled:
+                    _sync_for_timing(input_ids.device)
+                    path_timings["timing_path_overlay_ms"] = path_timings.get("timing_path_overlay_ms", 0.0) + (time.perf_counter() - start_chunk_overlay) * 1000.0
             else:
+                if profile_enabled:
+                    _sync_for_timing(input_ids.device)
+                    start_chunk_core = time.perf_counter()
                 core_output, field_state, core_stats = _run_chunk_core(
                     chunk_hidden,
                     field_state,
@@ -4896,7 +4993,14 @@ class PrismalWaveModel(nn.Module):
                     chunk_relation_context if chunk_relation_context is not None else torch.empty(0, device=input_ids.device),
                     chunk_parent_context if chunk_parent_context is not None else torch.empty(0, device=input_ids.device),
                 )
+                if profile_enabled:
+                    _sync_for_timing(input_ids.device)
+                    path_timings["timing_path_core_ms"] = path_timings.get("timing_path_core_ms", 0.0) + (time.perf_counter() - start_chunk_core) * 1000.0
+                    start_chunk_overlay = time.perf_counter()
                 chunk_output, field_state, chunk_stats = _run_chunk_overlay(core_output, field_state, core_stats)
+                if profile_enabled:
+                    _sync_for_timing(input_ids.device)
+                    path_timings["timing_path_overlay_ms"] = path_timings.get("timing_path_overlay_ms", 0.0) + (time.perf_counter() - start_chunk_overlay) * 1000.0
             outputs.append(chunk_output)
             entropy_terms.append(chunk_stats["torus_entropy"])
             active_terms.append(chunk_stats.get("emitter_cell_occupancy", chunk_stats.get("active_cells", torch.tensor(0.0, device=input_ids.device))).float())

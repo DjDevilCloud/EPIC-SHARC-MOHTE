@@ -191,6 +191,18 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--token-memory-copy-bias", type=float, default=default_cfg.token_memory_copy_bias)
         p.add_argument("--token-memory-rare-token-cutoff", type=int, default=default_cfg.token_memory_rare_token_cutoff)
         p.add_argument("--token-memory-copy-min-confidence", type=float, default=default_cfg.token_memory_copy_min_confidence)
+        p.add_argument("--use-token-copy-cross-attention", dest="use_token_copy_cross_attention", action="store_true")
+        p.add_argument("--no-token-copy-cross-attention", dest="use_token_copy_cross_attention", action="store_false")
+        p.set_defaults(use_token_copy_cross_attention=default_cfg.use_token_copy_cross_attention)
+        p.add_argument("--use-token-copy-generation-cache", dest="use_token_copy_generation_cache", action="store_true")
+        p.add_argument("--no-token-copy-generation-cache", dest="use_token_copy_generation_cache", action="store_false")
+        p.set_defaults(use_token_copy_generation_cache=default_cfg.use_token_copy_generation_cache)
+        p.add_argument("--token-copy-window", type=int, default=default_cfg.token_copy_window)
+        p.add_argument("--token-copy-top-k", type=int, default=default_cfg.token_copy_top_k)
+        p.add_argument("--token-copy-weight", type=float, default=default_cfg.token_copy_weight)
+        p.add_argument("--token-copy-bias-strength", type=float, default=default_cfg.token_copy_bias_strength)
+        p.add_argument("--token-copy-rare-token-cutoff", type=int, default=default_cfg.token_copy_rare_token_cutoff)
+        p.add_argument("--token-copy-min-confidence", type=float, default=default_cfg.token_copy_min_confidence)
         p.add_argument("--use-pronunciation-signatures", dest="use_pronunciation_signatures", action="store_true")
         p.add_argument("--no-pronunciation-signatures", dest="use_pronunciation_signatures", action="store_false")
         p.set_defaults(use_pronunciation_signatures=default_cfg.use_pronunciation_signatures)
@@ -280,6 +292,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_p.add_argument("--max-samples", type=int, default=default_cfg.max_samples)
     train_p.add_argument("--max-new-tokens", type=int, default=0)
     train_p.add_argument("--min-token-frequency", type=int, default=2)
+    train_p.add_argument("--dataset-streaming", dest="dataset_streaming", action="store_true")
+    train_p.add_argument("--no-dataset-streaming", dest="dataset_streaming", action="store_false")
+    train_p.set_defaults(dataset_streaming=True)
     train_p.add_argument(
         "--tokenizer-cache-dir",
         default="",
@@ -471,6 +486,14 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         token_memory_copy_bias=getattr(args, "token_memory_copy_bias", default_cfg.token_memory_copy_bias),
         token_memory_rare_token_cutoff=getattr(args, "token_memory_rare_token_cutoff", default_cfg.token_memory_rare_token_cutoff),
         token_memory_copy_min_confidence=getattr(args, "token_memory_copy_min_confidence", default_cfg.token_memory_copy_min_confidence),
+        use_token_copy_cross_attention=getattr(args, "use_token_copy_cross_attention", default_cfg.use_token_copy_cross_attention),
+        use_token_copy_generation_cache=getattr(args, "use_token_copy_generation_cache", default_cfg.use_token_copy_generation_cache),
+        token_copy_window=getattr(args, "token_copy_window", default_cfg.token_copy_window),
+        token_copy_top_k=getattr(args, "token_copy_top_k", default_cfg.token_copy_top_k),
+        token_copy_weight=getattr(args, "token_copy_weight", default_cfg.token_copy_weight),
+        token_copy_bias_strength=getattr(args, "token_copy_bias_strength", default_cfg.token_copy_bias_strength),
+        token_copy_rare_token_cutoff=getattr(args, "token_copy_rare_token_cutoff", default_cfg.token_copy_rare_token_cutoff),
+        token_copy_min_confidence=getattr(args, "token_copy_min_confidence", default_cfg.token_copy_min_confidence),
         use_pronunciation_signatures=getattr(args, "use_pronunciation_signatures", default_cfg.use_pronunciation_signatures),
         use_speculative_decoding=args.use_speculative_decoding,
         speculative_draft_tokens=args.speculative_draft_tokens,
@@ -785,6 +808,7 @@ def main(argv: List[str] | None = None) -> int:
             max_samples=args.max_samples,
             val_fraction=args.val_fraction,
             seed=args.seed,
+            streaming=getattr(args, "dataset_streaming", True),
         )
         metrics = train_model(
             model,

@@ -1,5 +1,6 @@
 import sys
 import unittest
+import tempfile
 from pathlib import Path
 
 import torch
@@ -12,6 +13,7 @@ if str(ROOT) not in sys.path:
 from config import PrismalWaveConfig
 from data import PrismalTokenizer
 from model import PrismalWaveModel
+from train import build_train_val_dataloaders
 
 
 class SmokeTests(unittest.TestCase):
@@ -118,6 +120,7 @@ class SmokeTests(unittest.TestCase):
         cfg.token_memory_weight = 0.5
         cfg.token_memory_copy_bias = 1.0
         cfg.token_memory_rare_token_cutoff = 2
+        cfg.profile_runtime = True
         cfg.use_turbo_quantization = False
         cfg.use_bitsandbytes_leaf_precision = False
         cfg.use_speculative_decoding = False
@@ -158,6 +161,9 @@ class SmokeTests(unittest.TestCase):
 
         self.assertIsNotNone(output.token_memory_state)
         self.assertIn("token_memory_copy_logits", output.route_stats)
+        self.assertIn("timing_token_memory_total_ms", output.route_stats)
+        self.assertIn("timing_token_memory_query_ms", output.route_stats)
+        self.assertIn("timing_encode_embed_ms", output.route_stats)
         copy_logits = output.route_stats["token_memory_copy_logits"]
         self.assertEqual(copy_logits.shape[-1], cfg.vocab_size)
         repeated_score = float(copy_logits[0, repeated_token_id].item())
@@ -178,6 +184,27 @@ class SmokeTests(unittest.TestCase):
         )
         self.assertEqual(step_output[0].shape[-1], cfg.vocab_size)
         self.assertIsNotNone(step_output[2].token_memory_state)
+
+    def test_token_copy_aliases_sync_to_canonical_names(self) -> None:
+        cfg = PrismalWaveConfig(
+            token_copy_window=12,
+            token_copy_top_k=4,
+            token_copy_weight=0.31,
+            token_copy_bias_strength=0.92,
+            token_copy_rare_token_cutoff=3,
+            token_copy_min_confidence=0.27,
+            use_token_copy_cross_attention=False,
+            use_token_copy_generation_cache=False,
+        )
+
+        self.assertEqual(cfg.token_memory_window, 12)
+        self.assertEqual(cfg.token_memory_top_k, 4)
+        self.assertAlmostEqual(cfg.token_memory_weight, 0.31)
+        self.assertAlmostEqual(cfg.token_memory_copy_bias, 0.92)
+        self.assertEqual(cfg.token_memory_rare_token_cutoff, 3)
+        self.assertAlmostEqual(cfg.token_memory_copy_min_confidence, 0.27)
+        self.assertFalse(cfg.use_token_memory_cross_attention)
+        self.assertFalse(cfg.use_token_memory_generation_cache)
 
     def test_token_memory_disabled_shape_stability(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -231,6 +258,25 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(tuple(output.logits.shape[:2]), tuple(input_ids.shape))
         self.assertEqual(output.logits.shape[-1], cfg.vocab_size)
         self.assertIsNone(output.token_memory_state)
+
+    def test_dataset_streaming_toggle_uses_in_memory_loader(self) -> None:
+        tokenizer = PrismalTokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "tiny.txt"
+            source.write_text("Alpha beta gamma.\n\nDelta epsilon zeta.", encoding="utf-8")
+            train_loader, val_loader = build_train_val_dataloaders(
+                source,
+                tokenizer,
+                seq_len=16,
+                batch_size=2,
+                max_samples=0,
+                val_fraction=0.5,
+                seed=7,
+                streaming=False,
+            )
+
+        self.assertFalse(isinstance(getattr(train_loader, "dataset", None), torch.utils.data.IterableDataset))
+        self.assertFalse(isinstance(getattr(val_loader, "dataset", None), torch.utils.data.IterableDataset))
 
 
 if __name__ == "__main__":
