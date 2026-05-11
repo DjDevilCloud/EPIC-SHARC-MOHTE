@@ -3682,6 +3682,11 @@ class TokenMemoryCrossAttention(nn.Module):
         copy_logits = torch.zeros(batch, self.vocab_size, device=device, dtype=dtype)
         scale = math.sqrt(float(self.d_model))
         zero_long = torch.zeros(batch, device=device, dtype=torch.long)
+        special_token_ids = {
+            int(getattr(self.cfg, "pad_id", 0)),
+            int(getattr(self.cfg, "bos_id", 1)),
+            int(getattr(self.cfg, "eos_id", 2)),
+        }
         for step_idx in range(seq_len):
             step_hidden = hidden[:, step_idx, :]
             step_token_ids = token_ids[:, step_idx] if token_ids.numel() > 0 else zero_long
@@ -3733,11 +3738,15 @@ class TokenMemoryCrossAttention(nn.Module):
                         minlength=self.vocab_size,
                     )
                     rare_mask = token_counts.index_select(0, selected_token_ids) <= self.rare_token_cutoff
-                    if rare_mask.any():
+                    special_mask = torch.ones_like(selected_token_ids, dtype=torch.bool)
+                    for special_id in special_token_ids:
+                        special_mask = special_mask & selected_token_ids.ne(special_id)
+                    usable_mask = rare_mask & special_mask
+                    if usable_mask.any():
                         step_copy_logits[batch_idx].scatter_add_(
                             0,
                             selected_token_ids,
-                            weights * rare_mask.to(dtype) * self.copy_bias,
+                            weights * usable_mask.to(dtype) * self.copy_bias * step_confidence[batch_idx].clamp(min=0.0, max=1.0),
                         )
             gate = torch.sigmoid(self.gate_proj(query_input))
             delta = self.out_proj(memory_context)
@@ -3773,11 +3782,21 @@ class TokenMemoryCrossAttention(nn.Module):
             )
         stats = {
             "token_memory_enabled": torch.tensor(1.0, device=device),
+            "copy_attention_enabled": torch.tensor(1.0, device=device),
             "token_memory_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
+            "copy_attention_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
             "token_memory_copy_confidence": torch.stack(copy_conf_terms).mean() if copy_conf_terms else torch.tensor(0.0, device=device),
+            "copy_attention_max_weight": torch.stack(copy_conf_terms).max() if copy_conf_terms else torch.tensor(0.0, device=device),
+            "token_memory_memory_fill": (
+                memory_state.lengths.float().mean().clamp(min=0.0) / max(float(self.window), 1.0)
+            ).detach(),
+            "copy_attention_memory_fill": (
+                memory_state.lengths.float().mean().clamp(min=0.0) / max(float(self.window), 1.0)
+            ).detach(),
             "token_memory_window": torch.tensor(float(self.window), device=device),
             "token_memory_top_k": torch.tensor(float(self.top_k), device=device),
             "token_memory_copy_logits": copy_logits.detach(),
+            "copy_attention_candidate_count": torch.tensor(float(self.top_k), device=device),
         }
         return torch.cat(outputs, dim=1), next_state, stats
 
@@ -4096,7 +4115,7 @@ class PrismalWaveModel(nn.Module):
         )
         self.token_memory_attention = (
             TokenMemoryCrossAttention(cfg, quantization_config=qcfg)
-            if self.use_token_memory_cross_attention
+            if self.use_torus_core and self.use_token_memory_cross_attention
             else None
         )
         if self.use_torus_core:
@@ -4334,7 +4353,11 @@ class PrismalWaveModel(nn.Module):
             return logits
         if copy_logits.shape != logits.shape:
             return logits
-        return logits + copy_logits.to(device=logits.device, dtype=logits.dtype)
+        blocked = copy_logits.to(device=logits.device, dtype=logits.dtype).clone()
+        for token_id in {int(self.cfg.pad_id), int(self.cfg.bos_id), int(self.cfg.eos_id)}:
+            if 0 <= token_id < blocked.size(-1):
+                blocked[:, token_id] = 0.0
+        return logits + blocked
 
     def _relay_temperature(self, step_index: int, base_temperature: float) -> float:
         base_temperature = max(1e-3, float(base_temperature))
@@ -4626,11 +4649,17 @@ class PrismalWaveModel(nn.Module):
         next_token_memory_state: Optional[TokenMemoryState] = token_memory_state
         token_memory_stats: Dict[str, torch.Tensor] = {
             "token_memory_enabled": torch.tensor(0.0, device=input_ids.device),
+            "copy_attention_enabled": torch.tensor(0.0, device=input_ids.device),
             "token_memory_gate_mean": torch.tensor(0.0, device=input_ids.device),
+            "copy_attention_gate_mean": torch.tensor(0.0, device=input_ids.device),
             "token_memory_copy_confidence": torch.tensor(0.0, device=input_ids.device),
+            "copy_attention_max_weight": torch.tensor(0.0, device=input_ids.device),
+            "token_memory_memory_fill": torch.tensor(0.0, device=input_ids.device),
+            "copy_attention_memory_fill": torch.tensor(0.0, device=input_ids.device),
             "token_memory_window": torch.tensor(float(getattr(self.cfg, "token_memory_window", 0)), device=input_ids.device),
             "token_memory_top_k": torch.tensor(float(getattr(self.cfg, "token_memory_top_k", 0)), device=input_ids.device),
             "token_memory_copy_logits": torch.zeros(batch_size, self.vocab_size, device=input_ids.device, dtype=hidden.dtype),
+            "copy_attention_candidate_count": torch.tensor(float(getattr(self.cfg, "token_memory_top_k", 0)), device=input_ids.device),
         }
         if self.token_memory_attention is not None:
             hidden, next_token_memory_state, token_memory_stats = _profile_stage(
@@ -4651,7 +4680,7 @@ class PrismalWaveModel(nn.Module):
                     parent_context=parent_context_seq,
                     token_ids=input_ids[:, :seq_len],
                     state=token_memory_state,
-                    return_state=not self.training,
+                    return_state=not self.training and bool(getattr(self.cfg, "use_token_memory_generation_cache", True)),
                 ),
             )
 
@@ -5475,10 +5504,19 @@ class PrismalWaveModel(nn.Module):
                 else torch.tensor(0.0, device=input_ids.device).detach()
             ),
             "token_memory_enabled": frame.token_memory_stats.get("token_memory_enabled", torch.tensor(0.0, device=input_ids.device)).detach(),
+            "copy_attention_enabled": frame.token_memory_stats.get("copy_attention_enabled", torch.tensor(0.0, device=input_ids.device)).detach(),
             "token_memory_gate_mean": frame.token_memory_stats.get("token_memory_gate_mean", torch.tensor(0.0, device=input_ids.device)).detach(),
+            "copy_attention_gate_mean": frame.token_memory_stats.get("copy_attention_gate_mean", torch.tensor(0.0, device=input_ids.device)).detach(),
             "token_memory_copy_confidence": frame.token_memory_stats.get("token_memory_copy_confidence", torch.tensor(0.0, device=input_ids.device)).detach(),
+            "copy_attention_max_weight": frame.token_memory_stats.get("copy_attention_max_weight", torch.tensor(0.0, device=input_ids.device)).detach(),
+            "token_memory_memory_fill": frame.token_memory_stats.get("token_memory_memory_fill", torch.tensor(0.0, device=input_ids.device)).detach(),
+            "copy_attention_memory_fill": frame.token_memory_stats.get("copy_attention_memory_fill", torch.tensor(0.0, device=input_ids.device)).detach(),
             "token_memory_window": frame.token_memory_stats.get("token_memory_window", torch.tensor(0.0, device=input_ids.device)).detach(),
             "token_memory_top_k": frame.token_memory_stats.get("token_memory_top_k", torch.tensor(0.0, device=input_ids.device)).detach(),
+            "copy_attention_candidate_count": frame.token_memory_stats.get(
+                "copy_attention_candidate_count",
+                torch.tensor(0.0, device=input_ids.device),
+            ).detach(),
             "token_memory_copy_logits": frame.token_memory_stats.get(
                 "token_memory_copy_logits",
                 torch.zeros(input_ids.size(0), self.vocab_size, device=input_ids.device, dtype=final_logits.dtype),
