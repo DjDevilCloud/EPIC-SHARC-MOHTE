@@ -3255,6 +3255,19 @@ class TokenMemoryState:
     relation_ids: torch.Tensor
     parent_ids: torch.Tensor
     lengths: torch.Tensor
+    anchor_token_ids: torch.Tensor
+    anchor_span_ids: torch.Tensor
+    anchor_offsets: torch.Tensor
+    anchor_lengths: torch.Tensor
+    anchor_tags: torch.Tensor
+    anchor_flags: torch.Tensor
+    anchor_span_starts: torch.Tensor
+    anchor_cursor_pos: torch.Tensor
+    anchor_cursor_span_id: torch.Tensor
+    anchor_cursor_offset: torch.Tensor
+    anchor_cursor_length: torch.Tensor
+    anchor_cursor_tag: torch.Tensor
+    anchor_cursor_active: torch.Tensor
 
 
 class SignatureLatticeAttention(nn.Module):
@@ -3267,7 +3280,7 @@ class SignatureLatticeAttention(nn.Module):
         d = int(cfg.d_model)
         self.r = max(1, int(getattr(cfg, "signature_lattice_dim", 256)))
         self.buckets = max(1, int(getattr(cfg, "signature_lattice_buckets", 512)))
-        self.candidates = max(1, min(8, int(getattr(cfg, "signature_lattice_candidates", 8))))
+        self.candidates = max(1, min(self.buckets, int(getattr(cfg, "signature_lattice_candidates", 8))))
         self.weight = max(0.0, float(getattr(cfg, "signature_lattice_weight", 0.35)))
         self.decay = max(0.0, min(1.0, float(getattr(cfg, "signature_lattice_decay", 0.92))))
         self.chunk_len = max(1, int(getattr(cfg, "signature_lattice_chunk_len", getattr(cfg, "torus_chunk_len", 8))))
@@ -3493,18 +3506,90 @@ class TokenMemoryCrossAttention(nn.Module):
         self.gate_proj = create_quantized_linear(self.d_model, 1, bias=True, quantization_config=self.quantization_config)
         self.context_proj = create_quantized_linear(self.d_model, self.d_model, bias=False, quantization_config=self.quantization_config)
 
+    def _anchor_tag(
+        self,
+        token_id: int,
+        family_id: int,
+        signature_id: int,
+        level_id: int,
+        relation_id: int,
+        parent_id: int,
+    ) -> int:
+        tag = int(token_id) & 0xFFFFFFFF
+        tag ^= (int(signature_id) & 0xFFFF) << 1
+        tag = ((tag << 5) - tag) & 0xFFFFFFFF
+        tag ^= (int(level_id) & 0xFFFF) << 11
+        tag = ((tag << 7) - tag) & 0xFFFFFFFF
+        tag ^= (int(relation_id) & 0xFFFF) << 17
+        tag = (tag + ((int(family_id) & 0xFFFF) << 3) + ((int(parent_id) & 0xFFFF) << 13)) & 0xFFFFFFFF
+        return tag
+
+    def _anchor_flags(
+        self,
+        token_id: int,
+        family_id: int,
+        signature_id: int,
+        level_id: int,
+        relation_id: int,
+        token_count: int,
+    ) -> int:
+        flags = 0
+        special_ids = {
+            int(getattr(self.cfg, "pad_id", 0)),
+            int(getattr(self.cfg, "bos_id", 1)),
+            int(getattr(self.cfg, "eos_id", 2)),
+        }
+        if int(token_id) in special_ids:
+            return 0
+        if token_count <= self.rare_token_cutoff:
+            flags |= 0x01
+        exact_id = SIGNATURE_RELATION_IDS.get("exact")
+        prefix_id = SIGNATURE_RELATION_IDS.get("prefix")
+        suffix_id = SIGNATURE_RELATION_IDS.get("suffix")
+        containment_id = SIGNATURE_RELATION_IDS.get("containment")
+        if exact_id is not None and int(relation_id) == exact_id:
+            flags |= 0x02
+        if prefix_id is not None and int(relation_id) == prefix_id:
+            flags |= 0x04
+        if suffix_id is not None and int(relation_id) == suffix_id:
+            flags |= 0x08
+        if containment_id is not None and int(relation_id) == containment_id:
+            flags |= 0x10
+        if int(level_id) in {
+            int(SIGNATURE_LEVEL_IDS.get("char", 0)),
+            int(SIGNATURE_LEVEL_IDS.get("piece", 0)),
+        }:
+            flags |= 0x20
+        if int(signature_id) != 0 and int(family_id) != 0:
+            flags |= 0x40
+        return flags
+
     def init_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> TokenMemoryState:
         pad_token = int(getattr(self.cfg, "pad_id", 0))
+        window = self.window
         return TokenMemoryState(
-            token_ids=torch.full((batch_size, self.window), pad_token, device=device, dtype=torch.long),
-            memory_keys=torch.zeros(batch_size, self.window, self.d_model, device=device, dtype=dtype),
-            memory_values=torch.zeros(batch_size, self.window, self.d_model, device=device, dtype=dtype),
-            family_ids=torch.zeros(batch_size, self.window, device=device, dtype=torch.long),
-            signature_ids=torch.zeros(batch_size, self.window, device=device, dtype=torch.long),
-            level_ids=torch.zeros(batch_size, self.window, device=device, dtype=torch.long),
-            relation_ids=torch.zeros(batch_size, self.window, device=device, dtype=torch.long),
-            parent_ids=torch.zeros(batch_size, self.window, device=device, dtype=torch.long),
+            token_ids=torch.full((batch_size, window), pad_token, device=device, dtype=torch.long),
+            memory_keys=torch.zeros(batch_size, window, self.d_model, device=device, dtype=dtype),
+            memory_values=torch.zeros(batch_size, window, self.d_model, device=device, dtype=dtype),
+            family_ids=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            signature_ids=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            level_ids=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            relation_ids=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            parent_ids=torch.zeros(batch_size, window, device=device, dtype=torch.long),
             lengths=torch.zeros(batch_size, device=device, dtype=torch.long),
+            anchor_token_ids=torch.full((batch_size, window), pad_token, device=device, dtype=torch.long),
+            anchor_span_ids=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            anchor_offsets=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            anchor_lengths=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            anchor_tags=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            anchor_flags=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            anchor_span_starts=torch.zeros(batch_size, window, device=device, dtype=torch.long),
+            anchor_cursor_pos=torch.full((batch_size,), -1, device=device, dtype=torch.long),
+            anchor_cursor_span_id=torch.zeros(batch_size, device=device, dtype=torch.long),
+            anchor_cursor_offset=torch.zeros(batch_size, device=device, dtype=torch.long),
+            anchor_cursor_length=torch.zeros(batch_size, device=device, dtype=torch.long),
+            anchor_cursor_tag=torch.zeros(batch_size, device=device, dtype=torch.long),
+            anchor_cursor_active=torch.zeros(batch_size, device=device, dtype=torch.bool),
         )
 
     def _coerce_state(
@@ -3525,6 +3610,19 @@ class TokenMemoryCrossAttention(nn.Module):
         relation_ids = state.relation_ids.to(device=device, dtype=torch.long)
         parent_ids = state.parent_ids.to(device=device, dtype=torch.long)
         lengths = state.lengths.to(device=device, dtype=torch.long)
+        anchor_token_ids = state.anchor_token_ids.to(device=device, dtype=torch.long)
+        anchor_span_ids = state.anchor_span_ids.to(device=device, dtype=torch.long)
+        anchor_offsets = state.anchor_offsets.to(device=device, dtype=torch.long)
+        anchor_lengths = state.anchor_lengths.to(device=device, dtype=torch.long)
+        anchor_tags = state.anchor_tags.to(device=device, dtype=torch.long)
+        anchor_flags = state.anchor_flags.to(device=device, dtype=torch.long)
+        anchor_span_starts = state.anchor_span_starts.to(device=device, dtype=torch.long)
+        anchor_cursor_pos = state.anchor_cursor_pos.to(device=device, dtype=torch.long)
+        anchor_cursor_span_id = state.anchor_cursor_span_id.to(device=device, dtype=torch.long)
+        anchor_cursor_offset = state.anchor_cursor_offset.to(device=device, dtype=torch.long)
+        anchor_cursor_length = state.anchor_cursor_length.to(device=device, dtype=torch.long)
+        anchor_cursor_tag = state.anchor_cursor_tag.to(device=device, dtype=torch.long)
+        anchor_cursor_active = state.anchor_cursor_active.to(device=device, dtype=torch.bool)
         if token_ids.size(0) != batch_size:
             token_ids = token_ids[:1].expand(batch_size, -1).clone()
             memory_keys = memory_keys[:1].expand(batch_size, -1, -1).clone()
@@ -3535,6 +3633,19 @@ class TokenMemoryCrossAttention(nn.Module):
             relation_ids = relation_ids[:1].expand(batch_size, -1).clone()
             parent_ids = parent_ids[:1].expand(batch_size, -1).clone()
             lengths = lengths[:1].expand(batch_size).clone()
+            anchor_token_ids = anchor_token_ids[:1].expand(batch_size, -1).clone()
+            anchor_span_ids = anchor_span_ids[:1].expand(batch_size, -1).clone()
+            anchor_offsets = anchor_offsets[:1].expand(batch_size, -1).clone()
+            anchor_lengths = anchor_lengths[:1].expand(batch_size, -1).clone()
+            anchor_tags = anchor_tags[:1].expand(batch_size, -1).clone()
+            anchor_flags = anchor_flags[:1].expand(batch_size, -1).clone()
+            anchor_span_starts = anchor_span_starts[:1].expand(batch_size, -1).clone()
+            anchor_cursor_pos = anchor_cursor_pos[:1].expand(batch_size).clone()
+            anchor_cursor_span_id = anchor_cursor_span_id[:1].expand(batch_size).clone()
+            anchor_cursor_offset = anchor_cursor_offset[:1].expand(batch_size).clone()
+            anchor_cursor_length = anchor_cursor_length[:1].expand(batch_size).clone()
+            anchor_cursor_tag = anchor_cursor_tag[:1].expand(batch_size).clone()
+            anchor_cursor_active = anchor_cursor_active[:1].expand(batch_size).clone()
         return TokenMemoryState(
             token_ids=token_ids,
             memory_keys=memory_keys,
@@ -3545,6 +3656,19 @@ class TokenMemoryCrossAttention(nn.Module):
             relation_ids=relation_ids,
             parent_ids=parent_ids,
             lengths=lengths,
+            anchor_token_ids=anchor_token_ids,
+            anchor_span_ids=anchor_span_ids,
+            anchor_offsets=anchor_offsets,
+            anchor_lengths=anchor_lengths,
+            anchor_tags=anchor_tags,
+            anchor_flags=anchor_flags,
+            anchor_span_starts=anchor_span_starts,
+            anchor_cursor_pos=anchor_cursor_pos,
+            anchor_cursor_span_id=anchor_cursor_span_id,
+            anchor_cursor_offset=anchor_cursor_offset,
+            anchor_cursor_length=anchor_cursor_length,
+            anchor_cursor_tag=anchor_cursor_tag,
+            anchor_cursor_active=anchor_cursor_active,
         )
 
     def _combine_contexts(
@@ -3592,6 +3716,19 @@ class TokenMemoryCrossAttention(nn.Module):
         relation_store = state.relation_ids.clone()
         parent_store = state.parent_ids.clone()
         lengths = state.lengths.clone()
+        anchor_token_store = state.anchor_token_ids.clone()
+        anchor_span_store = state.anchor_span_ids.clone()
+        anchor_offset_store = state.anchor_offsets.clone()
+        anchor_length_store = state.anchor_lengths.clone()
+        anchor_tag_store = state.anchor_tags.clone()
+        anchor_flag_store = state.anchor_flags.clone()
+        anchor_span_start_store = state.anchor_span_starts.clone()
+        anchor_cursor_pos = state.anchor_cursor_pos.clone()
+        anchor_cursor_span_id = state.anchor_cursor_span_id.clone()
+        anchor_cursor_offset = state.anchor_cursor_offset.clone()
+        anchor_cursor_length = state.anchor_cursor_length.clone()
+        anchor_cursor_tag = state.anchor_cursor_tag.clone()
+        anchor_cursor_active = state.anchor_cursor_active.clone()
         batch_size = token_ids.size(0)
         pad_token = int(getattr(self.cfg, "pad_id", 0))
         family_ids = family_ids if family_ids is not None else torch.full_like(token_ids, 0)
@@ -3616,6 +3753,22 @@ class TokenMemoryCrossAttention(nn.Module):
                     level_store[batch_idx] = torch.roll(level_store[batch_idx], shifts=-1, dims=0)
                     relation_store[batch_idx] = torch.roll(relation_store[batch_idx], shifts=-1, dims=0)
                     parent_store[batch_idx] = torch.roll(parent_store[batch_idx], shifts=-1, dims=0)
+                    anchor_token_store[batch_idx] = torch.roll(anchor_token_store[batch_idx], shifts=-1, dims=0)
+                    anchor_span_store[batch_idx] = torch.roll(anchor_span_store[batch_idx], shifts=-1, dims=0)
+                    anchor_offset_store[batch_idx] = torch.roll(anchor_offset_store[batch_idx], shifts=-1, dims=0)
+                    anchor_length_store[batch_idx] = torch.roll(anchor_length_store[batch_idx], shifts=-1, dims=0)
+                    anchor_tag_store[batch_idx] = torch.roll(anchor_tag_store[batch_idx], shifts=-1, dims=0)
+                    anchor_flag_store[batch_idx] = torch.roll(anchor_flag_store[batch_idx], shifts=-1, dims=0)
+                    anchor_span_start_store[batch_idx] = torch.roll(anchor_span_start_store[batch_idx], shifts=-1, dims=0)
+                    if anchor_cursor_active[batch_idx]:
+                        anchor_cursor_pos[batch_idx] = anchor_cursor_pos[batch_idx] - 1
+                        if int(anchor_cursor_pos[batch_idx].item()) < 0:
+                            anchor_cursor_active[batch_idx] = False
+                            anchor_cursor_pos[batch_idx] = -1
+                            anchor_cursor_span_id[batch_idx] = 0
+                            anchor_cursor_offset[batch_idx] = 0
+                            anchor_cursor_length[batch_idx] = 0
+                            anchor_cursor_tag[batch_idx] = 0
                 lengths[batch_idx] = self.window
             token_store[batch_idx, slot] = int(token_ids[batch_idx].item()) if token_ids.dim() == 2 else int(token_ids[batch_idx])
             key_store[batch_idx, slot] = key[batch_idx]
@@ -3625,6 +3778,60 @@ class TokenMemoryCrossAttention(nn.Module):
             level_store[batch_idx, slot] = int(level_ids[batch_idx].item()) if level_ids.dim() == 2 else int(level_ids[batch_idx])
             relation_store[batch_idx, slot] = int(relation_ids[batch_idx].item()) if relation_ids.dim() == 2 else int(relation_ids[batch_idx])
             parent_store[batch_idx, slot] = int(parent_ids[batch_idx].item()) if parent_ids.dim() == 2 else int(parent_ids[batch_idx])
+            token_id = int(token_store[batch_idx, slot].item())
+            family_id = int(family_store[batch_idx, slot].item())
+            signature_id = int(signature_store[batch_idx, slot].item())
+            level_id = int(level_store[batch_idx, slot].item())
+            relation_id = int(relation_store[batch_idx, slot].item())
+            parent_id = int(parent_store[batch_idx, slot].item())
+            token_window = token_store[batch_idx, : lengths[batch_idx].item()]
+            token_count = int(token_window.eq(token_id).sum().item()) if token_window.numel() > 0 else 0
+            tag = self._anchor_tag(token_id, family_id, signature_id, level_id, relation_id, parent_id)
+            anchor_flag = self._anchor_flags(
+                token_id,
+                family_id,
+                signature_id,
+                level_id,
+                relation_id,
+                token_count,
+            )
+            if anchor_flag > 0:
+                prev_idx = slot - 1
+                prev_continues = False
+                prev_span_id = 0
+                prev_offset = -1
+                prev_span_start = slot
+                prev_tag = 0
+                if prev_idx >= 0 and anchor_flag_store[batch_idx, prev_idx].item() > 0:
+                    prev_span_id = int(anchor_span_store[batch_idx, prev_idx].item())
+                    prev_offset = int(anchor_offset_store[batch_idx, prev_idx].item())
+                    prev_span_start = int(anchor_span_start_store[batch_idx, prev_idx].item())
+                    prev_tag = int(anchor_tag_store[batch_idx, prev_idx].item())
+                    prev_continues = prev_span_id > 0 and prev_tag == tag and prev_offset + 1 >= 1
+                if prev_continues:
+                    span_id = prev_span_id
+                    offset = prev_offset + 1
+                    span_start = prev_span_start
+                else:
+                    span_id = int(anchor_span_store[batch_idx, : slot].max().item()) + 1 if slot > 0 else 1
+                    offset = 0
+                    span_start = slot
+                span_len = offset + 1
+                anchor_token_store[batch_idx, slot] = token_store[batch_idx, slot]
+                anchor_span_store[batch_idx, slot] = span_id
+                anchor_offset_store[batch_idx, slot] = offset
+                anchor_length_store[batch_idx, slot] = span_len
+                anchor_tag_store[batch_idx, slot] = tag
+                anchor_flag_store[batch_idx, slot] = anchor_flag
+                anchor_span_start_store[batch_idx, slot] = span_start
+            else:
+                anchor_token_store[batch_idx, slot] = token_store[batch_idx, slot]
+                anchor_span_store[batch_idx, slot] = 0
+                anchor_offset_store[batch_idx, slot] = 0
+                anchor_length_store[batch_idx, slot] = 0
+                anchor_tag_store[batch_idx, slot] = 0
+                anchor_flag_store[batch_idx, slot] = 0
+                anchor_span_start_store[batch_idx, slot] = slot
             if token_store[batch_idx, slot].item() == pad_token and int(token_ids[batch_idx].item()) == pad_token:
                 continue
         return TokenMemoryState(
@@ -3637,6 +3844,19 @@ class TokenMemoryCrossAttention(nn.Module):
             relation_ids=relation_store,
             parent_ids=parent_store,
             lengths=lengths,
+            anchor_token_ids=anchor_token_store,
+            anchor_span_ids=anchor_span_store,
+            anchor_offsets=anchor_offset_store,
+            anchor_lengths=anchor_length_store,
+            anchor_tags=anchor_tag_store,
+            anchor_flags=anchor_flag_store,
+            anchor_span_starts=anchor_span_start_store,
+            anchor_cursor_pos=anchor_cursor_pos,
+            anchor_cursor_span_id=anchor_cursor_span_id,
+            anchor_cursor_offset=anchor_cursor_offset,
+            anchor_cursor_length=anchor_cursor_length,
+            anchor_cursor_tag=anchor_cursor_tag,
+            anchor_cursor_active=anchor_cursor_active,
         )
 
     def forward(
@@ -3713,6 +3933,8 @@ class TokenMemoryCrossAttention(nn.Module):
             memory_context = torch.zeros_like(step_hidden)
             step_copy_logits = torch.zeros(batch, self.vocab_size, device=device, dtype=dtype)
             step_confidence = torch.zeros(batch, device=device, dtype=dtype)
+            batch_top_idx: List[Optional[torch.Tensor]] = [None] * batch
+            batch_usable_mask: List[Optional[torch.Tensor]] = [None] * batch
             start_select = time.perf_counter()
             for batch_idx in range(batch):
                 length = int(memory_state.lengths[batch_idx].item())
@@ -3766,10 +3988,41 @@ class TokenMemoryCrossAttention(nn.Module):
                             selected_token_ids,
                             weights * usable_mask.to(dtype) * self.copy_bias * step_confidence[batch_idx].clamp(min=0.0, max=1.0),
                         )
+                    batch_top_idx[batch_idx] = top_idx
+                    batch_usable_mask[batch_idx] = usable_mask
             if bool(getattr(self.cfg, "profile_runtime", False)):
                 timing_totals["timing_token_memory_select_ms"] = timing_totals.get("timing_token_memory_select_ms", 0.0) + (
                     (time.perf_counter() - start_select) * 1000.0
                 )
+            for batch_idx in range(batch):
+                if step_confidence[batch_idx].item() < self.copy_min_confidence:
+                    continue
+                if not (step_copy_logits[batch_idx].abs().sum().item() > 0.0):
+                    continue
+                candidate_top_idx = batch_top_idx[batch_idx]
+                candidate_mask = batch_usable_mask[batch_idx]
+                if candidate_top_idx is None or candidate_mask is None:
+                    continue
+                candidate_pos: Optional[int] = None
+                for cand_idx in range(candidate_top_idx.size(0)):
+                    if not bool(candidate_mask[cand_idx].item()):
+                        continue
+                    candidate_pos = int(candidate_top_idx[cand_idx].item())
+                    break
+                if candidate_pos is None:
+                    continue
+                span_id = int(memory_state.anchor_span_ids[batch_idx, candidate_pos].item())
+                span_start = int(memory_state.anchor_span_starts[batch_idx, candidate_pos].item())
+                span_len = int(memory_state.anchor_lengths[batch_idx, candidate_pos].item())
+                span_tag = int(memory_state.anchor_tags[batch_idx, candidate_pos].item())
+                if span_id <= 0 or span_len <= 0:
+                    continue
+                memory_state.anchor_cursor_active[batch_idx] = True
+                memory_state.anchor_cursor_pos[batch_idx] = span_start
+                memory_state.anchor_cursor_span_id[batch_idx] = span_id
+                memory_state.anchor_cursor_offset[batch_idx] = 0
+                memory_state.anchor_cursor_length[batch_idx] = span_len
+                memory_state.anchor_cursor_tag[batch_idx] = span_tag
             start_project = time.perf_counter()
             gate = torch.sigmoid(self.gate_proj(query_input))
             delta = self.out_proj(memory_context)
@@ -3811,6 +4064,19 @@ class TokenMemoryCrossAttention(nn.Module):
                 relation_ids=memory_state.relation_ids.detach(),
                 parent_ids=memory_state.parent_ids.detach(),
                 lengths=memory_state.lengths.detach(),
+                anchor_token_ids=memory_state.anchor_token_ids.detach(),
+                anchor_span_ids=memory_state.anchor_span_ids.detach(),
+                anchor_offsets=memory_state.anchor_offsets.detach(),
+                anchor_lengths=memory_state.anchor_lengths.detach(),
+                anchor_tags=memory_state.anchor_tags.detach(),
+                anchor_flags=memory_state.anchor_flags.detach(),
+                anchor_span_starts=memory_state.anchor_span_starts.detach(),
+                anchor_cursor_pos=memory_state.anchor_cursor_pos.detach(),
+                anchor_cursor_span_id=memory_state.anchor_cursor_span_id.detach(),
+                anchor_cursor_offset=memory_state.anchor_cursor_offset.detach(),
+                anchor_cursor_length=memory_state.anchor_cursor_length.detach(),
+                anchor_cursor_tag=memory_state.anchor_cursor_tag.detach(),
+                anchor_cursor_active=memory_state.anchor_cursor_active.detach(),
             )
         stats = {
             "token_memory_enabled": torch.tensor(1.0, device=device),
@@ -4394,6 +4660,112 @@ class PrismalWaveModel(nn.Module):
             if 0 <= token_id < blocked.size(-1):
                 blocked[:, token_id] = 0.0
         return logits + blocked
+
+    def _token_memory_anchor_next_ids(
+        self,
+        token_memory_state: Optional[TokenMemoryState],
+        *,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if token_memory_state is None:
+            return None
+        active = token_memory_state.anchor_cursor_active
+        if active is None or not bool(active.any().item() if active.numel() > 0 else False):
+            return None
+        batch_size = token_memory_state.token_ids.size(0)
+        next_ids = torch.full((batch_size, 1), -1, device=device, dtype=torch.long)
+        cursor_pos = token_memory_state.anchor_cursor_pos.to(device=device, dtype=torch.long)
+        token_ids = token_memory_state.anchor_token_ids.to(device=device, dtype=torch.long)
+        for batch_idx in range(batch_size):
+            if not bool(active[batch_idx].item()):
+                continue
+            pos = int(cursor_pos[batch_idx].item())
+            if pos < 0 or pos >= token_ids.size(1):
+                continue
+            next_ids[batch_idx, 0] = token_ids[batch_idx, pos]
+        if bool(next_ids.ge(0).any().item()):
+            return next_ids
+        return None
+
+    def _advance_token_memory_anchor_state(
+        self,
+        token_memory_state: Optional[TokenMemoryState],
+        emitted_ids: torch.Tensor,
+    ) -> Optional[TokenMemoryState]:
+        if token_memory_state is None:
+            return None
+        if emitted_ids.dim() == 1:
+            emitted_ids = emitted_ids.unsqueeze(-1)
+        active = token_memory_state.anchor_cursor_active.to(device=emitted_ids.device, dtype=torch.bool)
+        if not bool(active.any().item() if active.numel() > 0 else False):
+            return token_memory_state
+        token_ids = token_memory_state.anchor_token_ids.to(device=emitted_ids.device, dtype=torch.long)
+        cursor_pos = token_memory_state.anchor_cursor_pos.to(device=emitted_ids.device, dtype=torch.long).clone()
+        cursor_span_id = token_memory_state.anchor_cursor_span_id.to(device=emitted_ids.device, dtype=torch.long).clone()
+        cursor_offset = token_memory_state.anchor_cursor_offset.to(device=emitted_ids.device, dtype=torch.long).clone()
+        cursor_length = token_memory_state.anchor_cursor_length.to(device=emitted_ids.device, dtype=torch.long).clone()
+        cursor_tag = token_memory_state.anchor_cursor_tag.to(device=emitted_ids.device, dtype=torch.long).clone()
+        cursor_active = active.clone()
+        batch_size = emitted_ids.size(0)
+        for batch_idx in range(batch_size):
+            if not bool(cursor_active[batch_idx].item()):
+                continue
+            pos = int(cursor_pos[batch_idx].item())
+            if pos < 0 or pos >= token_ids.size(1):
+                cursor_active[batch_idx] = False
+                cursor_pos[batch_idx] = -1
+                cursor_span_id[batch_idx] = 0
+                cursor_offset[batch_idx] = 0
+                cursor_length[batch_idx] = 0
+                cursor_tag[batch_idx] = 0
+                continue
+            expected = int(token_ids[batch_idx, pos].item())
+            emitted = int(emitted_ids[batch_idx, 0].item())
+            if emitted != expected:
+                cursor_active[batch_idx] = False
+                cursor_pos[batch_idx] = -1
+                cursor_span_id[batch_idx] = 0
+                cursor_offset[batch_idx] = 0
+                cursor_length[batch_idx] = 0
+                cursor_tag[batch_idx] = 0
+                continue
+            next_offset = int(cursor_offset[batch_idx].item()) + 1
+            next_pos = pos + 1
+            span_len = int(cursor_length[batch_idx].item())
+            if next_offset >= span_len or next_pos >= token_ids.size(1):
+                cursor_active[batch_idx] = False
+                cursor_pos[batch_idx] = -1
+                cursor_span_id[batch_idx] = 0
+                cursor_offset[batch_idx] = 0
+                cursor_length[batch_idx] = 0
+                cursor_tag[batch_idx] = 0
+            else:
+                cursor_pos[batch_idx] = next_pos
+                cursor_offset[batch_idx] = next_offset
+        return TokenMemoryState(
+            token_ids=token_memory_state.token_ids.to(device=emitted_ids.device, dtype=torch.long),
+            memory_keys=token_memory_state.memory_keys.to(device=emitted_ids.device, dtype=token_memory_state.memory_keys.dtype),
+            memory_values=token_memory_state.memory_values.to(device=emitted_ids.device, dtype=token_memory_state.memory_values.dtype),
+            family_ids=token_memory_state.family_ids.to(device=emitted_ids.device, dtype=torch.long),
+            signature_ids=token_memory_state.signature_ids.to(device=emitted_ids.device, dtype=torch.long),
+            level_ids=token_memory_state.level_ids.to(device=emitted_ids.device, dtype=torch.long),
+            relation_ids=token_memory_state.relation_ids.to(device=emitted_ids.device, dtype=torch.long),
+            parent_ids=token_memory_state.parent_ids.to(device=emitted_ids.device, dtype=torch.long),
+            lengths=token_memory_state.lengths.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_token_ids=token_memory_state.anchor_token_ids.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_span_ids=token_memory_state.anchor_span_ids.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_offsets=token_memory_state.anchor_offsets.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_lengths=token_memory_state.anchor_lengths.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_tags=token_memory_state.anchor_tags.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_flags=token_memory_state.anchor_flags.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_span_starts=token_memory_state.anchor_span_starts.to(device=emitted_ids.device, dtype=torch.long),
+            anchor_cursor_pos=cursor_pos,
+            anchor_cursor_span_id=cursor_span_id,
+            anchor_cursor_offset=cursor_offset,
+            anchor_cursor_length=cursor_length,
+            anchor_cursor_tag=cursor_tag,
+            anchor_cursor_active=cursor_active,
+        )
 
     def _relay_temperature(self, step_index: int, base_temperature: float) -> float:
         base_temperature = max(1e-3, float(base_temperature))
@@ -6325,6 +6697,24 @@ class PrismalWaveModel(nn.Module):
                 "avg_entropy"
             ].float()
 
+        def _force_anchor_logits(
+            logits: torch.Tensor,
+            memory_state: Optional[TokenMemoryState],
+        ) -> Tuple[torch.Tensor, bool]:
+            anchor_next_ids = self._token_memory_anchor_next_ids(memory_state, device=logits.device)
+            if anchor_next_ids is None:
+                return logits, False
+            active_mask = anchor_next_ids.ge(0).squeeze(-1)
+            if not bool(active_mask.any().item()):
+                return logits, False
+            forced = logits.clone()
+            for row_idx in range(forced.size(0)):
+                if not bool(active_mask[row_idx].item()):
+                    continue
+                forced[row_idx] = float("-inf")
+                forced[row_idx, int(anchor_next_ids[row_idx, 0].item())] = 0.0
+            return forced, True
+
         generated = input_ids.clone()
         generated_families = signature_family_ids.clone() if signature_family_ids is not None else torch.zeros_like(generated)
         generated_signatures = signature_ids.clone() if signature_ids is not None else torch.zeros_like(generated)
@@ -6332,6 +6722,7 @@ class PrismalWaveModel(nn.Module):
         generated_relations = signature_relation_ids.clone() if signature_relation_ids is not None else torch.zeros_like(generated)
         generated_parents = parent_signature_ids.clone() if parent_signature_ids is not None else generated_signatures.clone()
         carried_token_memory_state = token_memory_state
+        anchor_token_memory_state = token_memory_state
         min_new_tokens = max(0, int(min_new_tokens))
         top_p = float(max(0.0, min(1.0, top_p)))
 
@@ -6353,6 +6744,7 @@ class PrismalWaveModel(nn.Module):
         if base_slots is None:
             base_slots = self.router.init_slots(generated.size(0), generated.device)
         prompt_logits = probe_output.logits[:, -1, :]
+        prompt_anchor_state = token_memory_state
 
         beams = [
             {
@@ -6365,6 +6757,7 @@ class PrismalWaveModel(nn.Module):
                 "slots": base_slots,
                 "lattice_state": probe_output.signature_lattice_state,
                 "memory_state": probe_output.token_memory_state,
+                "anchor_state": prompt_anchor_state,
                 "score": 0.0,
                 "finished": False,
                 "prefill_done": False,
@@ -6386,7 +6779,7 @@ class PrismalWaveModel(nn.Module):
                     candidates.append(beam)
                     continue
                 if not bool(beam.get("prefill_done", False)):
-                    logits = beam["prompt_logits"]
+                    logits, anchor_forced = _force_anchor_logits(beam["prompt_logits"], beam.get("anchor_state"))
                     next_slots = beam["slots"]
                     output = probe_output
                     next_committed_path_index = int(beam.get("committed_path_index", committed_path_index))
@@ -6422,6 +6815,7 @@ class PrismalWaveModel(nn.Module):
                                 step_idx,
                                 fallback_lane=next_committed_path_index,
                             )
+                            logits, anchor_forced = _force_anchor_logits(logits, beam.get("anchor_state"))
                             decode_temperature = max(
                                 float(temperature),
                                 float(lane_temperature) if self.use_race_lanes else float(temperature),
@@ -6451,7 +6845,7 @@ class PrismalWaveModel(nn.Module):
                                 logits = torch.full_like(logits, float("-inf"))
                                 logits.scatter_(1, sorted_idx, sorted_logits)
                             log_probs = F.log_softmax(logits, dim=-1)
-                            candidate_k = min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
+                            candidate_k = 1 if anchor_forced else min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
                             top_log_probs, top_token_ids = torch.topk(log_probs, k=candidate_k, dim=-1)
                             quality = float(step_quality(output).mean().item())
                             for idx in range(top_token_ids.size(-1)):
@@ -6477,6 +6871,7 @@ class PrismalWaveModel(nn.Module):
                                 new_relations = torch.cat([beam["relations"], next_relation], dim=-1)
                                 new_parents = torch.cat([beam["parents"], next_parent], dim=-1)
                                 finished = bool(step_idx + 1 >= min_new_tokens and torch.all(next_id.squeeze(-1) == self.cfg.eos_id))
+                                next_memory_state = self._advance_token_memory_anchor_state(beam.get("anchor_state"), next_id)
                                 candidates.append(
                                     {
                                         "generated": new_generated,
@@ -6487,7 +6882,7 @@ class PrismalWaveModel(nn.Module):
                                         "parents": new_parents,
                                         "slots": next_slots,
                                         "lattice_state": output.signature_lattice_state,
-                                        "memory_state": output.token_memory_state,
+                                        "memory_state": next_memory_state if next_memory_state is not None else output.token_memory_state,
                                         "score": float(beam["score"]) + next_logprob + self.cfg.beam_signature_weight * quality,
                                         "finished": finished,
                                         "prefill_done": True,
@@ -6520,6 +6915,7 @@ class PrismalWaveModel(nn.Module):
                             step_idx,
                             fallback_lane=next_committed_path_index,
                         )
+                        logits, anchor_forced = _force_anchor_logits(logits, beam.get("anchor_state"))
                     else:
                         next_committed_path_index = current_committed
                         output = self.forward(
@@ -6536,6 +6932,7 @@ class PrismalWaveModel(nn.Module):
                         next_slots = output.slot_state if output.slot_state is not None else beam["slots"]
                         lane_band = self._race_lane_band_from_score(float(output.route_stats["signature_agreement"].float().mean().item()))
                         lane_temperature = self._race_lane_temperature(next_committed_path_index, step_idx, temperature)
+                        logits, anchor_forced = _force_anchor_logits(logits, beam.get("anchor_state"))
                 decode_temperature = max(
                     float(temperature),
                     float(lane_temperature) if self.use_race_lanes else float(temperature),
@@ -6566,7 +6963,7 @@ class PrismalWaveModel(nn.Module):
                     logits.scatter_(1, sorted_idx, sorted_logits)
 
                 log_probs = F.log_softmax(logits, dim=-1)
-                candidate_k = min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
+                candidate_k = 1 if anchor_forced else min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
                 top_log_probs, top_token_ids = torch.topk(log_probs, k=candidate_k, dim=-1)
                 quality = float(step_quality(output).mean().item())
                 for idx in range(top_token_ids.size(-1)):
@@ -6592,6 +6989,8 @@ class PrismalWaveModel(nn.Module):
                     new_relations = torch.cat([beam["relations"], next_relation], dim=-1)
                     new_parents = torch.cat([beam["parents"], next_parent], dim=-1)
                     finished = bool(step_idx + 1 >= min_new_tokens and torch.all(next_id.squeeze(-1) == self.cfg.eos_id))
+                    next_anchor_state = self._advance_token_memory_anchor_state(beam.get("anchor_state"), next_id)
+                    next_memory_state = self._advance_token_memory_anchor_state(beam.get("anchor_state"), next_id)
                     candidates.append(
                         {
                             "generated": new_generated,
@@ -6600,14 +6999,15 @@ class PrismalWaveModel(nn.Module):
                             "levels": new_levels,
                             "relations": new_relations,
                             "parents": new_parents,
-                                    "slots": next_slots,
-                                    "lattice_state": output.signature_lattice_state,
-                                    "memory_state": output.token_memory_state,
-                                    "score": float(beam["score"]) + next_logprob + self.cfg.beam_signature_weight * quality,
-                                    "finished": finished,
-                                    "prefill_done": True,
-                                    "prompt_logits": beam["prompt_logits"],
-                                    "committed_path_index": next_committed_path_index,
+                            "slots": next_slots,
+                            "lattice_state": output.signature_lattice_state,
+                            "memory_state": next_memory_state if next_memory_state is not None else output.token_memory_state,
+                            "anchor_state": next_anchor_state if next_anchor_state is not None else beam.get("anchor_state"),
+                            "score": float(beam["score"]) + next_logprob + self.cfg.beam_signature_weight * quality,
+                            "finished": finished,
+                            "prefill_done": True,
+                            "prompt_logits": beam["prompt_logits"],
+                            "committed_path_index": next_committed_path_index,
                         }
                     )
             candidates.sort(key=lambda item: float(item["score"]), reverse=True)
@@ -6802,6 +7202,7 @@ class PrismalWaveModel(nn.Module):
         carried_slots = slot_state
         carried_lattice_state = signature_lattice_state
         carried_token_memory_state = token_memory_state
+        anchor_token_memory_state = token_memory_state
         committed_path_index: Optional[int] = None
         min_new_tokens = max(0, int(min_new_tokens))
         speculative_draft_tokens = max(1, int(speculative_draft_tokens))
@@ -6825,6 +7226,40 @@ class PrismalWaveModel(nn.Module):
         carried_slots = prefill_output.slot_state if prefill_output.slot_state is not None else carried_slots
         carried_lattice_state = prefill_output.signature_lattice_state if prefill_output.signature_lattice_state is not None else carried_lattice_state
         carried_token_memory_state = prefill_output.token_memory_state if prefill_output.token_memory_state is not None else carried_token_memory_state
+        if (
+            carried_token_memory_state is not None
+            and carried_token_memory_state.anchor_cursor_active.numel() > 0
+            and bool(carried_token_memory_state.anchor_cursor_active.any().item())
+        ):
+            return self.generate(
+                input_ids,
+                signature_family_ids=signature_family_ids,
+                signature_ids=signature_ids,
+                signature_level_ids=signature_level_ids,
+                signature_relation_ids=signature_relation_ids,
+                parent_signature_ids=parent_signature_ids,
+                slot_state=slot_state,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                beam_size=1,
+                token_signature_lookup=token_signature_lookup,
+                token_family_lookup=token_family_lookup,
+                token_level_lookup=token_level_lookup,
+                token_relation_lookup=token_relation_lookup,
+                suppressed_token_ids=suppressed_token_ids,
+                recommit_interval=recommit_interval,
+                recommit_signature_threshold=recommit_signature_threshold,
+                signature_lattice_state=signature_lattice_state,
+                token_memory_state=token_memory_state,
+                use_speculative_decoding=False,
+                speculative_draft_tokens=1,
+                speculative_temperature=0.0,
+            )
 
         while generated.size(1) < total_target_len:
             remaining = total_target_len - generated.size(1)
@@ -7083,7 +7518,49 @@ class PrismalWaveModel(nn.Module):
         speculative_temperature = float(
             speculative_temperature if speculative_temperature is not None else getattr(self.cfg, "speculative_temperature", 0.0)
         )
-        if speculative_enabled and speculative_draft_tokens > 1 and self.use_torus_core and self.use_hmote and beam_size == 1:
+        anchor_rail_active = bool(
+            token_memory_state is not None
+            and token_memory_state.anchor_cursor_active.numel() > 0
+            and bool(token_memory_state.anchor_cursor_active.any().item())
+        )
+        if anchor_rail_active and beam_size > 1:
+            return self.generate(
+                input_ids,
+                signature_family_ids=signature_family_ids,
+                signature_ids=signature_ids,
+                signature_level_ids=signature_level_ids,
+                signature_relation_ids=signature_relation_ids,
+                parent_signature_ids=parent_signature_ids,
+                slot_state=slot_state,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                beam_size=1,
+                token_signature_lookup=token_signature_lookup,
+                token_family_lookup=token_family_lookup,
+                token_level_lookup=token_level_lookup,
+                token_relation_lookup=token_relation_lookup,
+                suppressed_token_ids=suppressed_token_ids,
+                recommit_interval=recommit_interval,
+                recommit_signature_threshold=recommit_signature_threshold,
+                signature_lattice_state=signature_lattice_state,
+                token_memory_state=token_memory_state,
+                use_speculative_decoding=False,
+                speculative_draft_tokens=1,
+                speculative_temperature=0.0,
+            )
+        if (
+            speculative_enabled
+            and speculative_draft_tokens > 1
+            and self.use_torus_core
+            and self.use_hmote
+            and beam_size == 1
+            and not anchor_rail_active
+        ):
             return self._coarse_fine_speculative_generate(
                 input_ids,
                 signature_family_ids=signature_family_ids,
@@ -7179,6 +7656,7 @@ class PrismalWaveModel(nn.Module):
         carried_slots = slot_state
         carried_lattice_state = signature_lattice_state
         carried_token_memory_state = token_memory_state
+        anchor_token_memory_state = token_memory_state
         committed_path_index: Optional[int] = None
         min_new_tokens = max(0, int(min_new_tokens))
         top_p = float(max(0.0, min(1.0, top_p)))
@@ -7322,8 +7800,18 @@ class PrismalWaveModel(nn.Module):
             sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
             logits = torch.full_like(logits, float("-inf"))
             logits.scatter_(1, sorted_idx, sorted_logits)
-        probs = F.softmax(logits, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1)
+        anchor_next_ids = self._token_memory_anchor_next_ids(anchor_token_memory_state, device=input_ids.device)
+        if anchor_next_ids is not None:
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            active_anchor_mask = anchor_next_ids.ge(0)
+            if bool(active_anchor_mask.any().item()):
+                next_id = next_id.clone()
+                next_id[active_anchor_mask] = anchor_next_ids[active_anchor_mask]
+        else:
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+        anchor_token_memory_state = self._advance_token_memory_anchor_state(anchor_token_memory_state, next_id)
         if token_signature_lookup is not None:
             next_sig = _lookup_next_tokens(token_signature_lookup_tensor, next_id, 7)
         else:
@@ -7414,8 +7902,18 @@ class PrismalWaveModel(nn.Module):
                 sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
                 logits = torch.full_like(logits, float("-inf"))
                 logits.scatter_(1, sorted_idx, sorted_logits)
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
+            anchor_next_ids = self._token_memory_anchor_next_ids(anchor_token_memory_state, device=input_ids.device)
+            if anchor_next_ids is not None:
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
+                active_anchor_mask = anchor_next_ids.ge(0)
+                if bool(active_anchor_mask.any().item()):
+                    next_id = next_id.clone()
+                    next_id[active_anchor_mask] = anchor_next_ids[active_anchor_mask]
+            else:
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
+            anchor_token_memory_state = self._advance_token_memory_anchor_state(anchor_token_memory_state, next_id)
             if token_signature_lookup is not None:
                 next_sig = _lookup_next_tokens(token_signature_lookup_tensor, next_id, 7)
             else:

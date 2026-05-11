@@ -98,7 +98,7 @@ class PrismalWaveConfig:
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
     use_token_memory_cross_attention: bool = True
-    use_token_memory_generation_cache: bool = False
+    use_token_memory_generation_cache: bool = True
     token_memory_window: int = 96
     token_memory_top_k: int = 4
     token_memory_weight: float = 0.18
