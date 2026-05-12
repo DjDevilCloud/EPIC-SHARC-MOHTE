@@ -80,7 +80,7 @@ class PrismalWaveConfig:
     leaf_cell_enabled: bool = True
     leaf_cell_dim: int = 64
     leaf_router_confidence_threshold: float = 0.75
-    max_families_per_nest: int = 64
+    max_families_per_nest: int = 15
     family_budget: int = 16
     family_specialist_bank_size: int = 6
     use_mixture_of_torus: bool = True

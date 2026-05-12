@@ -261,19 +261,19 @@ class ProgressTracker:
         if balance_loss is not None:
             usage_text += f" bal={balance_loss:.4f}"
         if torus_coverage is not None:
-            usage_text += f" cov={torus_coverage:.4f}"
+            usage_text += f" torus_cov={torus_coverage:.4f}"
         if normalized_breadth is not None:
-            usage_text += f" breadth={normalized_breadth:.4f}"
+            usage_text += f" cell_breadth={normalized_breadth:.4f}"
         if soft_active_emitters is not None:
-            usage_text += f" soft_raw={soft_active_emitters:.2f}"
+            usage_text += f" soft_active={soft_active_emitters:.2f}"
         if soft_breadth is not None:
-            usage_text += f" soft_breadth={soft_breadth:.4f}"
+            usage_text += f" soft_cell_breadth={soft_breadth:.4f}"
         if usage_concentration is not None:
-            usage_text += f" conc={usage_concentration:.4f}"
+            usage_text += f" usage_conc={usage_concentration:.4f}"
         if effective_emitters is not None:
-            usage_text += f" eff={effective_emitters:.2f}"
+            usage_text += f" eff_count={effective_emitters:.2f}"
         if emitter_cell_coverage is not None:
-            usage_text += f" ccv={emitter_cell_coverage:.4f}"
+            usage_text += f" cell_cov={emitter_cell_coverage:.4f}"
         if self.streaming_mode:
             print(
                 f"[Prismal] stream epoch {epoch_idx} "
@@ -1487,14 +1487,14 @@ def train_model(
                 f"[Prismal] {label} "
                 f"val_total={val_metrics['loss']:.4f} val_ce={val_metrics.get('ce_loss', 0.0):.4f} val_aux={val_metrics.get('aux_loss', 0.0):.4f} "
                 f"val_sig={val_metrics['signature_agreement']:.4f} "
-                f"val_raw={val_raw_active:.2f} "
-                f"val_soft_raw={val_soft_active:.2f} "
-                f"val_eff={val_effective:.2f} "
-                f"val_breadth={val_breadth:.4f} "
-                f"val_soft_breadth={val_soft_breadth:.4f} "
-                f"val_balance={val_balance:.4f} "
-                f"val_usage={val_usage_entropy:.4f} "
-                f"val_conc={val_usage_concentration:.4f} "
+                f"val_active={val_raw_active:.2f} "
+                f"val_soft_active={val_soft_active:.2f} "
+                f"val_eff_count={val_effective:.2f} "
+                f"val_cell_breadth={val_breadth:.4f} "
+                f"val_soft_cell_breadth={val_soft_breadth:.4f} "
+                f"val_cell_cov={val_balance:.4f} "
+                f"val_usage_entropy={val_usage_entropy:.4f} "
+                f"val_usage_conc={val_usage_concentration:.4f} "
                 f"geom_local={val_local_r} "
                 f"geom_scout={val_scout_r} "
                 f"geom_relay={val_relay_r}",

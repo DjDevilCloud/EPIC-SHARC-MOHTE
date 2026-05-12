@@ -3983,12 +3983,13 @@ class TokenMemoryCrossAttention(nn.Module):
                     special_mask = torch.ones_like(selected_token_ids, dtype=torch.bool)
                     for special_id in special_token_ids:
                         special_mask = special_mask & selected_token_ids.ne(special_id)
-                    usable_mask = rare_mask & special_mask
+                    valid_token_mask = (selected_token_ids >= 0) & (selected_token_ids < self.vocab_size)
+                    usable_mask = rare_mask & special_mask & valid_token_mask
                     if usable_mask.any():
                         step_copy_logits[batch_idx].scatter_add_(
                             0,
-                            selected_token_ids,
-                            weights * usable_mask.to(dtype) * self.copy_bias * step_confidence[batch_idx].clamp(min=0.0, max=1.0),
+                            selected_token_ids[usable_mask],
+                            weights[usable_mask] * self.copy_bias * step_confidence[batch_idx].clamp(min=0.0, max=1.0),
                         )
                     batch_top_idx[batch_idx] = top_idx
                     batch_usable_mask[batch_idx] = usable_mask
@@ -7946,4 +7947,3 @@ class PrismalWaveModel(nn.Module):
             if step_idx + 1 >= min_new_tokens and torch.all(next_id.squeeze(-1) == self.cfg.eos_id):
                 break
         return generated
-

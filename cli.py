@@ -623,7 +623,6 @@ def main(argv: List[str] | None = None) -> int:
         if continue_checkpoint:
             model, tokenizer, raw_cfg = load_bundle_from_checkpoint(continue_checkpoint, device=device, load_training_state=False)
             model = model.to(device)
-            model = maybe_compile_model(model, enabled=args.torch_compile)
             tokenizer = build_tokenizer_from_source(
                 args.data,
                 max_new_tokens=args.max_new_tokens,
@@ -654,6 +653,7 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.muon_ns_steps = getattr(args, "muon_ns_steps", raw_cfg.muon_ns_steps)
             raw_cfg.muon_extra_scale_factor = getattr(args, "muon_extra_scale_factor", raw_cfg.muon_extra_scale_factor)
             raw_cfg.muon_scalar_optimizer = getattr(args, "muon_scalar_optimizer", raw_cfg.muon_scalar_optimizer)
+            model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] initialized checkpoint weights "
                 f"d={model.cfg.d_model} torus={model.cfg.torus_depth}x{model.cfg.torus_height}x{model.cfg.torus_width} "
@@ -686,7 +686,6 @@ def main(argv: List[str] | None = None) -> int:
         elif resume_checkpoint:
             model, tokenizer, raw_cfg = load_bundle_from_checkpoint(resume_checkpoint, device=device)
             model = model.to(device)
-            model = maybe_compile_model(model, enabled=args.torch_compile)
             tokenizer = build_tokenizer_from_source(
                 args.data,
                 max_new_tokens=args.max_new_tokens,
@@ -717,6 +716,7 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.muon_ns_steps = getattr(args, "muon_ns_steps", raw_cfg.muon_ns_steps)
             raw_cfg.muon_extra_scale_factor = getattr(args, "muon_extra_scale_factor", raw_cfg.muon_extra_scale_factor)
             raw_cfg.muon_scalar_optimizer = getattr(args, "muon_scalar_optimizer", raw_cfg.muon_scalar_optimizer)
+            model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] resumed checkpoint architecture "
                 f"d={model.cfg.d_model} torus={model.cfg.torus_depth}x{model.cfg.torus_height}x{model.cfg.torus_width} "
