@@ -22,7 +22,7 @@ class PrismalWaveConfig:
     optimizer: str = "hierarchical"
     hierarchical_precision_enabled: bool = True
     hierarchical_precision_root_dtype: str = "bf16"
-    hierarchical_precision_mid_dtype: str = "float8_e4m3fn"
+    hierarchical_precision_mid_dtype: str = "bf16"
     hierarchical_precision_leaf_dtype: str = "fp4"
     hierarchical_precision_fallback_dtype: str = "bf16"
     hierarchical_precision_accumulator_dtype: str = "bf16"
@@ -60,7 +60,7 @@ class PrismalWaveConfig:
     use_torus_core: bool = True
     use_hmote: bool = True
     use_recursive_hmoe: bool = True
-    use_gradient_checkpointing: bool = True
+    use_gradient_checkpointing: bool = False
     hmote_depth: int = 1
     hmote_branching: int = 1
     hierarchical_nest_depth: int = 1
@@ -80,7 +80,7 @@ class PrismalWaveConfig:
     leaf_cell_enabled: bool = True
     leaf_cell_dim: int = 64
     leaf_router_confidence_threshold: float = 0.75
-    max_families_per_nest: int = 16
+    max_families_per_nest: int = 64
     family_budget: int = 16
     family_specialist_bank_size: int = 6
     use_mixture_of_torus: bool = True
@@ -204,7 +204,7 @@ class PrismalWaveConfig:
     beam_coherence_weight: float = 0.45
     memory_momentum: float = 0.85
     use_speculative_decoding: bool = True
-    speculative_draft_tokens: int = 2
+    speculative_draft_tokens: int = 6
     speculative_temperature: float = 0.01
     validator_temperature: float = 0.15
     emitter_grid_height: int = 0
@@ -371,9 +371,29 @@ class PrismalWaveConfig:
             self.speculative_temperature = 0.0
         self.use_hmote = bool(self.use_hmote)
         self.use_bitsandbytes_leaf_precision = bool(self.use_bitsandbytes_leaf_precision)
-        self.bitsandbytes_leaf_precision_mode = str(self.bitsandbytes_leaf_precision_mode).strip().lower() or "int4"
-        self.bitsandbytes_leaf_quant_type = str(self.bitsandbytes_leaf_quant_type).strip().lower() or "nf4"
-        self.bitsandbytes_leaf_compute_dtype = str(self.bitsandbytes_leaf_compute_dtype).strip().lower() or "bfloat16"
+        def _normalize_choice(value: object, *, fallback: str, allowed: set[str]) -> str:
+            text = str(value or "").strip().lower()
+            if text in allowed:
+                return text
+            return fallback
+
+        # Keep these values safe even if they arrive from an old config file or a
+        # boolean flag that was serialized into JSON as `false`.
+        self.bitsandbytes_leaf_precision_mode = _normalize_choice(
+            self.bitsandbytes_leaf_precision_mode,
+            fallback="int4",
+            allowed={"int4"},
+        )
+        self.bitsandbytes_leaf_quant_type = _normalize_choice(
+            self.bitsandbytes_leaf_quant_type,
+            fallback="nf4",
+            allowed={"fp4", "nf4"},
+        )
+        self.bitsandbytes_leaf_compute_dtype = _normalize_choice(
+            self.bitsandbytes_leaf_compute_dtype,
+            fallback="bfloat16",
+            allowed={"bfloat16", "bf16", "float16", "fp16"},
+        )
         if self.use_hmote:
             self.use_recursive_hmoe = True
             self.use_mixture_of_torus = True
