@@ -20,6 +20,8 @@ class PrismalWaveConfig:
     max_samples: int = 0
     lr: float = 0.00008
     optimizer: str = "hierarchical"
+    use_gradient_accumulation: bool = True
+    gradient_accumulation_steps: int = 4
     hierarchical_precision_enabled: bool = True
     hierarchical_precision_root_dtype: str = "bf16"
     hierarchical_precision_mid_dtype: str = "bf16"
@@ -34,12 +36,12 @@ class PrismalWaveConfig:
     muon_ns_steps: int = 8
     muon_extra_scale_factor: float = 0.5
     muon_scalar_optimizer: str = "adamw"
-    d_model: int = 1024
+    d_model: int = 512
     n_layers: int = 1
-    n_emitters: int = 256
-    n_slots: int = 128
+    n_emitters: int = 64
+    n_slots: int = 32
     n_paths: int = 1
-    top_k_emitters: int = 8
+    top_k_emitters: int = 4
     top_k_slots: int = 4
     max_seq_len: int = 0
     position_embedding_init_size: int = 256
@@ -50,7 +52,7 @@ class PrismalWaveConfig:
     use_turbo_quantization: bool = False
     turbo_quantization_bits: int = 3
     turbo_quantization_method: str = "turbo"
-    use_bitsandbytes_leaf_precision: bool = True
+    use_bitsandbytes_leaf_precision: bool = False
     bitsandbytes_leaf_precision_mode: str = "fp4"
     bitsandbytes_leaf_quant_type: str = "fp4"
     bitsandbytes_leaf_compute_dtype: str = "fp4"
@@ -97,7 +99,13 @@ class PrismalWaveConfig:
     signature_lattice_decay: float = 0.85
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
-    use_token_memory_cross_attention: bool = True
+    use_gate: bool = False
+    gate_residency_budget: int = 6
+    gate_prefetch_horizon: int = 2
+    gate_tile_granularity: int = 4
+    gate_offload_to_cpu: bool = False
+    gate_fallback_on_miss: bool = True
+    use_token_memory_cross_attention: bool = False
     use_token_memory_generation_cache: bool = False
     token_memory_window: int = 96
     token_memory_top_k: int = 4
@@ -105,7 +113,7 @@ class PrismalWaveConfig:
     token_memory_copy_bias: float = 0.75
     token_memory_rare_token_cutoff: int = 2
     token_memory_copy_min_confidence: float = 0.35
-    use_token_copy_cross_attention: bool = True
+    use_token_copy_cross_attention: bool = False
     use_token_copy_generation_cache: bool = False
     token_copy_window: int = 96
     token_copy_top_k: int = 4
@@ -177,6 +185,7 @@ class PrismalWaveConfig:
     emitter_level_share: float = 0.0005
     emitter_relation_share: float = 0.0001
     emitter_parent_share: float = 0.55
+    emitter_hierarchy_score_weight: float = 0.25
     emitter_balance_weight: float = 0.65
     emitter_mixture_target_count: float = 4
     emitter_mixture_weight: float = 0.75
@@ -274,6 +283,9 @@ class PrismalWaveConfig:
             self.family_budget = self.max_families_per_nest
         if self.family_specialist_bank_size < 1:
             self.family_specialist_bank_size = 8
+        self.use_gradient_accumulation = bool(self.use_gradient_accumulation)
+        if self.gradient_accumulation_steps < 1:
+            self.gradient_accumulation_steps = 1
         if self.mot_num_experts < 1:
             self.mot_num_experts = 1
         if self.mot_expert_scale <= 0:
@@ -283,8 +295,19 @@ class PrismalWaveConfig:
         self.use_topk_mot = bool(self.use_topk_mot)
         if self.mot_top_k < 1:
             self.mot_top_k = 1
+        if self.emitter_hierarchy_score_weight < 0.0:
+            self.emitter_hierarchy_score_weight = 0.0
         self.use_signature_lattice_attention = bool(self.use_signature_lattice_attention)
         self.use_signature_lattice_generation_cache = bool(self.use_signature_lattice_generation_cache)
+        self.use_gate = bool(self.use_gate)
+        if self.gate_residency_budget < 1:
+            self.gate_residency_budget = 1
+        if self.gate_prefetch_horizon < 1:
+            self.gate_prefetch_horizon = 1
+        if self.gate_tile_granularity < 1:
+            self.gate_tile_granularity = 1
+        self.gate_offload_to_cpu = bool(self.gate_offload_to_cpu)
+        self.gate_fallback_on_miss = bool(self.gate_fallback_on_miss)
         self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
         self.use_token_memory_generation_cache = bool(self.use_token_memory_generation_cache)
         self.use_token_copy_cross_attention = bool(self.use_token_copy_cross_attention)

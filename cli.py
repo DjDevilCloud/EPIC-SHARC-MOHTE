@@ -72,6 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--no-factorized-embedding", action="store_true")
         p.add_argument("--factorized-embedding-dim", type=int, default=default_cfg.factorized_embedding_dim)
         p.add_argument("--optimizer", type=str, default=None, choices=("adamw", "muon", "hierarchical"))
+        p.add_argument("--use-gradient-accumulation", dest="use_gradient_accumulation", action="store_true")
+        p.add_argument("--no-gradient-accumulation", dest="use_gradient_accumulation", action="store_false")
+        p.set_defaults(use_gradient_accumulation=default_cfg.use_gradient_accumulation)
+        p.add_argument(
+            "--gradient-accumulation-steps",
+            "--grad-accum-steps",
+            dest="gradient_accumulation_steps",
+            type=int,
+            default=default_cfg.gradient_accumulation_steps,
+        )
         p.add_argument("--muon-lr", type=float, default=default_cfg.muon_lr)
         p.add_argument("--muon-weight-decay", type=float, default=default_cfg.muon_weight_decay)
         p.add_argument("--muon-momentum-beta", type=float, default=default_cfg.muon_momentum_beta)
@@ -182,6 +192,18 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--use-signature-lattice-generation-cache", dest="use_signature_lattice_generation_cache", action="store_true")
         p.add_argument("--no-signature-lattice-generation-cache", dest="use_signature_lattice_generation_cache", action="store_false")
         p.set_defaults(use_signature_lattice_generation_cache=default_cfg.use_signature_lattice_generation_cache)
+        p.add_argument("--use-gate", dest="use_gate", action="store_true")
+        p.add_argument("--no-gate", dest="use_gate", action="store_false")
+        p.set_defaults(use_gate=default_cfg.use_gate)
+        p.add_argument("--gate-residency-budget", type=int, default=default_cfg.gate_residency_budget)
+        p.add_argument("--gate-prefetch-horizon", type=int, default=default_cfg.gate_prefetch_horizon)
+        p.add_argument("--gate-tile-granularity", type=int, default=default_cfg.gate_tile_granularity)
+        p.add_argument("--gate-offload-to-cpu", dest="gate_offload_to_cpu", action="store_true")
+        p.add_argument("--no-gate-offload-to-cpu", dest="gate_offload_to_cpu", action="store_false")
+        p.set_defaults(gate_offload_to_cpu=default_cfg.gate_offload_to_cpu)
+        p.add_argument("--gate-fallback-on-miss", dest="gate_fallback_on_miss", action="store_true")
+        p.add_argument("--no-gate-fallback-on-miss", dest="gate_fallback_on_miss", action="store_false")
+        p.set_defaults(gate_fallback_on_miss=default_cfg.gate_fallback_on_miss)
         p.add_argument("--use-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_true")
         p.add_argument("--no-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_false")
         p.set_defaults(use_token_memory_cross_attention=default_cfg.use_token_memory_cross_attention)
@@ -270,6 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--emitter-level-share", type=float, default=default_cfg.emitter_level_share)
         p.add_argument("--emitter-relation-share", type=float, default=default_cfg.emitter_relation_share)
         p.add_argument("--emitter-parent-share", type=float, default=default_cfg.emitter_parent_share)
+        p.add_argument("--emitter-hierarchy-score-weight", type=float, default=default_cfg.emitter_hierarchy_score_weight)
         p.add_argument("--emitter-balance-weight", type=float, default=default_cfg.emitter_balance_weight)
         p.add_argument("--emitter-mixture-target-count", type=float, default=default_cfg.emitter_mixture_target_count)
         p.add_argument("--emitter-mixture-weight", type=float, default=default_cfg.emitter_mixture_weight)
@@ -399,6 +422,8 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         max_samples=getattr(args, "max_samples", PrismalWaveConfig.max_samples),
         lr=getattr(args, "lr", PrismalWaveConfig.lr),
         optimizer=getattr(args, "optimizer", None) if getattr(args, "optimizer", None) is not None else default_cfg.optimizer,
+        use_gradient_accumulation=getattr(args, "use_gradient_accumulation", default_cfg.use_gradient_accumulation),
+        gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", default_cfg.gradient_accumulation_steps),
         muon_lr=getattr(args, "muon_lr", default_cfg.muon_lr),
         muon_weight_decay=getattr(args, "muon_weight_decay", default_cfg.muon_weight_decay),
         muon_momentum_beta=getattr(args, "muon_momentum_beta", default_cfg.muon_momentum_beta),
@@ -489,6 +514,12 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         signature_lattice_decay=getattr(args, "signature_lattice_decay", default_cfg.signature_lattice_decay),
         signature_lattice_chunk_len=getattr(args, "signature_lattice_chunk_len", default_cfg.signature_lattice_chunk_len),
         use_signature_lattice_generation_cache=getattr(args, "use_signature_lattice_generation_cache", default_cfg.use_signature_lattice_generation_cache),
+        use_gate=getattr(args, "use_gate", default_cfg.use_gate),
+        gate_residency_budget=getattr(args, "gate_residency_budget", default_cfg.gate_residency_budget),
+        gate_prefetch_horizon=getattr(args, "gate_prefetch_horizon", default_cfg.gate_prefetch_horizon),
+        gate_tile_granularity=getattr(args, "gate_tile_granularity", default_cfg.gate_tile_granularity),
+        gate_offload_to_cpu=getattr(args, "gate_offload_to_cpu", default_cfg.gate_offload_to_cpu),
+        gate_fallback_on_miss=getattr(args, "gate_fallback_on_miss", default_cfg.gate_fallback_on_miss),
         use_token_memory_cross_attention=getattr(args, "use_token_memory_cross_attention", default_cfg.use_token_memory_cross_attention),
         use_token_memory_generation_cache=getattr(args, "use_token_memory_generation_cache", default_cfg.use_token_memory_generation_cache),
         token_memory_window=getattr(args, "token_memory_window", default_cfg.token_memory_window),
@@ -554,6 +585,7 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         emitter_level_share=args.emitter_level_share,
         emitter_relation_share=args.emitter_relation_share,
         emitter_parent_share=args.emitter_parent_share,
+        emitter_hierarchy_score_weight=args.emitter_hierarchy_score_weight,
         emitter_balance_weight=args.emitter_balance_weight,
         emitter_mixture_target_count=args.emitter_mixture_target_count,
         emitter_mixture_weight=args.emitter_mixture_weight,
@@ -643,6 +675,8 @@ def main(argv: List[str] | None = None) -> int:
                     flush=True,
                 )
                 model.resize_vocab(tokenizer.vocab_size)
+            if hasattr(model, "prepare_capacity_for_tokenizer"):
+                model.prepare_capacity_for_tokenizer(tokenizer)
             raw_cfg.lr = getattr(args, "lr", raw_cfg.lr)
             if getattr(args, "optimizer", None) is not None:
                 raw_cfg.optimizer = getattr(args, "optimizer", raw_cfg.optimizer)
@@ -706,6 +740,8 @@ def main(argv: List[str] | None = None) -> int:
                     flush=True,
                 )
                 model.resize_vocab(tokenizer.vocab_size)
+            if hasattr(model, "prepare_capacity_for_tokenizer"):
+                model.prepare_capacity_for_tokenizer(tokenizer)
             raw_cfg.lr = getattr(args, "lr", raw_cfg.lr)
             if getattr(args, "optimizer", None) is not None:
                 raw_cfg.optimizer = getattr(args, "optimizer", raw_cfg.optimizer)
