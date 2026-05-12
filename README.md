@@ -23,7 +23,7 @@ The core runtime depends on `numpy` and `torch`. Optional data-path helpers can 
 
 ## Overview
 
-The architecture is built around a hierarchy-aware tokenizer, a SHARC-style routing cache, torus memory, and selective expert paths. The boundary markers carry span structure for input/output segments and paragraph-like blocks:
+The architecture is built around a hierarchy-aware tokenizer, a SHARC-style routing cache, torus memory, and reusable operator emitters. The boundary markers carry span structure for input/output segments and paragraph-like blocks:
 
 - `<BOI>` and `<EOI>` mark input spans
 - `<BOO>` and `<EOO>` mark output spans
@@ -58,9 +58,10 @@ Key defaults:
 
 - `d_model = 1024`
 - `n_layers = 1`
-- `n_emitters = 4096`
+- `n_emitters = 64`
 - `n_slots = 2048`
 - `n_paths = 1`
+- `emitter_hierarchy_score_weight = 0.25`
 - `use_factorized_embedding = true`
 - `use_turbo_quantization = false`
 - `use_torus_core = true`
@@ -118,7 +119,7 @@ Expected result: a short training log, a saved checkpoint under `checkpoints/tin
 - Each record is converted into a hierarchical text window.
 - The tokenizer can emit `<BOO>`, `<EOO>`, `<BOP>`, `<EOP>`, `<BLO>`, `<LINE>`, `<EOL>`, and `<SIG:OTHER>` special tokens.
 - These markers add structure for blocks, paragraphs, and line boundaries, with `<SIG:OTHER>` covering fallback structural cases.
-- The hierarchy encoder also produces aligned signature-family, signature-level, relation, and parent-ID tracks for every token.
+- The hierarchy encoder also produces aligned signature-family, signature-level, relation, and parent-ID tracks for every token, and the operator router consumes those tracks directly with a dedicated hierarchy score weight.
 - For a tiny local demo workflow, see [`demo/pretokenizedemo.md`](./demo/pretokenizedemo.md).
 - The shipped sample corpus lives in [`demo/corpus/tiny_example.txt`](./demo/corpus/tiny_example.txt); you can point `train`, `benchmark`, or `pretokenize.py` at `demo/corpus/` directly.
 

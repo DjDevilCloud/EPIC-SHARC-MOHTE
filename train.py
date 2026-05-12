@@ -1310,6 +1310,8 @@ def train_model(
         cfg=cfg,
         precision_policy=getattr(runtime_model, "precision_policy", None),
     )
+    if hasattr(runtime_model, "set_capacity_growth_locked"):
+        runtime_model.set_capacity_growth_locked(True)
     scaler_enabled = _amp_scaler_enabled(precision_policy, device, use_amp=use_amp)
     scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     resume_state = getattr(runtime_model, "_prismal_training_state", None)

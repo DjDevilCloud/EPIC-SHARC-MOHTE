@@ -34,12 +34,12 @@ class PrismalWaveConfig:
     muon_ns_steps: int = 8
     muon_extra_scale_factor: float = 0.5
     muon_scalar_optimizer: str = "adamw"
-    d_model: int = 1024
+    d_model: int = 512
     n_layers: int = 1
-    n_emitters: int = 256
-    n_slots: int = 128
+    n_emitters: int = 64
+    n_slots: int = 32
     n_paths: int = 1
-    top_k_emitters: int = 8
+    top_k_emitters: int = 4
     top_k_slots: int = 4
     max_seq_len: int = 0
     position_embedding_init_size: int = 256
@@ -177,6 +177,7 @@ class PrismalWaveConfig:
     emitter_level_share: float = 0.0005
     emitter_relation_share: float = 0.0001
     emitter_parent_share: float = 0.55
+    emitter_hierarchy_score_weight: float = 0.25
     emitter_balance_weight: float = 0.65
     emitter_mixture_target_count: float = 4
     emitter_mixture_weight: float = 0.75
@@ -283,6 +284,8 @@ class PrismalWaveConfig:
         self.use_topk_mot = bool(self.use_topk_mot)
         if self.mot_top_k < 1:
             self.mot_top_k = 1
+        if self.emitter_hierarchy_score_weight < 0.0:
+            self.emitter_hierarchy_score_weight = 0.0
         self.use_signature_lattice_attention = bool(self.use_signature_lattice_attention)
         self.use_signature_lattice_generation_cache = bool(self.use_signature_lattice_generation_cache)
         self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
