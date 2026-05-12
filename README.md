@@ -1,4 +1,4 @@
-# EPIC-SHARC MOHTE v0.1.2 - Updated resuable emitter branch.
+# EPIC-SHARC MOHTE v0.1.2 - Updated resuable emitter branch at https://github.com/DjDevilCloud/EPIC-SHARC-MOHTE/tree/ESM-v0.1.2
 
 Emitter Prismal Instructional Core with Signature-Hierarchy Attention Routing Cache + Mixture of Hierarchical Toroidal Experts.
 
