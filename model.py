@@ -1606,6 +1606,7 @@ class SignatureEmitterRegistry(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.quantization_config = quantization_config or QuantizationConfig()
+        self.capacity_growth_locked = False
         self.family_share = float(getattr(cfg, "emitter_family_share", 1.0))
         self.level_share = float(getattr(cfg, "emitter_level_share", 0.35))
         self.relation_share = float(getattr(cfg, "emitter_relation_share", 0.50))
@@ -1672,6 +1673,13 @@ class SignatureEmitterRegistry(nn.Module):
         self.register_buffer(name, new_buffer, persistent=True)
 
     def _ensure_capacity(self, family_id: int, relation_id: int, level_id: int) -> None:
+        grow_family = family_id >= self.family_embedding.num_embeddings
+        grow_relation = relation_id >= self.relation_embedding.num_embeddings
+        grow_level = level_id >= self.level_embedding.num_embeddings
+        if self.training and self.capacity_growth_locked and (grow_family or grow_relation or grow_level):
+            raise RuntimeError(
+                "Signature registry capacity grew after optimizer init; pre-grow the registry embeddings before training."
+            )
         if family_id >= self.family_embedding.num_embeddings:
             self._resize_embedding("family_embedding", family_id + 1)
             self._resize_buffer("family_activity", family_id + 1)
@@ -1688,6 +1696,21 @@ class SignatureEmitterRegistry(nn.Module):
             self._resize_embedding("parent_embedding", family_id + 1)
             self._resize_buffer("parent_activity", family_id + 1)
             self._resize_buffer("parent_active_mask", family_id + 1)
+
+    def set_capacity_growth_locked(self, locked: bool = True) -> None:
+        self.capacity_growth_locked = bool(locked)
+
+    def ensure_capacity_for_sizes(self, family_vocab_size: int, level_vocab_size: int, relation_vocab_size: int) -> None:
+        prev_locked = self.capacity_growth_locked
+        try:
+            self.capacity_growth_locked = False
+            self._ensure_capacity(
+                max(0, int(family_vocab_size) - 1),
+                max(0, int(relation_vocab_size) - 1),
+                max(0, int(level_vocab_size) - 1),
+            )
+        finally:
+            self.capacity_growth_locked = prev_locked
 
     def _seed_special_families(self) -> None:
         with torch.no_grad():
@@ -4143,14 +4166,18 @@ class PrismalTorusFrame:
 
 
 class PrismalEmitterRouter(nn.Module):
+    """Reusable operator router that blends content with hierarchy-aware compatibility."""
+
     def __init__(self, cfg: PrismalWaveConfig, quantization_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.cfg = cfg
         self.quantization_config = quantization_config or QuantizationConfig()
+        self.capacity_growth_locked = False
         d = cfg.d_model
         self.query_proj = create_quantized_linear(d, d, quantization_config=self.quantization_config)
         self.value_proj = create_quantized_linear(d, d, quantization_config=self.quantization_config)
         self.signature_proj = create_quantized_linear(d, d, quantization_config=self.quantization_config)
+        self.hierarchy_proj = create_quantized_linear(d, d, quantization_config=self.quantization_config)
         self.phase_proj = create_quantized_linear(d, d, quantization_config=self.quantization_config)
         self.frequency_proj = create_quantized_linear(d, 1, quantization_config=self.quantization_config)
         self.route_gate = create_quantized_linear(d, d, quantization_config=self.quantization_config)
@@ -4159,10 +4186,20 @@ class PrismalEmitterRouter(nn.Module):
         self.slot_value = create_quantized_linear(d, d, quantization_config=self.quantization_config)
         self.path_coord_proj = create_quantized_linear(d, 2, quantization_config=self.quantization_config)
         self.emitter_bank = nn.Parameter(torch.randn(cfg.n_emitters, d) * 0.02)
+        self.operator_hierarchy_bank = nn.Parameter(torch.randn(cfg.n_emitters, d) * 0.02)
         self.emitter_phase = nn.Parameter(torch.rand(cfg.n_emitters, d) * (2.0 * math.pi) - math.pi)
         self.emitter_frequency = nn.Parameter(torch.rand(cfg.n_emitters, 1) + 0.5)
         self.slot_seed = nn.Parameter(torch.randn(cfg.n_slots, d) * 0.02)
         self.path_basis = nn.Parameter(torch.randn(cfg.n_paths, d) * 0.02)
+        self.signature_vocab_size = max(8, int(getattr(cfg, "signature_vocab_size", 0)) or 8)
+        self.signature_bucket_vocab_size = max(8, int(getattr(cfg, "signature_bucket_vocab_size", 0)) or 8)
+        self.signature_level_vocab_size = max(8, int(getattr(cfg, "signature_level_vocab_size", 0)) or len(SIGNATURE_LEVEL_IDS))
+        self.signature_relation_vocab_size = max(8, int(getattr(cfg, "signature_relation_vocab_size", 0)) or len(SIGNATURE_RELATION_IDS))
+        self.signature_embedding = self._make_embedding(self.signature_vocab_size, d)
+        self.family_embedding = self._make_embedding(self.signature_bucket_vocab_size, d)
+        self.level_embedding = self._make_embedding(self.signature_level_vocab_size, d)
+        self.relation_embedding = self._make_embedding(self.signature_relation_vocab_size, d)
+        self.parent_embedding = self._make_embedding(self.signature_vocab_size, d)
         grid_h = int(cfg.emitter_grid_height or round(math.sqrt(cfg.n_emitters)) or 1)
         grid_w = int(cfg.emitter_grid_width or math.ceil(cfg.n_emitters / max(grid_h, 1)) or 1)
         self.grid_height = max(1, grid_h)
@@ -4173,6 +4210,139 @@ class PrismalEmitterRouter(nn.Module):
             x = idx % self.grid_width
             coords.append((float(y % self.grid_height), float(x)))
         self.register_buffer("emitter_grid_coords", torch.tensor(coords, dtype=torch.float32), persistent=False)
+
+    def _make_embedding(self, size: int, d_model: int) -> nn.Embedding:
+        size = max(1, int(size))
+        if self.quantization_config is not None and self.quantization_config.enabled:
+            return create_quantized_embedding(size, d_model, quantization_config=self.quantization_config)
+        return nn.Embedding(size, d_model)
+
+    @staticmethod
+    def _module_device_dtype(module: nn.Module) -> Tuple[torch.device, torch.dtype]:
+        param = next(module.parameters())
+        return param.device, param.dtype
+
+    def _resize_embedding(self, name: str, required_size: int) -> None:
+        required_size = max(1, int(required_size))
+        embed: nn.Embedding = getattr(self, name)
+        if required_size <= embed.num_embeddings:
+            return
+        device, _dtype = self._module_device_dtype(embed)
+        new_embed = self._make_embedding(required_size, embed.embedding_dim).to(device)
+        old_weight = getattr(embed, "weight", getattr(embed, "embedding_matrix", None))
+        new_weight = getattr(new_embed, "weight", getattr(new_embed, "embedding_matrix", None))
+        if old_weight is None or new_weight is None:
+            raise AttributeError(f"Unsupported embedding module for resize: {type(embed).__name__}")
+        with torch.no_grad():
+            new_weight[: embed.num_embeddings].copy_(old_weight)
+            nn.init.normal_(new_weight[embed.num_embeddings :], mean=0.0, std=0.02)
+        setattr(self, name, new_embed)
+
+    def _ensure_hierarchy_capacity(
+        self,
+        *,
+        signature_family_ids: Optional[torch.Tensor] = None,
+        signature_ids: Optional[torch.Tensor] = None,
+        signature_level_ids: Optional[torch.Tensor] = None,
+        signature_relation_ids: Optional[torch.Tensor] = None,
+        parent_signature_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        max_signature = -1
+        max_family = -1
+        max_level = -1
+        max_relation = -1
+        if signature_ids is not None and signature_ids.numel() > 0:
+            max_signature = max(max_signature, int(signature_ids.detach().long().max().item()))
+        if signature_family_ids is not None and signature_family_ids.numel() > 0:
+            max_family = max(max_family, int(signature_family_ids.detach().long().max().item()))
+        if signature_level_ids is not None and signature_level_ids.numel() > 0:
+            max_level = max(max_level, int(signature_level_ids.detach().long().max().item()))
+        if signature_relation_ids is not None and signature_relation_ids.numel() > 0:
+            max_relation = max(max_relation, int(signature_relation_ids.detach().long().max().item()))
+        if parent_signature_ids is not None and parent_signature_ids.numel() > 0:
+            max_signature = max(max_signature, int(parent_signature_ids.detach().long().max().item()))
+        grow_signature = max_signature >= self.signature_embedding.num_embeddings
+        grow_family = max_family >= self.family_embedding.num_embeddings
+        grow_level = max_level >= self.level_embedding.num_embeddings
+        grow_relation = max_relation >= self.relation_embedding.num_embeddings
+        if self.training and self.capacity_growth_locked and (grow_signature or grow_family or grow_level or grow_relation):
+            raise RuntimeError(
+                "Hierarchy embedding capacity grew after optimizer init; pre-grow the hierarchy embeddings before training."
+            )
+        if max_signature >= 0:
+            self._resize_embedding("signature_embedding", max_signature + 1)
+            self._resize_embedding("parent_embedding", max_signature + 1)
+        if max_family >= 0:
+            self._resize_embedding("family_embedding", max_family + 1)
+        if max_level >= 0:
+            self._resize_embedding("level_embedding", max_level + 1)
+        if max_relation >= 0:
+            self._resize_embedding("relation_embedding", max_relation + 1)
+
+    def set_capacity_growth_locked(self, locked: bool = True) -> None:
+        self.capacity_growth_locked = bool(locked)
+
+    def ensure_hierarchy_capacity_for_sizes(
+        self,
+        signature_vocab_size: int,
+        family_vocab_size: int,
+        level_vocab_size: int,
+        relation_vocab_size: int,
+    ) -> None:
+        prev_locked = self.capacity_growth_locked
+        try:
+            self.capacity_growth_locked = False
+            family_cap = max(0, int(family_vocab_size) - 1)
+            signature_cap = max(0, int(signature_vocab_size) - 1)
+            level_cap = max(0, int(level_vocab_size) - 1)
+            relation_cap = max(0, int(relation_vocab_size) - 1)
+            self._ensure_hierarchy_capacity(
+                signature_family_ids=torch.tensor([family_cap], device=self.emitter_bank.device, dtype=torch.long),
+                signature_ids=torch.tensor([signature_cap], device=self.emitter_bank.device, dtype=torch.long),
+                signature_level_ids=torch.tensor([level_cap], device=self.emitter_bank.device, dtype=torch.long),
+                signature_relation_ids=torch.tensor([relation_cap], device=self.emitter_bank.device, dtype=torch.long),
+                parent_signature_ids=torch.tensor([signature_cap], device=self.emitter_bank.device, dtype=torch.long),
+            )
+        finally:
+            self.capacity_growth_locked = prev_locked
+
+    def _hierarchy_context(
+        self,
+        hidden: torch.Tensor,
+        *,
+        signature_family_ids: Optional[torch.Tensor] = None,
+        signature_ids: Optional[torch.Tensor] = None,
+        signature_level_ids: Optional[torch.Tensor] = None,
+        signature_relation_ids: Optional[torch.Tensor] = None,
+        parent_signature_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self._ensure_hierarchy_capacity(
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
+        family_ids = signature_family_ids if signature_family_ids is not None else signature_ids
+        parent_ids = parent_signature_ids if parent_signature_ids is not None else family_ids
+        tensors: List[torch.Tensor] = []
+        if signature_ids is not None and signature_ids.numel() > 0:
+            tensors.append(self.signature_embedding(signature_ids.clamp(min=0)))
+        if family_ids is not None and family_ids.numel() > 0:
+            tensors.append(float(getattr(self.cfg, "emitter_family_share", 1.0)) * self.family_embedding(family_ids.clamp(min=0)))
+        if signature_level_ids is not None and signature_level_ids.numel() > 0:
+            tensors.append(float(getattr(self.cfg, "emitter_level_share", 0.35)) * self.level_embedding(signature_level_ids.clamp(min=0)))
+        if signature_relation_ids is not None and signature_relation_ids.numel() > 0:
+            tensors.append(float(getattr(self.cfg, "emitter_relation_share", 0.50)) * self.relation_embedding(signature_relation_ids.clamp(min=0)))
+        if parent_ids is not None and parent_ids.numel() > 0:
+            tensors.append(float(getattr(self.cfg, "emitter_parent_share", 0.75)) * self.parent_embedding(parent_ids.clamp(min=0)))
+        if not tensors:
+            return torch.zeros_like(hidden)
+        hierarchy_context = tensors[0]
+        for tensor in tensors[1:]:
+            hierarchy_context = hierarchy_context + tensor
+        hierarchy_context = self.hierarchy_proj(hierarchy_context)
+        return F.normalize(hierarchy_context, dim=-1)
 
     def init_slots(
         self,
@@ -4200,6 +4370,11 @@ class PrismalEmitterRouter(nn.Module):
         hidden: torch.Tensor,
         slots: torch.Tensor,
         *,
+        signature_family_ids: Optional[torch.Tensor] = None,
+        signature_ids: Optional[torch.Tensor] = None,
+        signature_level_ids: Optional[torch.Tensor] = None,
+        signature_relation_ids: Optional[torch.Tensor] = None,
+        parent_signature_ids: Optional[torch.Tensor] = None,
         path_index: int,
         layer_index: int,
         torus_center: Optional[torch.Tensor] = None,
@@ -4212,6 +4387,14 @@ class PrismalEmitterRouter(nn.Module):
         value = self.value_proj(hidden)
         phase_state = torch.tanh(self.phase_proj(hidden)) * math.pi
         token_frequency = F.softplus(self.frequency_proj(hidden)) + 1e-3
+        hierarchy_context = self._hierarchy_context(
+            hidden,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
 
         path_vector = self.path_basis[path_index % self.path_basis.size(0)]
         path_vector = torch.tanh(path_vector) * math.pi
@@ -4225,7 +4408,6 @@ class PrismalEmitterRouter(nn.Module):
         path_coord = torch.sigmoid(self.path_coord_proj(path_vector.unsqueeze(0))) * coord_scale
         path_coord = path_coord.squeeze(0)
 
-        content_scores = torch.einsum("btd,ed->bte", query, self.emitter_bank) / math.sqrt(dim)
         phase_dist = (1.0 - torch.cos(phase_state.unsqueeze(2) - emitter_phase.view(1, 1, -1, dim))).mean(dim=-1)
         freq_dist = torch.abs(token_frequency - emitter_frequency.view(1, 1, -1))
         grid_h = torch.tensor(float(self.grid_height), device=hidden.device)
@@ -4237,7 +4419,26 @@ class PrismalEmitterRouter(nn.Module):
         grid_dist = coord_y + coord_x
         path_bias = (hidden * path_vector.view(1, 1, -1)).sum(dim=-1, keepdim=True) / math.sqrt(dim)
 
-        scores = content_scores - self.cfg.torus_weight * phase_dist - self.cfg.frequency_weight * freq_dist
+        content_scores = torch.einsum(
+            "btd,ed->bte",
+            F.normalize(query, dim=-1, eps=1e-6),
+            F.normalize(self.emitter_bank, dim=-1, eps=1e-6),
+        ) * math.sqrt(dim)
+        hierarchy_scores = torch.einsum(
+            "btd,ed->bte",
+            F.normalize(hierarchy_context, dim=-1, eps=1e-6),
+            F.normalize(self.operator_hierarchy_bank, dim=-1, eps=1e-6),
+        ) * math.sqrt(dim)
+        hierarchy_context_norm = hierarchy_context.norm(dim=-1).mean()
+        hierarchy_probs = F.softmax(hierarchy_scores / max(self.cfg.router_temperature, 1e-3), dim=-1)
+        hierarchy_entropy = -(hierarchy_probs * torch.log(hierarchy_probs + 1e-8)).sum(dim=-1).mean()
+        hierarchy_score_weight = float(getattr(self.cfg, "emitter_hierarchy_score_weight", 0.25))
+        scores = (
+            content_scores
+            + hierarchy_score_weight * hierarchy_scores
+            - self.cfg.torus_weight * phase_dist
+            - self.cfg.frequency_weight * freq_dist
+        )
         scores = scores - self.cfg.emitter_neighbor_weight * grid_dist
         scores = scores + 0.05 * path_bias
         scores = scores + 0.03 * (layer_index + 1)
@@ -4250,7 +4451,13 @@ class PrismalEmitterRouter(nn.Module):
             top_idx.unsqueeze(-1).expand(-1, -1, -1, dim),
             dim=2,
         )
-        emitter_context = torch.sum(top_weights.unsqueeze(-1) * selected_emitters, dim=2)
+        selected_hierarchy = torch.take_along_dim(
+            self.operator_hierarchy_bank.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1, -1),
+            top_idx.unsqueeze(-1).expand(-1, -1, -1, dim),
+            dim=2,
+        )
+        effective_emitters = selected_emitters + 0.25 * selected_hierarchy + 0.15 * hierarchy_context.unsqueeze(2)
+        emitter_context = torch.sum(top_weights.unsqueeze(-1) * effective_emitters, dim=2)
         topk_entropy = -(top_weights * torch.log(top_weights + 1e-8)).sum(dim=-1)
         topk_effective_count = torch.exp(topk_entropy)
         emitter_mixture_target = float(getattr(self.cfg, "emitter_mixture_target_count", 2.0))
@@ -4272,11 +4479,11 @@ class PrismalEmitterRouter(nn.Module):
         )
         slot_context = torch.sum(top_slot_weights.unsqueeze(-1) * selected_slots, dim=2)
 
-        combined_context = self.value_proj(emitter_context) + self.slot_value(slot_context)
+        combined_context = self.value_proj(emitter_context) + self.slot_value(slot_context) + 0.15 * hierarchy_context
         gate = torch.sigmoid(self.route_gate(hidden))
         delta = gate * self.out_proj(combined_context)
 
-        update_source = self.slot_value(value + emitter_context + slot_context)
+        update_source = self.slot_value(value + emitter_context + slot_context + 0.25 * hierarchy_context)
         per_token_slot_update = torch.einsum("bts,btd->btsd", slot_weights, update_source)
         cumulative_slot_update = torch.cumsum(per_token_slot_update, dim=1)
         cumulative_slot_weight = torch.cumsum(slot_weights, dim=1).unsqueeze(-1).clamp_min(1e-6)
@@ -4307,6 +4514,9 @@ class PrismalEmitterRouter(nn.Module):
             "emitter_usage_entropy": usage_entropy.detach(),
             "emitter_usage_concentration": usage_concentration.detach(),
             "emitter_balance_loss": balance_loss,
+            "emitter_hierarchy_entropy": hierarchy_entropy.detach(),
+            "emitter_hierarchy_context_norm": hierarchy_context_norm.detach(),
+            "emitter_hierarchy_score_weight": torch.tensor(hierarchy_score_weight, device=hidden.device).detach(),
             "slot_top_idx": top_slot_idx.detach(),
             "slot_top_weights": top_slot_weights.detach(),
             "slot_entropy": (-(slot_weights * torch.log(slot_weights + 1e-8)).sum(dim=-1).mean()).detach(),
@@ -4335,6 +4545,11 @@ class PrismalWaveBlock(nn.Module):
         slots: torch.Tensor,
         router: PrismalEmitterRouter,
         *,
+        signature_family_ids: Optional[torch.Tensor] = None,
+        signature_ids: Optional[torch.Tensor] = None,
+        signature_level_ids: Optional[torch.Tensor] = None,
+        signature_relation_ids: Optional[torch.Tensor] = None,
+        parent_signature_ids: Optional[torch.Tensor] = None,
         path_index: int,
         layer_index: int,
         torus_center: Optional[torch.Tensor] = None,
@@ -4344,6 +4559,11 @@ class PrismalWaveBlock(nn.Module):
         delta, updated_slots, stats = router.route(
             normed,
             slots,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
             path_index=path_index,
             layer_index=layer_index,
             torus_center=torus_center,
@@ -4624,6 +4844,92 @@ class PrismalWaveModel(nn.Module):
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
         )
+
+    def set_capacity_growth_locked(self, locked: bool = True) -> None:
+        if hasattr(self, "registry") and hasattr(self.registry, "set_capacity_growth_locked"):
+            self.registry.set_capacity_growth_locked(locked)
+        if hasattr(self, "router") and hasattr(self.router, "set_capacity_growth_locked"):
+            self.router.set_capacity_growth_locked(locked)
+
+    def prepare_capacity_for_tokenizer(self, tokenizer: object) -> None:
+        router = getattr(self, "router", None)
+        registry = getattr(self, "registry", None)
+        signature_vocab_size = max(1, int(getattr(tokenizer, "signature_vocab_size", self.signature_vocab_size) or self.signature_vocab_size))
+        signature_level_vocab_size = max(
+            1,
+            int(getattr(tokenizer, "signature_level_vocab_size", self.signature_level_vocab_size) or self.signature_level_vocab_size),
+        )
+        signature_relation_vocab_size = max(
+            1,
+            int(getattr(tokenizer, "signature_relation_vocab_size", self.signature_relation_vocab_size) or self.signature_relation_vocab_size),
+        )
+        signature_bucket_vocab_size = max(
+            8,
+            int(getattr(tokenizer, "signature_family_vocab_size", self.signature_bucket_vocab_size) or self.signature_bucket_vocab_size),
+        )
+        registry_old = {
+            "signature_vocab_size": int(getattr(registry.family_embedding, "num_embeddings", 0)) if registry is not None else 0,
+            "signature_level_vocab_size": int(getattr(registry.level_embedding, "num_embeddings", 0)) if registry is not None else 0,
+            "signature_relation_vocab_size": int(getattr(registry.relation_embedding, "num_embeddings", 0)) if registry is not None else 0,
+        }
+        router_old = {
+            "signature_vocab_size": int(getattr(getattr(router, "signature_embedding", None), "num_embeddings", 0)) if router is not None else 0,
+            "signature_bucket_vocab_size": int(getattr(getattr(router, "family_embedding", None), "num_embeddings", 0)) if router is not None else 0,
+            "signature_level_vocab_size": int(getattr(getattr(router, "level_embedding", None), "num_embeddings", 0)) if router is not None else 0,
+            "signature_relation_vocab_size": int(getattr(getattr(router, "relation_embedding", None), "num_embeddings", 0)) if router is not None else 0,
+        }
+        if hasattr(self, "registry") and hasattr(self.registry, "ensure_capacity_for_sizes"):
+            self.registry.ensure_capacity_for_sizes(
+                signature_vocab_size,
+                signature_level_vocab_size,
+                signature_relation_vocab_size,
+            )
+        if hasattr(self, "router") and hasattr(self.router, "ensure_hierarchy_capacity_for_sizes"):
+            self.router.ensure_hierarchy_capacity_for_sizes(
+                signature_vocab_size,
+                signature_bucket_vocab_size,
+                signature_level_vocab_size,
+                signature_relation_vocab_size,
+            )
+        if signature_bucket_vocab_size > self.signature_bucket_vocab_size:
+            self.resize_signature_bucket_vocab(signature_bucket_vocab_size)
+        old_bucket_vocab_size = int(self.signature_bucket_vocab_size)
+        self.signature_vocab_size = max(self.signature_vocab_size, signature_vocab_size)
+        self.signature_level_vocab_size = max(self.signature_level_vocab_size, signature_level_vocab_size)
+        self.signature_relation_vocab_size = max(self.signature_relation_vocab_size, signature_relation_vocab_size)
+        self.signature_bucket_vocab_size = max(self.signature_bucket_vocab_size, signature_bucket_vocab_size)
+        self.cfg.signature_vocab_size = self.signature_vocab_size
+        self.cfg.signature_level_vocab_size = self.signature_level_vocab_size
+        self.cfg.signature_relation_vocab_size = self.signature_relation_vocab_size
+        self.cfg.signature_bucket_vocab_size = self.signature_bucket_vocab_size
+        expansions: List[str] = []
+        if registry is not None:
+            registry_new = {
+                "signature_vocab_size": int(getattr(registry.family_embedding, "num_embeddings", 0)),
+                "signature_level_vocab_size": int(getattr(registry.level_embedding, "num_embeddings", 0)),
+                "signature_relation_vocab_size": int(getattr(registry.relation_embedding, "num_embeddings", 0)),
+            }
+            for key, old_value in registry_old.items():
+                new_value = registry_new[key]
+                if new_value > old_value:
+                    expansions.append(f"registry.{key} {old_value}->{new_value}")
+        if router is not None:
+            router_new = {
+                "signature_vocab_size": int(getattr(getattr(router, "signature_embedding", None), "num_embeddings", 0)),
+                "signature_bucket_vocab_size": int(getattr(getattr(router, "family_embedding", None), "num_embeddings", 0)),
+                "signature_level_vocab_size": int(getattr(getattr(router, "level_embedding", None), "num_embeddings", 0)),
+                "signature_relation_vocab_size": int(getattr(getattr(router, "relation_embedding", None), "num_embeddings", 0)),
+            }
+            for key, old_value in router_old.items():
+                new_value = router_new[key]
+                if new_value > old_value:
+                    expansions.append(f"router.{key} {old_value}->{new_value}")
+        if signature_bucket_vocab_size > old_bucket_vocab_size:
+            expansions.append(f"signature_bucket_vocab_size {old_bucket_vocab_size}->{signature_bucket_vocab_size}")
+        if expansions:
+            print("[Prismal] pre-grew transfer capacities: " + ", ".join(expansions), flush=True)
+        else:
+            print("[Prismal] pre-grew transfer capacities: no expansion required", flush=True)
 
     def _signature_family_targets(self, family_ids: torch.Tensor) -> torch.Tensor:
         bucket_vocab = max(1, int(self.signature_bucket_vocab_size))
@@ -6100,6 +6406,51 @@ class PrismalWaveModel(nn.Module):
         self._vocab_size = new_vocab_size
         self.cfg.vocab_size = new_vocab_size
 
+    def resize_signature_bucket_vocab(self, new_bucket_vocab_size: int) -> None:
+        new_bucket_vocab_size = int(new_bucket_vocab_size)
+        if new_bucket_vocab_size <= self.signature_bucket_vocab_size:
+            return
+        device = next(self.parameters()).device
+
+        old_head = self.signature_token_head
+        new_head = create_quantized_linear(
+            self.cfg.d_model,
+            new_bucket_vocab_size,
+            bias=True,
+            quantization_config=self.quantization_config,
+        ).to(device)
+        with torch.no_grad():
+            rows = min(old_head.weight.shape[0], new_bucket_vocab_size)
+            dense_weight = new_head.weight.detach()
+            dense_weight[:rows].copy_(old_head.weight[:rows].detach())
+            if new_bucket_vocab_size > rows:
+                nn.init.normal_(dense_weight[rows:], mean=0.0, std=0.02)
+            if old_head.bias is not None and new_head.bias is not None:
+                dense_bias = new_head.bias.detach()
+                dense_bias[:rows].copy_(old_head.bias[:rows].detach())
+                if new_bucket_vocab_size > rows:
+                    nn.init.zeros_(dense_bias[rows:])
+            _assign_dense_weight(new_head, dense_weight)
+        self.signature_token_head = new_head
+
+        old_embedding = self.signature_neighborhood_embedding
+        new_embedding = create_quantized_embedding(
+            new_bucket_vocab_size,
+            self.cfg.d_model,
+            quantization_config=self.quantization_config,
+        ).to(device)
+        with torch.no_grad():
+            dense_weight = getattr(new_embedding, "weight", getattr(new_embedding, "embedding_matrix", None))
+            old_weight = getattr(old_embedding, "weight", getattr(old_embedding, "embedding_matrix", None))
+            if dense_weight is None or old_weight is None:
+                raise AttributeError("Unsupported signature neighborhood embedding module for resize.")
+            dense_weight[: old_embedding.num_embeddings].copy_(old_weight)
+            if new_bucket_vocab_size > old_embedding.num_embeddings:
+                nn.init.normal_(dense_weight[old_embedding.num_embeddings :], mean=0.0, std=0.02)
+        self.signature_neighborhood_embedding = new_embedding
+        self.signature_bucket_vocab_size = new_bucket_vocab_size
+        self.cfg.signature_bucket_vocab_size = new_bucket_vocab_size
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -6192,6 +6543,11 @@ class PrismalWaveModel(nn.Module):
                     path_hidden_state,
                     slots,
                     self.router,
+                    signature_family_ids=signature_family_ids,
+                    signature_ids=signature_ids,
+                    signature_level_ids=signature_level_ids,
+                    signature_relation_ids=signature_relation_ids,
+                    parent_signature_ids=parent_signature_ids,
                     path_index=current_path_index,
                     layer_index=layer_index,
                     torus_center=torus_center if torus_center is not None else input_signature,

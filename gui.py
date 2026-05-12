@@ -30,6 +30,11 @@ PROCESS_GRACE_SECONDS = 5.0
 DEFAULT_CFG = PrismalWaveConfig()
 
 
+def _decimal_str(value: float) -> str:
+    text = format(float(value), ".10f").rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     return slug.strip("._-") or "run"
@@ -101,13 +106,13 @@ class PrismalWaveGUI(tk.Tk):
         self.max_samples_var = tk.StringVar(value=str(DEFAULT_CFG.max_samples))
         self.dataset_streaming_var = tk.BooleanVar(value=True)
         self.tokenizer_workers_var = tk.StringVar(value="1")
-        self.lr_var = tk.StringVar(value=str(DEFAULT_CFG.lr))
+        self.lr_var = tk.StringVar(value=_decimal_str(DEFAULT_CFG.lr))
         self.optimizer_var = tk.StringVar(value=DEFAULT_CFG.optimizer)
         self.muon_lr_var = tk.StringVar(value=str(DEFAULT_CFG.muon_lr))
         self.muon_weight_decay_var = tk.StringVar(value=str(DEFAULT_CFG.muon_weight_decay))
         self.muon_momentum_beta_var = tk.StringVar(value=str(DEFAULT_CFG.muon_momentum_beta))
         self.muon_ns_steps_var = tk.StringVar(value=str(DEFAULT_CFG.muon_ns_steps))
-        self.muon_extra_scale_factor_var = tk.StringVar(value=str(DEFAULT_CFG.muon_extra_scale_factor))
+        self.muon_extra_scale_factor_var = tk.StringVar(value="0.8")
         self.muon_scalar_optimizer_var = tk.StringVar(value=DEFAULT_CFG.muon_scalar_optimizer)
         self.muon_nesterov_var = tk.BooleanVar(value=DEFAULT_CFG.muon_nesterov)
         self.val_fraction_var = tk.StringVar(value="0.1")
@@ -123,7 +128,7 @@ class PrismalWaveGUI(tk.Tk):
         self.post_beam_size_var = tk.StringVar(value="2")
         self.extra_train_args_var = tk.StringVar(value="")
         self.extra_infer_args_var = tk.StringVar(value="")
-        self.torch_compile_var = tk.BooleanVar(value=True)
+        self.torch_compile_var = tk.BooleanVar(value=False)
         self.amp_var = tk.BooleanVar(value=True)
         self.use_bitsandbytes_leaf_precision_var = tk.BooleanVar(value=DEFAULT_CFG.use_bitsandbytes_leaf_precision)
         self.torus_local_field_radius_var = tk.StringVar(value=str(DEFAULT_CFG.torus_local_field_radius))

@@ -23,7 +23,7 @@ The core runtime depends on `numpy` and `torch`. Optional data-path helpers can 
 
 ## Overview
 
-The architecture is built around a hierarchy-aware tokenizer, a SHARC-style routing cache, torus memory, and selective expert paths. The boundary markers carry span structure for input/output segments and paragraph-like blocks:
+The architecture is built around a hierarchy-aware tokenizer, a SHARC-style routing cache, torus memory, and reusable operator emitters. The boundary markers carry span structure for input/output segments and paragraph-like blocks:
 
 - `<BOI>` and `<EOI>` mark input spans
 - `<BOO>` and `<EOO>` mark output spans
@@ -58,9 +58,10 @@ Key defaults:
 
 - `d_model = 1024`
 - `n_layers = 1`
-- `n_emitters = 4096`
+- `n_emitters = 64`
 - `n_slots = 2048`
 - `n_paths = 1`
+- `emitter_hierarchy_score_weight = 0.25`
 - `use_factorized_embedding = true`
 - `use_turbo_quantization = false`
 - `use_torus_core = true`
@@ -98,6 +99,7 @@ If one of those drifts, the model raises immediately in `forward()` or `generate
 
 ```bash
 python cli.py train --data <your-data-path> --save-dir checkpoints/demo
+python cli.py train --data <your-data-path> --save-dir checkpoints/demo --use-gradient-accumulation --gradient-accumulation-steps 4
 python cli.py infer --checkpoint checkpoints/demo/model.pt --prompt "Explain torus routing"
 python cli.py benchmark --data <your-data-path>
 python gui.py
@@ -106,7 +108,7 @@ python gui.py
 ## Try It In 60 Seconds
 
 ```bash
-python cli.py train --data demo/corpus --save-dir checkpoints/tiny
+python cli.py train --data demo/corpus --save-dir checkpoints/tiny --use-gradient-accumulation --gradient-accumulation-steps 4
 python cli.py infer --checkpoint checkpoints/tiny/model.pt --prompt "Explain the torus core."
 ```
 
@@ -118,7 +120,7 @@ Expected result: a short training log, a saved checkpoint under `checkpoints/tin
 - Each record is converted into a hierarchical text window.
 - The tokenizer can emit `<BOO>`, `<EOO>`, `<BOP>`, `<EOP>`, `<BLO>`, `<LINE>`, `<EOL>`, and `<SIG:OTHER>` special tokens.
 - These markers add structure for blocks, paragraphs, and line boundaries, with `<SIG:OTHER>` covering fallback structural cases.
-- The hierarchy encoder also produces aligned signature-family, signature-level, relation, and parent-ID tracks for every token.
+- The hierarchy encoder also produces aligned signature-family, signature-level, relation, and parent-ID tracks for every token, and the operator router consumes those tracks directly with a dedicated hierarchy score weight.
 - For a tiny local demo workflow, see [`demo/pretokenizedemo.md`](./demo/pretokenizedemo.md).
 - The shipped sample corpus lives in [`demo/corpus/tiny_example.txt`](./demo/corpus/tiny_example.txt); you can point `train`, `benchmark`, or `pretokenize.py` at `demo/corpus/` directly.
 

@@ -114,7 +114,7 @@ Its responsibilities include:
 - global bus style persistent memory
 - relay and scout-style read/write behavior
 - recurrent solver or chunked-step refinement
-- emitter and slot interaction with strength, decay, and activity controls
+- reusable operator and slot interaction with strength, decay, and activity controls
 
 The torus is the memory backbone of the model. The bus gives it longer-lived sequence state, while local field updates keep it responsive to nearby context.
 
@@ -220,7 +220,8 @@ That means the same architecture can be exercised in a few different ways withou
 Some of the most important families of knobs are:
 
 - model size: `d_model`, `n_layers`, `ff_mult`
-- routing capacity: `n_emitters`, `n_slots`, `top_k_emitters`, `top_k_slots`
+- routing capacity: `n_emitters` as a reusable operator bank, `n_slots`, `top_k_emitters`, `top_k_slots`
+- hierarchy routing control: `emitter_hierarchy_score_weight`
 - torus shape: `torus_depth`, `torus_height`, `torus_width`
 - bus and relay behavior: `torus_global_bus_slots`, `torus_global_bus_decay`, `torus_global_bus_write_scale`
 - family routing: `family_budget`, `family_specialist_bank_size`, `family_specialist_gate_threshold`

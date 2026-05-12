@@ -455,6 +455,7 @@ def pretokenize_corpus(
 
     token_state = tokenizer.to_state_dict()
     output_path = Path(output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_root = Path(tempfile.mkdtemp(prefix="pretokenize_shards_", dir=str(output_path.parent)))
     shard_dirs: list[Path] = []
     print(f"[Prismal] sharded pretokenize: {len(shard_specs)} workers", flush=True)
