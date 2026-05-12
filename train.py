@@ -1265,6 +1265,7 @@ def train_model(
     steps: int,
     lr: float,
     grad_clip: float = 1.0,
+    grad_accum_steps: int | None = None,
     minutes: float | None = None,
     progress: bool = True,
     val_loader: Optional[DataLoader] = None,
@@ -1290,6 +1291,8 @@ def train_model(
         "bitsandbytes_leaf_precision_mode",
         "bitsandbytes_leaf_quant_type",
         "bitsandbytes_leaf_compute_dtype",
+        "use_gradient_accumulation",
+        "gradient_accumulation_steps",
         "quantization_aware_training",
         "qat_start_fraction",
         "qat_ramp_fraction",
@@ -1314,6 +1317,13 @@ def train_model(
         runtime_model.set_capacity_growth_locked(True)
     scaler_enabled = _amp_scaler_enabled(precision_policy, device, use_amp=use_amp)
     scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
+    use_grad_accum = bool(getattr(cfg, "use_gradient_accumulation", False))
+    if grad_accum_steps is not None:
+        requested_grad_accum_steps = max(1, int(grad_accum_steps))
+        use_grad_accum = requested_grad_accum_steps > 1
+    else:
+        requested_grad_accum_steps = max(1, int(getattr(cfg, "gradient_accumulation_steps", 1)))
+    grad_accum_steps = max(1, requested_grad_accum_steps if use_grad_accum else 1)
     resume_state = getattr(runtime_model, "_prismal_training_state", None)
     resume_global_step = 0
     optimizer_state_loaded = False
@@ -1399,7 +1409,7 @@ def train_model(
     total_steps = max(1, step_limit if step_limit > 0 else epoch_batches)
     if epoch_count > 0:
         total_steps = max(total_steps, epoch_batches)
-    scheduler_total_steps = total_steps
+    scheduler_total_steps = max(1, math.ceil(total_steps / grad_accum_steps))
     scheduler_warmup_steps = max(1, min(int(scheduler_total_steps * 0.1), max(1, scheduler_total_steps - 1)))
     if optimizer_state_loaded and isinstance(resume_state, dict):
         scheduler_total_steps = int(resume_state.get("scheduler_total_steps", scheduler_total_steps) or scheduler_total_steps)
@@ -1443,7 +1453,7 @@ def train_model(
         if not qat_enabled or precision_policy is None:
             return
         absolute_step = resume_global_step + int(step_index)
-        progress = float(absolute_step) / float(max(resume_global_step + total_steps, 1))
+        progress = float(absolute_step) / float(max(resume_global_step + scheduler_total_steps, 1))
         scheduled_policy = precision_policy.progressive_qat_policy(
             progress,
             start_fraction=qat_start_fraction,
@@ -1457,6 +1467,45 @@ def train_model(
         runtime_model.precision_policy = scheduled_policy
         attach_precision_policy(runtime_model, scheduled_policy)
         runtime_model.configure_precision(device, enabled=True)
+
+    optimizer.zero_grad(set_to_none=True)
+    accumulation_step = 0
+    optimizer_step = 0
+
+    def _finish_optimizer_step() -> bool:
+        nonlocal accumulation_step, optimizer_step
+        if accumulation_step <= 0:
+            return False
+        should_step_scheduler = True
+        if grad_clip and grad_clip > 0:
+            if scaler_enabled:
+                scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            for param in model.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    should_step_scheduler = False
+                    break
+        else:
+            for param in model.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    should_step_scheduler = False
+                    break
+        if should_step_scheduler:
+            if scaler_enabled:
+                scaler.step(optimizer)
+            else:
+                optimizer.step()
+        else:
+            optimizer.zero_grad(set_to_none=True)
+        if scaler_enabled:
+            scaler.update()
+        if scheduler is not None and should_step_scheduler:
+            scheduler.step()
+        if should_step_scheduler:
+            optimizer_step += 1
+        optimizer.zero_grad(set_to_none=True)
+        accumulation_step = 0
+        return should_step_scheduler
 
     def _epoch_validation_points(num_batches: int) -> list[int]:
         """Return the batch indices where validation should run within an epoch."""
@@ -1517,6 +1566,8 @@ def train_model(
         batch_idx: int,
     ) -> None:
         nonlocal step
+        nonlocal accumulation_step
+        nonlocal optimizer_step
         nonlocal loss_sum, ce_loss_sum, aux_loss_sum, best_loss_tensor, last_loss_tensor, last_ce_loss_tensor, last_aux_loss_tensor
         nonlocal route_agreement_sum, route_entropy_sum, route_active_sum
         nonlocal route_soft_active_sum, route_usage_entropy_sum, route_usage_concentration_sum
@@ -1532,8 +1583,8 @@ def train_model(
         signature_family_ids = signature_family_ids.to(device)
         loss_mask = loss_mask.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
-        _maybe_update_qat_precision(step)
+        if accumulation_step == 0:
+            _maybe_update_qat_precision(resume_global_step + optimizer_step)
         context = _precision_context(precision_policy, device, use_amp=use_amp)
         with context:
             loss, output = model.compute_loss(
@@ -1546,35 +1597,15 @@ def train_model(
                 signature_family_ids=signature_family_ids,
                 loss_mask=loss_mask,
             )
+        scaled_loss = loss / float(grad_accum_steps)
         if scaler_enabled:
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
         else:
-            loss.backward()
-        should_step_scheduler = True
-        if grad_clip and grad_clip > 0:
-            if scaler_enabled:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            for param in model.parameters():
-                if param.grad is not None and not torch.isfinite(param.grad).all():
-                    should_step_scheduler = False
-                    break
-        else:
-            for param in model.parameters():
-                if param.grad is not None and not torch.isfinite(param.grad).all():
-                    should_step_scheduler = False
-                    break
-        if should_step_scheduler:
-            if scaler_enabled:
-                scaler.step(optimizer)
-            else:
-                optimizer.step()
-        else:
-            optimizer.zero_grad(set_to_none=True)
-        if scaler_enabled:
-            scaler.update()
-        if scheduler is not None and should_step_scheduler:
-            scheduler.step()
+            scaled_loss.backward()
+        accumulation_step += 1
+        should_step_scheduler = False
+        if accumulation_step >= grad_accum_steps:
+            should_step_scheduler = _finish_optimizer_step()
 
         step += 1
         loss_value = float(loss.detach().item())
@@ -1711,8 +1742,10 @@ def train_model(
                     batch_idx=batch_idx,
                 )
                 while validation_point_index < len(validation_points) and batch_idx >= validation_points[validation_point_index]:
+                    _finish_optimizer_step()
                     _run_validation(f"epoch {epoch_idx}/{epoch_count} @ end")
                     validation_point_index += 1
+            _finish_optimizer_step()
     else:
         iterator = iter(dataloader)
         batch_idx = 0
@@ -1742,6 +1775,7 @@ def train_model(
                 epoch_idx=epoch_idx,
                 batch_idx=batch_idx,
             )
+        _finish_optimizer_step()
 
     if epoch_count <= 0 or streaming_mode:
         _run_validation("final")
@@ -1752,7 +1786,9 @@ def train_model(
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state": scaler.state_dict() if scaler is not None else None,
-        "global_step": int(resume_global_step + step),
+        "global_step": int(resume_global_step + optimizer_step),
+        "microbatch_step": int(step),
+        "grad_accum_steps": int(grad_accum_steps),
         "scheduler_total_steps": int(scheduler_total_steps),
         "scheduler_warmup_steps": int(scheduler_warmup_steps),
         "use_amp": bool(use_amp),

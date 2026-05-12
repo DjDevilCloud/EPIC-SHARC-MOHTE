@@ -72,6 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--no-factorized-embedding", action="store_true")
         p.add_argument("--factorized-embedding-dim", type=int, default=default_cfg.factorized_embedding_dim)
         p.add_argument("--optimizer", type=str, default=None, choices=("adamw", "muon", "hierarchical"))
+        p.add_argument("--use-gradient-accumulation", dest="use_gradient_accumulation", action="store_true")
+        p.add_argument("--no-gradient-accumulation", dest="use_gradient_accumulation", action="store_false")
+        p.set_defaults(use_gradient_accumulation=default_cfg.use_gradient_accumulation)
+        p.add_argument(
+            "--gradient-accumulation-steps",
+            "--grad-accum-steps",
+            dest="gradient_accumulation_steps",
+            type=int,
+            default=default_cfg.gradient_accumulation_steps,
+        )
         p.add_argument("--muon-lr", type=float, default=default_cfg.muon_lr)
         p.add_argument("--muon-weight-decay", type=float, default=default_cfg.muon_weight_decay)
         p.add_argument("--muon-momentum-beta", type=float, default=default_cfg.muon_momentum_beta)
@@ -400,6 +410,8 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         max_samples=getattr(args, "max_samples", PrismalWaveConfig.max_samples),
         lr=getattr(args, "lr", PrismalWaveConfig.lr),
         optimizer=getattr(args, "optimizer", None) if getattr(args, "optimizer", None) is not None else default_cfg.optimizer,
+        use_gradient_accumulation=getattr(args, "use_gradient_accumulation", default_cfg.use_gradient_accumulation),
+        gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", default_cfg.gradient_accumulation_steps),
         muon_lr=getattr(args, "muon_lr", default_cfg.muon_lr),
         muon_weight_decay=getattr(args, "muon_weight_decay", default_cfg.muon_weight_decay),
         muon_momentum_beta=getattr(args, "muon_momentum_beta", default_cfg.muon_momentum_beta),

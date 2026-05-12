@@ -99,6 +99,7 @@ If one of those drifts, the model raises immediately in `forward()` or `generate
 
 ```bash
 python cli.py train --data <your-data-path> --save-dir checkpoints/demo
+python cli.py train --data <your-data-path> --save-dir checkpoints/demo --use-gradient-accumulation --gradient-accumulation-steps 4
 python cli.py infer --checkpoint checkpoints/demo/model.pt --prompt "Explain torus routing"
 python cli.py benchmark --data <your-data-path>
 python gui.py
@@ -107,7 +108,7 @@ python gui.py
 ## Try It In 60 Seconds
 
 ```bash
-python cli.py train --data demo/corpus --save-dir checkpoints/tiny
+python cli.py train --data demo/corpus --save-dir checkpoints/tiny --use-gradient-accumulation --gradient-accumulation-steps 4
 python cli.py infer --checkpoint checkpoints/tiny/model.pt --prompt "Explain the torus core."
 ```
 
