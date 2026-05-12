@@ -125,17 +125,26 @@ class GateResidencyPlan:
 
 
 class GateResidencyController:
-    """Heuristic residency planner for inference-time paging."""
+    """Heuristic residency planner for routed-module paging."""
 
-    def __init__(self, model: "PrismalWaveModel") -> None:
+    def __init__(
+        self,
+        model: "PrismalWaveModel",
+        *,
+        enabled_attr: str = "use_gate",
+        config_prefix: str = "gate",
+        stat_prefix: str = "gate",
+    ) -> None:
         self.model = model
         self.cfg = model.cfg
-        self.enabled = bool(getattr(self.cfg, "use_gate", False))
-        self.residency_budget = max(1, int(getattr(self.cfg, "gate_residency_budget", 6)))
-        self.prefetch_horizon = max(1, int(getattr(self.cfg, "gate_prefetch_horizon", 2)))
-        self.tile_granularity = max(1, int(getattr(self.cfg, "gate_tile_granularity", 4)))
-        self.offload_to_cpu = bool(getattr(self.cfg, "gate_offload_to_cpu", False))
-        self.fallback_on_miss = bool(getattr(self.cfg, "gate_fallback_on_miss", True))
+        self.enabled = bool(getattr(self.cfg, enabled_attr, False))
+        self.config_prefix = str(config_prefix)
+        self.stat_prefix = str(stat_prefix)
+        self.residency_budget = max(1, int(self._cfg("residency_budget", 6)))
+        self.prefetch_horizon = max(1, int(self._cfg("prefetch_horizon", 2)))
+        self.tile_granularity = max(1, int(self._cfg("tile_granularity", 4)))
+        self.offload_to_cpu = bool(self._cfg("offload_to_cpu", False))
+        self.fallback_on_miss = bool(self._cfg("fallback_on_miss", True))
         self.route_history: Deque[Dict[str, float]] = deque(maxlen=max(8, self.residency_budget * 8))
         self.last_plan: Optional[GateResidencyPlan] = None
         self.last_route_stats: Optional[Dict[str, torch.Tensor]] = None
@@ -145,6 +154,18 @@ class GateResidencyController:
         self.miss_count: int = 0
         self.churn_count: int = 0
         self._emitter_tiles_on_device: Tuple[int, ...] = ()
+
+    def _cfg(self, suffix: str, default: object) -> object:
+        prefix_name = f"{self.config_prefix}_{suffix}"
+        if hasattr(self.cfg, prefix_name):
+            return getattr(self.cfg, prefix_name)
+        fallback_name = f"gate_{suffix}"
+        if hasattr(self.cfg, fallback_name):
+            return getattr(self.cfg, fallback_name)
+        return default
+
+    def _stat_name(self, suffix: str) -> str:
+        return f"{self.stat_prefix}_{suffix}" if self.stat_prefix else suffix
 
     def _unique_ids(self, values: Sequence[int], *, budget: Optional[int] = None) -> Tuple[int, ...]:
         seen: set[int] = set()
@@ -160,6 +181,18 @@ class GateResidencyController:
                 break
         return tuple(ordered)
 
+    def _route_history_summary(self) -> Dict[str, float]:
+        if not self.route_history:
+            return {"signature_agreement": 0.0, "avg_entropy": 0.0, "selected_path_index": 0.0}
+        agreement = sum(item.get("signature_agreement", 0.0) for item in self.route_history) / float(len(self.route_history))
+        entropy = sum(item.get("avg_entropy", 0.0) for item in self.route_history) / float(len(self.route_history))
+        selected = self.route_history[-1].get("selected_path_index", 0.0)
+        return {
+            "signature_agreement": float(agreement),
+            "avg_entropy": float(entropy),
+            "selected_path_index": float(selected),
+        }
+
     def _route_top_tiles(self, route_stats: Optional[Dict[str, torch.Tensor]]) -> Tuple[int, ...]:
         if not route_stats:
             return ()
@@ -172,6 +205,17 @@ class GateResidencyController:
             base_tile = int(value) // self.tile_granularity
             for horizon_offset in range(self.prefetch_horizon):
                 tiles.append(base_tile + horizon_offset)
+        return self._unique_ids(tiles, budget=self.residency_budget)
+
+    def _history_tiles(self) -> Tuple[int, ...]:
+        if not self.route_history:
+            return ()
+        tiles: List[int] = []
+        for entry in reversed(self.route_history):
+            selected = int(entry.get("selected_path_index", 0.0))
+            tiles.append(max(0, selected // max(1, self.tile_granularity)))
+            if len(tiles) >= self.prefetch_horizon:
+                break
         return self._unique_ids(tiles, budget=self.residency_budget)
 
     def _family_seed_tiles(self, family_ids: Optional[torch.Tensor]) -> Tuple[int, ...]:
@@ -197,6 +241,16 @@ class GateResidencyController:
         if path_index is not None:
             return (int(path_index) % expert_count,)
         return (0,)
+
+    def _history_seed_experts(self) -> Tuple[int, ...]:
+        experts = getattr(getattr(self.model, "token_hierarchy", None), "experts", None)
+        if experts is None:
+            return ()
+        expert_count = len(experts)
+        if expert_count <= 0 or not self.route_history:
+            return ()
+        recent = [int(entry.get("selected_path_index", 0.0)) % expert_count for entry in list(self.route_history)[-self.prefetch_horizon :]]
+        return self._unique_ids(recent, budget=self.residency_budget)
 
     def _prefetch_module(self, module: nn.Module, device: torch.device) -> None:
         module.to(device)
@@ -245,10 +299,15 @@ class GateResidencyController:
             return GateResidencyPlan()
         family_tiles = self._family_seed_tiles(signature_family_ids)
         route_tiles = self._route_top_tiles(route_stats)
-        expert_ids = self._path_seed_experts(route_stats, path_index)
-        predicted_tiles = self._unique_ids((*family_tiles, *route_tiles), budget=self.residency_budget)
+        history_tiles = self._history_tiles()
+        expert_ids = self._unique_ids(
+            (*self._path_seed_experts(route_stats, path_index), *self._history_seed_experts()),
+            budget=self.residency_budget,
+        )
+        predicted_tiles = self._unique_ids((*family_tiles, *route_tiles, *history_tiles), budget=self.residency_budget)
         lattice_hot = bool(getattr(self.model, "signature_lattice_attention", None) is not None)
         token_memory_hot = bool(getattr(self.model, "token_memory_attention", None) is not None)
+        history_summary = self._route_history_summary()
         confidence = 0.35
         if route_stats is not None:
             entropy = route_stats.get("avg_entropy")
@@ -257,6 +316,8 @@ class GateResidencyController:
                 confidence = float(agreement.detach().float().mean().clamp(0.0, 1.0).item())
             if torch.is_tensor(entropy):
                 confidence = max(confidence, float((1.0 / (1.0 + entropy.detach().float().mean())).clamp(0.0, 1.0).item()))
+        confidence = max(confidence, history_summary["signature_agreement"])
+        confidence = max(confidence, max(0.0, 1.0 - history_summary["avg_entropy"]))
         confidence = max(0.0, min(1.0, confidence))
         return GateResidencyPlan(
             family_ids=family_tiles,
@@ -301,12 +362,12 @@ class GateResidencyController:
             else:
                 emitter_bank = emitter_bank.to(device=device)
                 hierarchy_bank = hierarchy_bank.to(device=device)
-            stats["gate_emitter_tiles"] = torch.tensor(float(len(plan.emitter_tile_ids)), device=device)
-            stats["gate_emitter_override_rows"] = torch.tensor(float(emitter_bank.size(0)), device=device)
-            stats["_gate_emitter_bank_override"] = emitter_bank
-            stats["_gate_operator_bank_override"] = hierarchy_bank
+            stats[self._stat_name("emitter_tiles")] = torch.tensor(float(len(plan.emitter_tile_ids)), device=device)
+            stats[self._stat_name("emitter_override_rows")] = torch.tensor(float(emitter_bank.size(0)), device=device)
+            stats[f"_{self.stat_prefix}_emitter_bank_override"] = emitter_bank
+            stats[f"_{self.stat_prefix}_operator_bank_override"] = hierarchy_bank
         else:
-            stats["gate_emitter_tiles"] = torch.tensor(float(len(plan.emitter_tile_ids)), device=device)
+            stats[self._stat_name("emitter_tiles")] = torch.tensor(float(len(plan.emitter_tile_ids)), device=device)
         self._emitter_tiles_on_device = plan.emitter_tile_ids
         return stats
 
@@ -336,16 +397,23 @@ class GateResidencyController:
         self.miss_count += gate_miss
         if previous_plan is not None and plan.emitter_tile_ids != previous_plan.emitter_tile_ids:
             self.churn_count += 1
-        summary["gate_hit_count"] = torch.tensor(float(self.hit_count), device=next(self.model.parameters()).device)
-        summary["gate_miss_count"] = torch.tensor(float(self.miss_count), device=next(self.model.parameters()).device)
-        summary["gate_tile_churn"] = torch.tensor(float(self.churn_count), device=next(self.model.parameters()).device)
-        summary["gate_predicted_tiles"] = torch.tensor(float(plan.predicted_tiles), device=next(self.model.parameters()).device)
-        summary["gate_confidence"] = torch.tensor(float(plan.confidence), device=next(self.model.parameters()).device)
-        summary["gate_latency_saved_ms"] = torch.tensor(
+        device = next(self.model.parameters()).device
+        summary[self._stat_name("hit_count")] = torch.tensor(float(self.hit_count), device=device)
+        summary[self._stat_name("miss_count")] = torch.tensor(float(self.miss_count), device=device)
+        summary[self._stat_name("tile_churn")] = torch.tensor(float(self.churn_count), device=device)
+        summary[self._stat_name("predicted_tiles")] = torch.tensor(float(plan.predicted_tiles), device=device)
+        summary[self._stat_name("confidence")] = torch.tensor(float(plan.confidence), device=device)
+        summary[self._stat_name("latency_saved_ms")] = torch.tensor(
             float(plan.predicted_tiles) * float(plan.confidence) * 0.1,
-            device=next(self.model.parameters()).device,
+            device=device,
         )
-        summary["gate_plan_time_ms"] = torch.tensor(float(self.last_plan_time_ms), device=next(self.model.parameters()).device)
+        summary[self._stat_name("plan_time_ms")] = torch.tensor(float(self.last_plan_time_ms), device=device)
+        summary[self._stat_name("lead_time_ms")] = torch.tensor(
+            float(max(self.prefetch_horizon, 1)) * float(plan.confidence) * 0.1,
+            device=device,
+        )
+        summary[self._stat_name("batch_hit")] = torch.tensor(float(gate_hit), device=device)
+        summary[self._stat_name("batch_miss")] = torch.tensor(float(gate_miss), device=device)
         self.last_plan = plan
         return summary
 
@@ -5043,7 +5111,18 @@ class PrismalWaveModel(nn.Module):
         self._precision_tier_map: List[Dict[str, object]] = []
         self._prismal_precision_state: Dict[str, object] = {}
         self.use_gate = bool(getattr(cfg, "use_gate", False))
+        self.use_gatetrain = bool(getattr(cfg, "use_gatetrain", False))
         self.gate_controller = GateResidencyController(self) if self.use_gate else None
+        self.gatetrain_controller = (
+            GateResidencyController(
+                self,
+                enabled_attr="use_gatetrain",
+                config_prefix="gatetrain",
+                stat_prefix="gatetrain",
+            )
+            if self.use_gatetrain
+            else None
+        )
 
     @property
     def token_embedding(self) -> nn.Module:
@@ -5138,9 +5217,9 @@ class PrismalWaveModel(nn.Module):
         path_index: Optional[int],
         position_index: int,
     ) -> Dict[str, torch.Tensor | GateResidencyPlan]:
-        if not self.use_gate or self.gate_controller is None or self.training:
+        controller = self.gatetrain_controller if self.training else self.gate_controller
+        if controller is None:
             return {}
-        controller = self.gate_controller
         prior_route_stats = getattr(controller, "last_route_stats", None)
         start = time.perf_counter()
         plan = controller.plan(
@@ -5154,6 +5233,11 @@ class PrismalWaveModel(nn.Module):
         controller.last_plan_time_ms = (time.perf_counter() - start) * 1000.0
         gate_stats["plan"] = plan
         return gate_stats
+
+    def _active_residency_controller(self) -> Optional[GateResidencyController]:
+        if self.training:
+            return self.gatetrain_controller if self.use_gatetrain else None
+        return self.gate_controller if self.use_gate else None
 
     def _ensure_position_embedding_capacity(self, required_size: int) -> None:
         if self.cfg.max_seq_len <= 0:
@@ -6687,12 +6771,13 @@ class PrismalWaveModel(nn.Module):
             ).detach(),
             "recursive_aux_loss": avg_recursive_aux_loss.detach(),
         }
-        if self.use_gate and self.gate_controller is not None and not self.training:
+        residency_controller = self._active_residency_controller()
+        if residency_controller is not None:
             gate_stats = {key: value for key, value in gate_runtime.items() if torch.is_tensor(value) and not key.startswith("_")}
             route_stats.update(gate_stats)
             plan = gate_runtime.get("plan")
             route_stats.update(
-                self.gate_controller.record(
+                residency_controller.record(
                     route_stats,
                     plan=plan if isinstance(plan, GateResidencyPlan) else None,
                 )
@@ -7158,12 +7243,13 @@ class PrismalWaveModel(nn.Module):
                 device=input_ids.device,
             ).detach(),
         }
-        if self.use_gate and self.gate_controller is not None and not self.training:
+        residency_controller = self._active_residency_controller()
+        if residency_controller is not None:
             gate_stats = {key: value for key, value in gate_runtime.items() if torch.is_tensor(value) and not key.startswith("_")}
             route_stats.update(gate_stats)
             plan = gate_runtime.get("plan")
             route_stats.update(
-                self.gate_controller.record(
+                residency_controller.record(
                     route_stats,
                     plan=plan if isinstance(plan, GateResidencyPlan) else None,
                 )

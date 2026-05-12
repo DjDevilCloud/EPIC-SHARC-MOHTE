@@ -21,7 +21,7 @@ class PrismalWaveConfig:
     lr: float = 0.00008
     optimizer: str = "hierarchical"
     use_gradient_accumulation: bool = True
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 8
     hierarchical_precision_enabled: bool = True
     hierarchical_precision_root_dtype: str = "bf16"
     hierarchical_precision_mid_dtype: str = "bf16"
@@ -99,12 +99,18 @@ class PrismalWaveConfig:
     signature_lattice_decay: float = 0.85
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
-    use_gate: bool = False
-    gate_residency_budget: int = 6
-    gate_prefetch_horizon: int = 2
+    use_gate: bool = True
+    gate_residency_budget: int = 12
+    gate_prefetch_horizon: int = 6
     gate_tile_granularity: int = 4
     gate_offload_to_cpu: bool = False
     gate_fallback_on_miss: bool = True
+    use_gatetrain: bool = True
+    gatetrain_residency_budget: int = 6
+    gatetrain_prefetch_horizon: int = 2
+    gatetrain_tile_granularity: int = 4
+    gatetrain_offload_to_cpu: bool = False
+    gatetrain_fallback_on_miss: bool = True
     use_token_memory_cross_attention: bool = False
     use_token_memory_generation_cache: bool = False
     token_memory_window: int = 96
@@ -308,6 +314,15 @@ class PrismalWaveConfig:
             self.gate_tile_granularity = 1
         self.gate_offload_to_cpu = bool(self.gate_offload_to_cpu)
         self.gate_fallback_on_miss = bool(self.gate_fallback_on_miss)
+        self.use_gatetrain = bool(self.use_gatetrain)
+        if self.gatetrain_residency_budget < 1:
+            self.gatetrain_residency_budget = 1
+        if self.gatetrain_prefetch_horizon < 1:
+            self.gatetrain_prefetch_horizon = 1
+        if self.gatetrain_tile_granularity < 1:
+            self.gatetrain_tile_granularity = 1
+        self.gatetrain_offload_to_cpu = bool(self.gatetrain_offload_to_cpu)
+        self.gatetrain_fallback_on_miss = bool(self.gatetrain_fallback_on_miss)
         self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
         self.use_token_memory_generation_cache = bool(self.use_token_memory_generation_cache)
         self.use_token_copy_cross_attention = bool(self.use_token_copy_cross_attention)

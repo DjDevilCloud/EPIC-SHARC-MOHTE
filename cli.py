@@ -204,6 +204,18 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--gate-fallback-on-miss", dest="gate_fallback_on_miss", action="store_true")
         p.add_argument("--no-gate-fallback-on-miss", dest="gate_fallback_on_miss", action="store_false")
         p.set_defaults(gate_fallback_on_miss=default_cfg.gate_fallback_on_miss)
+        p.add_argument("--use-gatetrain", dest="use_gatetrain", action="store_true")
+        p.add_argument("--no-gatetrain", dest="use_gatetrain", action="store_false")
+        p.set_defaults(use_gatetrain=default_cfg.use_gatetrain)
+        p.add_argument("--gatetrain-residency-budget", type=int, default=default_cfg.gatetrain_residency_budget)
+        p.add_argument("--gatetrain-prefetch-horizon", type=int, default=default_cfg.gatetrain_prefetch_horizon)
+        p.add_argument("--gatetrain-tile-granularity", type=int, default=default_cfg.gatetrain_tile_granularity)
+        p.add_argument("--gatetrain-offload-to-cpu", dest="gatetrain_offload_to_cpu", action="store_true")
+        p.add_argument("--no-gatetrain-offload-to-cpu", dest="gatetrain_offload_to_cpu", action="store_false")
+        p.set_defaults(gatetrain_offload_to_cpu=default_cfg.gatetrain_offload_to_cpu)
+        p.add_argument("--gatetrain-fallback-on-miss", dest="gatetrain_fallback_on_miss", action="store_true")
+        p.add_argument("--no-gatetrain-fallback-on-miss", dest="gatetrain_fallback_on_miss", action="store_false")
+        p.set_defaults(gatetrain_fallback_on_miss=default_cfg.gatetrain_fallback_on_miss)
         p.add_argument("--use-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_true")
         p.add_argument("--no-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_false")
         p.set_defaults(use_token_memory_cross_attention=default_cfg.use_token_memory_cross_attention)
@@ -520,6 +532,12 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         gate_tile_granularity=getattr(args, "gate_tile_granularity", default_cfg.gate_tile_granularity),
         gate_offload_to_cpu=getattr(args, "gate_offload_to_cpu", default_cfg.gate_offload_to_cpu),
         gate_fallback_on_miss=getattr(args, "gate_fallback_on_miss", default_cfg.gate_fallback_on_miss),
+        use_gatetrain=getattr(args, "use_gatetrain", default_cfg.use_gatetrain),
+        gatetrain_residency_budget=getattr(args, "gatetrain_residency_budget", default_cfg.gatetrain_residency_budget),
+        gatetrain_prefetch_horizon=getattr(args, "gatetrain_prefetch_horizon", default_cfg.gatetrain_prefetch_horizon),
+        gatetrain_tile_granularity=getattr(args, "gatetrain_tile_granularity", default_cfg.gatetrain_tile_granularity),
+        gatetrain_offload_to_cpu=getattr(args, "gatetrain_offload_to_cpu", default_cfg.gatetrain_offload_to_cpu),
+        gatetrain_fallback_on_miss=getattr(args, "gatetrain_fallback_on_miss", default_cfg.gatetrain_fallback_on_miss),
         use_token_memory_cross_attention=getattr(args, "use_token_memory_cross_attention", default_cfg.use_token_memory_cross_attention),
         use_token_memory_generation_cache=getattr(args, "use_token_memory_generation_cache", default_cfg.use_token_memory_generation_cache),
         token_memory_window=getattr(args, "token_memory_window", default_cfg.token_memory_window),
@@ -844,6 +862,15 @@ def main(argv: List[str] | None = None) -> int:
                 f"bank={int(getattr(runtime_cfg, 'family_specialist_bank_size', 1))} "
                 f"budget={int(getattr(runtime_cfg, 'family_budget', 1))} "
                 f"gate={float(getattr(runtime_cfg, 'family_specialist_gate_threshold', 0.0)):.3f}",
+                flush=True,
+            )
+            print(
+                "[Prismal] GATE training "
+                f"enabled={bool(getattr(runtime_cfg, 'use_gatetrain', False))} "
+                f"budget={int(getattr(runtime_cfg, 'gatetrain_residency_budget', 1))} "
+                f"horizon={int(getattr(runtime_cfg, 'gatetrain_prefetch_horizon', 1))} "
+                f"tile={int(getattr(runtime_cfg, 'gatetrain_tile_granularity', 1))} "
+                f"offload={bool(getattr(runtime_cfg, 'gatetrain_offload_to_cpu', False))}",
                 flush=True,
             )
         model = maybe_compile_model(model, enabled=args.torch_compile)
