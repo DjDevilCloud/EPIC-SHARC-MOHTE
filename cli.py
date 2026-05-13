@@ -91,6 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--muon-ns-steps", type=int, default=default_cfg.muon_ns_steps)
         p.add_argument("--muon-extra-scale-factor", type=float, default=default_cfg.muon_extra_scale_factor)
         p.add_argument("--muon-scalar-optimizer", type=str, default=default_cfg.muon_scalar_optimizer)
+        p.add_argument("--training-finite-guard-enabled", dest="training_finite_guard_enabled", action="store_true")
+        p.add_argument("--no-training-finite-guard-enabled", dest="training_finite_guard_enabled", action="store_false")
+        p.set_defaults(training_finite_guard_enabled=default_cfg.training_finite_guard_enabled)
+        p.add_argument("--inference-finite-guard-enabled", dest="inference_finite_guard_enabled", action="store_true")
+        p.add_argument("--no-inference-finite-guard-enabled", dest="inference_finite_guard_enabled", action="store_false")
+        p.set_defaults(inference_finite_guard_enabled=default_cfg.inference_finite_guard_enabled)
+        p.add_argument("--grad-clip-muon", type=float, default=default_cfg.grad_clip_muon)
+        p.add_argument("--grad-clip-scalar", type=float, default=default_cfg.grad_clip_scalar)
+        p.add_argument("--grad-clip-rowwise", type=float, default=default_cfg.grad_clip_rowwise)
         p.add_argument("--max-signature-tokens", type=int, default=0)
         p.add_argument("--max-line-tokens", type=int, default=0)
         p.add_argument("--tokenizer-full-text", action="store_true")
@@ -207,6 +216,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--use-gatetrain", dest="use_gatetrain", action="store_true")
         p.add_argument("--no-gatetrain", dest="use_gatetrain", action="store_false")
         p.set_defaults(use_gatetrain=default_cfg.use_gatetrain)
+        p.add_argument("--use-fullgatetrain", dest="use_fullgatetrain", action="store_true")
+        p.add_argument("--no-fullgatetrain", dest="use_fullgatetrain", action="store_false")
+        p.set_defaults(use_fullgatetrain=default_cfg.use_fullgatetrain)
         p.add_argument("--gatetrain-residency-budget", type=int, default=default_cfg.gatetrain_residency_budget)
         p.add_argument("--gatetrain-prefetch-horizon", type=int, default=default_cfg.gatetrain_prefetch_horizon)
         p.add_argument("--gatetrain-tile-granularity", type=int, default=default_cfg.gatetrain_tile_granularity)
@@ -216,6 +228,23 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--gatetrain-fallback-on-miss", dest="gatetrain_fallback_on_miss", action="store_true")
         p.add_argument("--no-gatetrain-fallback-on-miss", dest="gatetrain_fallback_on_miss", action="store_false")
         p.set_defaults(gatetrain_fallback_on_miss=default_cfg.gatetrain_fallback_on_miss)
+        p.add_argument("--use-learned-residency-head", dest="use_learned_residency_head", action="store_true")
+        p.add_argument("--no-learned-residency-head", dest="use_learned_residency_head", action="store_false")
+        p.set_defaults(use_learned_residency_head=default_cfg.use_learned_residency_head)
+        p.add_argument("--residency-head-layers", type=int, default=default_cfg.residency_head_layers)
+        p.add_argument("--residency-head-hidden-dim", type=int, default=default_cfg.residency_head_hidden_dim)
+        p.add_argument("--learned-residency-weight", type=float, default=default_cfg.learned_residency_weight)
+        p.add_argument(
+            "--use-residency-with-reinforcement",
+            dest="use_residency_with_reinforcement",
+            action="store_true",
+        )
+        p.add_argument(
+            "--no-residency-with-reinforcement",
+            dest="use_residency_with_reinforcement",
+            action="store_false",
+        )
+        p.set_defaults(use_residency_with_reinforcement=default_cfg.use_residency_with_reinforcement)
         p.add_argument("--use-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_true")
         p.add_argument("--no-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_false")
         p.set_defaults(use_token_memory_cross_attention=default_cfg.use_token_memory_cross_attention)
@@ -312,6 +341,55 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--emitter-promotion-threshold", type=float, default=default_cfg.emitter_promotion_threshold)
         p.add_argument("--torus-write-family-floor", type=float, default=default_cfg.torus_write_family_floor)
         p.add_argument("--torus-read-family-floor", type=float, default=default_cfg.torus_read_family_floor)
+        p.add_argument("--use-contrastive-routing", dest="use_contrastive_routing", action="store_true")
+        p.add_argument("--no-contrastive-routing", dest="use_contrastive_routing", action="store_false")
+        p.set_defaults(use_contrastive_routing=default_cfg.use_contrastive_routing)
+        p.add_argument("--contrastive-routing-weight", type=float, default=default_cfg.contrastive_routing_weight)
+        p.add_argument("--contrastive-routing-temperature", type=float, default=default_cfg.contrastive_routing_temperature)
+        p.add_argument(
+            "--contrastive-routing-hard-negatives",
+            dest="contrastive_routing_hard_negatives",
+            action="store_true",
+        )
+        p.add_argument(
+            "--no-contrastive-routing-hard-negatives",
+            dest="contrastive_routing_hard_negatives",
+            action="store_false",
+        )
+        p.set_defaults(contrastive_routing_hard_negatives=default_cfg.contrastive_routing_hard_negatives)
+        p.add_argument(
+            "--use-contrastive-routing-signature-neighborhood",
+            dest="use_contrastive_routing_signature_neighborhood",
+            action="store_true",
+        )
+        p.add_argument(
+            "--no-contrastive-routing-signature-neighborhood",
+            dest="use_contrastive_routing_signature_neighborhood",
+            action="store_false",
+        )
+        p.set_defaults(
+            use_contrastive_routing_signature_neighborhood=default_cfg.use_contrastive_routing_signature_neighborhood
+        )
+        p.add_argument("--use-contrastive-routing-temporal", dest="use_contrastive_routing_temporal", action="store_true")
+        p.add_argument("--no-contrastive-routing-temporal", dest="use_contrastive_routing_temporal", action="store_false")
+        p.set_defaults(use_contrastive_routing_temporal=default_cfg.use_contrastive_routing_temporal)
+        p.add_argument("--use-contrastive-routing-residency", dest="use_contrastive_routing_residency", action="store_true")
+        p.add_argument("--no-contrastive-routing-residency", dest="use_contrastive_routing_residency", action="store_false")
+        p.set_defaults(use_contrastive_routing_residency=default_cfg.use_contrastive_routing_residency)
+        p.add_argument("--use-contrastive-routing-cross-view", dest="use_contrastive_routing_cross_view", action="store_true")
+        p.add_argument("--no-contrastive-routing-cross-view", dest="use_contrastive_routing_cross_view", action="store_false")
+        p.set_defaults(use_contrastive_routing_cross_view=default_cfg.use_contrastive_routing_cross_view)
+        p.add_argument(
+            "--use-contrastive-routing-self-contrast",
+            dest="use_contrastive_routing_self_contrast",
+            action="store_true",
+        )
+        p.add_argument(
+            "--no-contrastive-routing-self-contrast",
+            dest="use_contrastive_routing_self_contrast",
+            action="store_false",
+        )
+        p.set_defaults(use_contrastive_routing_self_contrast=default_cfg.use_contrastive_routing_self_contrast)
         p.add_argument("--profile-runtime", dest="profile_runtime", action="store_true")
         p.add_argument("--no-profile-runtime", dest="profile_runtime", action="store_false")
         p.set_defaults(profile_runtime=default_cfg.profile_runtime)
@@ -436,6 +514,11 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         optimizer=getattr(args, "optimizer", None) if getattr(args, "optimizer", None) is not None else default_cfg.optimizer,
         use_gradient_accumulation=getattr(args, "use_gradient_accumulation", default_cfg.use_gradient_accumulation),
         gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", default_cfg.gradient_accumulation_steps),
+        training_finite_guard_enabled=getattr(args, "training_finite_guard_enabled", default_cfg.training_finite_guard_enabled),
+        inference_finite_guard_enabled=getattr(args, "inference_finite_guard_enabled", default_cfg.inference_finite_guard_enabled),
+        grad_clip_muon=getattr(args, "grad_clip_muon", default_cfg.grad_clip_muon),
+        grad_clip_scalar=getattr(args, "grad_clip_scalar", default_cfg.grad_clip_scalar),
+        grad_clip_rowwise=getattr(args, "grad_clip_rowwise", default_cfg.grad_clip_rowwise),
         muon_lr=getattr(args, "muon_lr", default_cfg.muon_lr),
         muon_weight_decay=getattr(args, "muon_weight_decay", default_cfg.muon_weight_decay),
         muon_momentum_beta=getattr(args, "muon_momentum_beta", default_cfg.muon_momentum_beta),
@@ -533,11 +616,21 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         gate_offload_to_cpu=getattr(args, "gate_offload_to_cpu", default_cfg.gate_offload_to_cpu),
         gate_fallback_on_miss=getattr(args, "gate_fallback_on_miss", default_cfg.gate_fallback_on_miss),
         use_gatetrain=getattr(args, "use_gatetrain", default_cfg.use_gatetrain),
+        use_fullgatetrain=getattr(args, "use_fullgatetrain", default_cfg.use_fullgatetrain),
         gatetrain_residency_budget=getattr(args, "gatetrain_residency_budget", default_cfg.gatetrain_residency_budget),
         gatetrain_prefetch_horizon=getattr(args, "gatetrain_prefetch_horizon", default_cfg.gatetrain_prefetch_horizon),
         gatetrain_tile_granularity=getattr(args, "gatetrain_tile_granularity", default_cfg.gatetrain_tile_granularity),
         gatetrain_offload_to_cpu=getattr(args, "gatetrain_offload_to_cpu", default_cfg.gatetrain_offload_to_cpu),
         gatetrain_fallback_on_miss=getattr(args, "gatetrain_fallback_on_miss", default_cfg.gatetrain_fallback_on_miss),
+        use_learned_residency_head=getattr(args, "use_learned_residency_head", default_cfg.use_learned_residency_head),
+        residency_head_layers=getattr(args, "residency_head_layers", default_cfg.residency_head_layers),
+        residency_head_hidden_dim=getattr(args, "residency_head_hidden_dim", default_cfg.residency_head_hidden_dim),
+        learned_residency_weight=getattr(args, "learned_residency_weight", default_cfg.learned_residency_weight),
+        use_residency_with_reinforcement=getattr(
+            args,
+            "use_residency_with_reinforcement",
+            default_cfg.use_residency_with_reinforcement,
+        ),
         use_token_memory_cross_attention=getattr(args, "use_token_memory_cross_attention", default_cfg.use_token_memory_cross_attention),
         use_token_memory_generation_cache=getattr(args, "use_token_memory_generation_cache", default_cfg.use_token_memory_generation_cache),
         token_memory_window=getattr(args, "token_memory_window", default_cfg.token_memory_window),
@@ -611,6 +704,43 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         emitter_promotion_threshold=args.emitter_promotion_threshold,
         torus_write_family_floor=args.torus_write_family_floor,
         torus_read_family_floor=args.torus_read_family_floor,
+        use_contrastive_routing=getattr(args, "use_contrastive_routing", default_cfg.use_contrastive_routing),
+        contrastive_routing_weight=getattr(args, "contrastive_routing_weight", default_cfg.contrastive_routing_weight),
+        contrastive_routing_temperature=getattr(
+            args,
+            "contrastive_routing_temperature",
+            default_cfg.contrastive_routing_temperature,
+        ),
+        contrastive_routing_hard_negatives=getattr(
+            args,
+            "contrastive_routing_hard_negatives",
+            default_cfg.contrastive_routing_hard_negatives,
+        ),
+        use_contrastive_routing_signature_neighborhood=getattr(
+            args,
+            "use_contrastive_routing_signature_neighborhood",
+            default_cfg.use_contrastive_routing_signature_neighborhood,
+        ),
+        use_contrastive_routing_temporal=getattr(
+            args,
+            "use_contrastive_routing_temporal",
+            default_cfg.use_contrastive_routing_temporal,
+        ),
+        use_contrastive_routing_residency=getattr(
+            args,
+            "use_contrastive_routing_residency",
+            default_cfg.use_contrastive_routing_residency,
+        ),
+        use_contrastive_routing_cross_view=getattr(
+            args,
+            "use_contrastive_routing_cross_view",
+            default_cfg.use_contrastive_routing_cross_view,
+        ),
+        use_contrastive_routing_self_contrast=getattr(
+            args,
+            "use_contrastive_routing_self_contrast",
+            default_cfg.use_contrastive_routing_self_contrast,
+        ),
         profile_runtime=args.profile_runtime,
     )
     return cfg
@@ -705,6 +835,11 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.muon_ns_steps = getattr(args, "muon_ns_steps", raw_cfg.muon_ns_steps)
             raw_cfg.muon_extra_scale_factor = getattr(args, "muon_extra_scale_factor", raw_cfg.muon_extra_scale_factor)
             raw_cfg.muon_scalar_optimizer = getattr(args, "muon_scalar_optimizer", raw_cfg.muon_scalar_optimizer)
+            raw_cfg.training_finite_guard_enabled = getattr(args, "training_finite_guard_enabled", raw_cfg.training_finite_guard_enabled)
+            raw_cfg.inference_finite_guard_enabled = getattr(args, "inference_finite_guard_enabled", raw_cfg.inference_finite_guard_enabled)
+            raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)
+            raw_cfg.grad_clip_scalar = getattr(args, "grad_clip_scalar", raw_cfg.grad_clip_scalar)
+            raw_cfg.grad_clip_rowwise = getattr(args, "grad_clip_rowwise", raw_cfg.grad_clip_rowwise)
             model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] initialized checkpoint weights "
@@ -770,6 +905,11 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.muon_ns_steps = getattr(args, "muon_ns_steps", raw_cfg.muon_ns_steps)
             raw_cfg.muon_extra_scale_factor = getattr(args, "muon_extra_scale_factor", raw_cfg.muon_extra_scale_factor)
             raw_cfg.muon_scalar_optimizer = getattr(args, "muon_scalar_optimizer", raw_cfg.muon_scalar_optimizer)
+            raw_cfg.training_finite_guard_enabled = getattr(args, "training_finite_guard_enabled", raw_cfg.training_finite_guard_enabled)
+            raw_cfg.inference_finite_guard_enabled = getattr(args, "inference_finite_guard_enabled", raw_cfg.inference_finite_guard_enabled)
+            raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)
+            raw_cfg.grad_clip_scalar = getattr(args, "grad_clip_scalar", raw_cfg.grad_clip_scalar)
+            raw_cfg.grad_clip_rowwise = getattr(args, "grad_clip_rowwise", raw_cfg.grad_clip_rowwise)
             model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] resumed checkpoint architecture "
@@ -867,6 +1007,7 @@ def main(argv: List[str] | None = None) -> int:
             print(
                 "[Prismal] GATE training "
                 f"enabled={bool(getattr(runtime_cfg, 'use_gatetrain', False))} "
+                f"full={bool(getattr(runtime_cfg, 'use_fullgatetrain', False))} "
                 f"budget={int(getattr(runtime_cfg, 'gatetrain_residency_budget', 1))} "
                 f"horizon={int(getattr(runtime_cfg, 'gatetrain_prefetch_horizon', 1))} "
                 f"tile={int(getattr(runtime_cfg, 'gatetrain_tile_granularity', 1))} "

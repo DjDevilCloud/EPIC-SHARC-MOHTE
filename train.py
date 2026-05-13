@@ -245,6 +245,7 @@ class ProgressTracker:
         usage_entropy: float | None = None,
         usage_concentration: float | None = None,
         torus_coverage: float | None = None,
+        stability_text: str = "",
         timings: Optional[Dict[str, float]] = None,
         force: bool = False,
     ) -> None:
@@ -274,12 +275,13 @@ class ProgressTracker:
             usage_text += f" eff_count={effective_emitters:.2f}"
         if emitter_cell_coverage is not None:
             usage_text += f" cell_cov={emitter_cell_coverage:.4f}"
+        stability_suffix = f" {stability_text}" if stability_text else ""
         if self.streaming_mode:
             print(
                 f"[Prismal] stream epoch {epoch_idx} "
                 f"batches_seen={done_batches} total={total_loss:.4f} ce={ce_loss:.4f} aux={aux_loss:.4f} "
                 f"sig={signature_agreement:.4f} entropy={entropy:.4f} raw={raw_active_emitters:.2f} "
-                f"rate={rate:.2f} batches/s{usage_text}{timing_text}",
+                f"rate={rate:.2f} batches/s{usage_text}{stability_suffix}{timing_text}",
                 flush=True,
             )
             self.last_print_time = now
@@ -289,7 +291,7 @@ class ProgressTracker:
             f"batch {batch_idx}/{self.batches_per_epoch} "
             f"({100.0 * done_batches / max(self.total_batches, 1):.1f}%) total={total_loss:.4f} ce={ce_loss:.4f} aux={aux_loss:.4f} "
             f"sig={signature_agreement:.4f} entropy={entropy:.4f} raw={raw_active_emitters:.2f} "
-            f"rate={rate:.2f} batches/s eta={max(self.total_batches - done_batches, 0) / max(rate, 1e-6) / 60.0:.1f}m{usage_text}{timing_text}",
+            f"rate={rate:.2f} batches/s eta={max(self.total_batches - done_batches, 0) / max(rate, 1e-6) / 60.0:.1f}m{usage_text}{stability_suffix}{timing_text}",
             flush=True,
         )
         self.last_print_time = now
@@ -691,6 +693,11 @@ def save_checkpoint(
             "bitsandbytes_leaf_precision_mode",
             "bitsandbytes_leaf_quant_type",
             "bitsandbytes_leaf_compute_dtype",
+            "training_finite_guard_enabled",
+            "inference_finite_guard_enabled",
+            "grad_clip_muon",
+            "grad_clip_scalar",
+            "grad_clip_rowwise",
             "hierarchical_precision_enabled",
             "hierarchical_precision_root_dtype",
             "hierarchical_precision_mid_dtype",
@@ -863,6 +870,12 @@ def _checkpoint_mismatch_is_tolerable(missing: Sequence[str], unexpected: Sequen
     tolerated_unexpected_exact = {
         "signature_parent_embedding.weight",
     }
+    tolerated_missing_prefixes = (
+        "learned_residency_head.",
+    )
+    tolerated_unexpected_prefixes = (
+        "learned_residency_head.",
+    )
     tolerated_quantization_suffixes = (
         ".absmax",
         ".quant_map",
@@ -877,6 +890,10 @@ def _checkpoint_mismatch_is_tolerable(missing: Sequence[str], unexpected: Sequen
     def _is_tolerated(name: str, exact: set[str]) -> bool:
         if name in exact:
             return True
+        if any(name.startswith(prefix) for prefix in tolerated_missing_prefixes):
+            return True
+        if any(name.startswith(prefix) for prefix in tolerated_unexpected_prefixes):
+            return True
         if "quant_state.bitsandbytes__" in name:
             return True
         if any(name.endswith(suffix) for suffix in tolerated_quantization_suffixes):
@@ -886,6 +903,54 @@ def _checkpoint_mismatch_is_tolerable(missing: Sequence[str], unexpected: Sequen
     return all(_is_tolerated(name, tolerated_missing_exact) for name in missing) and all(
         _is_tolerated(name, tolerated_unexpected_exact) for name in unexpected
     )
+
+
+def _optimizer_group_grad_clip_cap(group: dict, cfg: PrismalWaveConfig, fallback_grad_clip: float) -> float:
+    group_name = str(group.get("parameter_role", "")).lower()
+    update_rule = str(group.get("update_rule", "")).lower()
+    if group.get("use_muon", False) or update_rule == "muon":
+        cap = float(getattr(cfg, "grad_clip_muon", 0.0))
+    elif update_rule == "rowwise" or group_name in {"table", "tensor"}:
+        cap = float(getattr(cfg, "grad_clip_rowwise", 0.0))
+    else:
+        cap = float(getattr(cfg, "grad_clip_scalar", 0.0))
+    if cap <= 0.0 and fallback_grad_clip > 0.0:
+        return float(fallback_grad_clip)
+    return max(0.0, float(cap))
+
+
+def _optimizer_gradients_are_finite(optimizer: torch.optim.Optimizer) -> bool:
+    for group in optimizer.param_groups:
+        for param in group.get("params", []):
+            if not isinstance(param, torch.Tensor) or param.grad is None:
+                continue
+            grad = param.grad
+            if grad.is_sparse:
+                grad = grad.coalesce().values()
+            if not torch.isfinite(grad).all():
+                return False
+    return True
+
+
+def _clip_optimizer_group_gradients(
+    optimizer: torch.optim.Optimizer,
+    cfg: PrismalWaveConfig,
+    *,
+    fallback_grad_clip: float,
+) -> tuple[int, float]:
+    clipped_groups = 0
+    total_norm = 0.0
+    for group in optimizer.param_groups:
+        params = [param for param in group.get("params", []) if isinstance(param, torch.Tensor) and param.grad is not None]
+        if not params:
+            continue
+        cap = _optimizer_group_grad_clip_cap(group, cfg, fallback_grad_clip)
+        if cap <= 0.0:
+            continue
+        clipped_groups += 1
+        norm = torch.nn.utils.clip_grad_norm_(params, cap)
+        total_norm += float(norm.detach().item() if torch.is_tensor(norm) else norm)
+    return clipped_groups, total_norm
 
 
 def _optimizer_state_is_shape_compatible(optimizer: torch.optim.Optimizer) -> bool:
@@ -1397,7 +1462,15 @@ def train_model(
     gatetrain_latency_saved_sum: Optional[float] = None
     gatetrain_plan_time_sum: Optional[float] = None
     gatetrain_lead_time_sum: Optional[float] = None
+    gatetrain_full_scope_sum: Optional[float] = None
     diagnostic_count = 0
+    stability_nonfinite_loss_batches = 0
+    stability_nonfinite_grad_batches = 0
+    stability_skipped_optimizer_steps = 0
+    stability_repaired_tensors = 0
+    stability_clipped_groups = 0
+    stability_clipped_steps = 0
+    last_stability_text = ""
     val_losses = []
     val_agreements = []
     last_val_metrics: Optional[Dict[str, float]] = None
@@ -1480,24 +1553,31 @@ def train_model(
     accumulation_step = 0
     optimizer_step = 0
 
-    def _finish_optimizer_step() -> bool:
+    def _finish_optimizer_step() -> tuple[bool, int]:
         nonlocal accumulation_step, optimizer_step
+        nonlocal stability_skipped_optimizer_steps, stability_nonfinite_grad_batches
+        nonlocal stability_clipped_groups, stability_clipped_steps
+        nonlocal last_stability_text
         if accumulation_step <= 0:
-            return False
+            return False, 0
         should_step_scheduler = True
-        if grad_clip and grad_clip > 0:
-            if scaler_enabled:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            for param in model.parameters():
-                if param.grad is not None and not torch.isfinite(param.grad).all():
-                    should_step_scheduler = False
-                    break
-        else:
-            for param in model.parameters():
-                if param.grad is not None and not torch.isfinite(param.grad).all():
-                    should_step_scheduler = False
-                    break
+        if scaler_enabled:
+            scaler.unscale_(optimizer)
+        if not _optimizer_gradients_are_finite(optimizer):
+            should_step_scheduler = False
+            stability_skipped_optimizer_steps += 1
+            stability_nonfinite_grad_batches += 1
+            last_stability_text = "grad_nan"
+        clipped_groups = 0
+        if should_step_scheduler:
+            clipped_groups, _total_norm = _clip_optimizer_group_gradients(
+                optimizer,
+                runtime_model.cfg,
+                fallback_grad_clip=float(grad_clip),
+            )
+            if clipped_groups > 0:
+                stability_clipped_groups += clipped_groups
+                stability_clipped_steps += 1
         if should_step_scheduler:
             if scaler_enabled:
                 scaler.step(optimizer)
@@ -1513,7 +1593,7 @@ def train_model(
             optimizer_step += 1
         optimizer.zero_grad(set_to_none=True)
         accumulation_step = 0
-        return should_step_scheduler
+        return should_step_scheduler, clipped_groups
 
     def _epoch_validation_points(num_batches: int) -> list[int]:
         """Return the batch indices where validation should run within an epoch."""
@@ -1576,6 +1656,10 @@ def train_model(
         nonlocal step
         nonlocal accumulation_step
         nonlocal optimizer_step
+        nonlocal last_stability_text
+        nonlocal stability_nonfinite_loss_batches, stability_nonfinite_grad_batches
+        nonlocal stability_skipped_optimizer_steps, stability_repaired_tensors
+        nonlocal stability_clipped_groups, stability_clipped_steps
         nonlocal loss_sum, ce_loss_sum, aux_loss_sum, best_loss_tensor, last_loss_tensor, last_ce_loss_tensor, last_aux_loss_tensor
         nonlocal route_agreement_sum, route_entropy_sum, route_active_sum
         nonlocal route_soft_active_sum, route_usage_entropy_sum, route_usage_concentration_sum
@@ -1584,6 +1668,7 @@ def train_model(
         nonlocal route_cell_breadth_sum, route_cell_soft_breadth_sum, route_cell_effective_sum, route_cell_coverage_sum, diagnostic_count
         nonlocal gatetrain_hit_sum, gatetrain_miss_sum, gatetrain_churn_sum, gatetrain_predicted_tiles_sum
         nonlocal gatetrain_confidence_sum, gatetrain_latency_saved_sum, gatetrain_plan_time_sum, gatetrain_lead_time_sum
+        nonlocal gatetrain_full_scope_sum
         input_ids = input_ids.to(device)
         labels = labels.to(device)
         signature_ids = signature_ids.to(device)
@@ -1607,6 +1692,24 @@ def train_model(
                 signature_family_ids=signature_family_ids,
                 loss_mask=loss_mask,
             )
+        repair_count = 0
+        stability_value = output.route_stats.get("stability_nonfinite_repair_count")
+        if torch.is_tensor(stability_value):
+            repair_count = int(max(0.0, float(stability_value.detach().float().mean().item())))
+        elif stability_value is not None:
+            repair_count = int(max(0.0, float(stability_value)))
+        if repair_count > 0:
+            stability_repaired_tensors += repair_count
+        is_finite_loss = bool(torch.isfinite(loss.detach()).all().item())
+        last_stability_text = f"repairs={repair_count}"
+        if not is_finite_loss:
+            stability_nonfinite_loss_batches += 1
+            stability_skipped_optimizer_steps += 1
+            last_stability_text = f"loss_nan repairs={repair_count}"
+            optimizer.zero_grad(set_to_none=True)
+            accumulation_step = 0
+            step += 1
+            return
         scaled_loss = loss / float(grad_accum_steps)
         if scaler_enabled:
             scaler.scale(scaled_loss).backward()
@@ -1614,8 +1717,11 @@ def train_model(
             scaled_loss.backward()
         accumulation_step += 1
         should_step_scheduler = False
+        clipped_groups = 0
         if accumulation_step >= grad_accum_steps:
-            should_step_scheduler = _finish_optimizer_step()
+            should_step_scheduler, clipped_groups = _finish_optimizer_step()
+            if clipped_groups > 0:
+                last_stability_text = f"repairs={repair_count} clip_groups={clipped_groups}"
 
         step += 1
         loss_value = float(loss.detach().item())
@@ -1686,6 +1792,7 @@ def train_model(
                 gatetrain_latency_saved_sum = _stat_value(output.route_stats, "gatetrain_latency_saved_ms") if gatetrain_latency_saved_sum is None else gatetrain_latency_saved_sum + _stat_value(output.route_stats, "gatetrain_latency_saved_ms")
                 gatetrain_plan_time_sum = _stat_value(output.route_stats, "gatetrain_plan_time_ms") if gatetrain_plan_time_sum is None else gatetrain_plan_time_sum + _stat_value(output.route_stats, "gatetrain_plan_time_ms")
                 gatetrain_lead_time_sum = _stat_value(output.route_stats, "gatetrain_lead_time_ms") if gatetrain_lead_time_sum is None else gatetrain_lead_time_sum + _stat_value(output.route_stats, "gatetrain_lead_time_ms")
+                gatetrain_full_scope_sum = _stat_value(output.route_stats, "gatetrain_full_scope") if gatetrain_full_scope_sum is None else gatetrain_full_scope_sum + _stat_value(output.route_stats, "gatetrain_full_scope")
             diagnostic_count += 1
             _accumulate_timings(timing_totals, output.route_stats)
 
@@ -1722,6 +1829,7 @@ def train_model(
                 usage_entropy=usage_entropy,
                 usage_concentration=usage_concentration,
                 torus_coverage=torus_coverage,
+                stability_text=last_stability_text,
                 timings=batch_timings,
             )
 
@@ -1880,11 +1988,18 @@ def train_model(
         "avg_gatetrain_latency_saved_ms": safe_avg(gatetrain_latency_saved_sum),
         "avg_gatetrain_plan_time_ms": safe_avg(gatetrain_plan_time_sum),
         "avg_gatetrain_lead_time_ms": safe_avg(gatetrain_lead_time_sum),
+        "avg_gatetrain_full_scope": safe_avg(gatetrain_full_scope_sum),
         "gatetrain_hit_rate": float(
             (gatetrain_hit_sum or 0.0) / max((gatetrain_hit_sum or 0.0) + (gatetrain_miss_sum or 0.0), 1e-6)
         )
         if gatetrain_hit_sum is not None or gatetrain_miss_sum is not None
         else float("nan"),
+        "stability_nonfinite_loss_batches": float(stability_nonfinite_loss_batches),
+        "stability_nonfinite_grad_batches": float(stability_nonfinite_grad_batches),
+        "stability_skipped_optimizer_steps": float(stability_skipped_optimizer_steps),
+        "stability_repaired_tensors": float(stability_repaired_tensors),
+        "stability_clipped_groups": float(stability_clipped_groups),
+        "stability_clipped_steps": float(stability_clipped_steps),
         "diagnostic_batches": float(diagnostic_count),
         "timing_breakdown_ms_total": dict(sorted(timing_totals.items())),
         "timing_breakdown_ms_per_step": {

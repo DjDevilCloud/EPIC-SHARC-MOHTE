@@ -80,6 +80,32 @@ def _scalar_stat_tensor(value: torch.Tensor | float | int, *, device: torch.devi
     return torch.tensor(float(value), device=device)
 
 
+def _repair_finite_tensor(
+    tensor: torch.Tensor,
+    *,
+    fallback: Optional[torch.Tensor] = None,
+    allow_negative_inf: bool = False,
+) -> Tuple[torch.Tensor, int]:
+    if not torch.is_tensor(tensor):
+        return tensor, 0
+    if tensor.numel() == 0:
+        return tensor, 0
+    if allow_negative_inf:
+        bad_mask = torch.isnan(tensor) | torch.isposinf(tensor)
+    else:
+        bad_mask = ~torch.isfinite(tensor)
+    if not bool(bad_mask.any().item()):
+        return tensor, 0
+    if fallback is None:
+        replacement = torch.zeros_like(tensor)
+    else:
+        replacement = fallback.to(device=tensor.device, dtype=tensor.dtype)
+        if replacement.shape != tensor.shape:
+            replacement = replacement.expand_as(tensor)
+    repaired = torch.where(bad_mask, replacement, tensor)
+    return repaired, int(bad_mask.sum().item())
+
+
 def _validate_aligned_signature_tensors(
     input_ids: torch.Tensor,
     *,
@@ -118,10 +144,69 @@ class GateResidencyPlan:
     emitter_tile_ids: Tuple[int, ...] = ()
     signature_lattice_hot: bool = False
     token_memory_hot: bool = False
+    full_scope: bool = False
+    router_hot: bool = False
+    torus_hot: bool = False
     confidence: float = 0.0
     hit_budget: int = 0
     miss_budget: int = 0
     predicted_tiles: int = 0
+
+
+class LearnedResidencyHead(nn.Module):
+    """Small MLP that predicts resident emitter tiles from pooled hidden state."""
+
+    def __init__(
+        self,
+        d_model: int,
+        tile_vocab_size: int,
+        *,
+        hidden_dim: int = 256,
+        layers: int = 1,
+        quantization_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.tile_vocab_size = max(1, int(tile_vocab_size))
+        self.hidden_dim = max(1, int(hidden_dim))
+        self.layers = max(1, int(layers))
+        self.quantization_config = quantization_config or QuantizationConfig()
+        self.input_proj = create_quantized_linear(
+            d_model,
+            self.hidden_dim,
+            bias=True,
+            quantization_config=self.quantization_config,
+        )
+        self.hidden_layers = nn.ModuleList(
+            create_quantized_linear(
+                self.hidden_dim,
+                self.hidden_dim,
+                bias=True,
+                quantization_config=self.quantization_config,
+            )
+            for _ in range(max(0, self.layers - 1))
+        )
+        self.output_proj = create_quantized_linear(
+            self.hidden_dim,
+            self.tile_vocab_size,
+            bias=True,
+            quantization_config=self.quantization_config,
+        )
+
+    def forward(self, hidden: torch.Tensor) -> Dict[str, torch.Tensor]:
+        pooled = hidden.mean(dim=1) if hidden.dim() == 3 else hidden
+        x = self.input_proj(pooled)
+        x = F.gelu(x)
+        for layer in self.hidden_layers:
+            x = F.gelu(layer(x))
+        tile_logits = self.output_proj(x)
+        tile_probs = F.softmax(tile_logits, dim=-1)
+        confidence = tile_probs.amax(dim=-1)
+        return {
+            "pooled_hidden": pooled,
+            "tile_logits": tile_logits,
+            "tile_probs": tile_probs,
+            "confidence": confidence,
+        }
 
 
 class GateResidencyController:
@@ -138,6 +223,7 @@ class GateResidencyController:
         self.model = model
         self.cfg = model.cfg
         self.enabled = bool(getattr(self.cfg, enabled_attr, False))
+        self.full_scope = bool(getattr(self.cfg, "use_fullgatetrain", False))
         self.config_prefix = str(config_prefix)
         self.stat_prefix = str(stat_prefix)
         self.residency_budget = max(1, int(self._cfg("residency_budget", 6)))
@@ -252,6 +338,46 @@ class GateResidencyController:
         recent = [int(entry.get("selected_path_index", 0.0)) % expert_count for entry in list(self.route_history)[-self.prefetch_horizon :]]
         return self._unique_ids(recent, budget=self.residency_budget)
 
+    def _learned_residency_tiles(self, route_stats: Optional[Dict[str, torch.Tensor]]) -> Tuple[int, ...]:
+        if route_stats is None:
+            return ()
+        tile_ids = route_stats.get("learned_residency_top_tiles")
+        if tile_ids is None or not torch.is_tensor(tile_ids) or tile_ids.numel() == 0:
+            return ()
+        flat = tile_ids.detach().long().reshape(-1).tolist()
+        return self._unique_ids(flat, budget=self.residency_budget)
+
+    def _learned_residency_confidence(self, route_stats: Optional[Dict[str, torch.Tensor]]) -> float:
+        if route_stats is None:
+            return 0.0
+        confidence = route_stats.get("learned_residency_confidence")
+        if confidence is None or not torch.is_tensor(confidence) or confidence.numel() == 0:
+            return 0.0
+        return float(confidence.detach().float().mean().clamp(0.0, 1.0).item())
+
+    def _all_family_ids(self) -> Tuple[int, ...]:
+        specialists = getattr(self.model, "family_specialists", None)
+        if specialists is None:
+            return ()
+        return tuple(range(len(specialists)))
+
+    def _all_expert_ids(self) -> Tuple[int, ...]:
+        experts = getattr(getattr(self.model, "token_hierarchy", None), "experts", None)
+        if experts is None:
+            return ()
+        return tuple(range(len(experts)))
+
+    def _all_emitter_tiles(self) -> Tuple[int, ...]:
+        router = getattr(self.model, "router", None)
+        if router is None:
+            return ()
+        bank = getattr(router, "emitter_bank", None)
+        if bank is None or not torch.is_tensor(bank) or bank.numel() == 0:
+            return ()
+        tile_size = max(1, self.tile_granularity)
+        total_tiles = max(1, math.ceil(bank.size(0) / tile_size))
+        return tuple(range(total_tiles))
+
     def _prefetch_module(self, module: nn.Module, device: torch.device) -> None:
         module.to(device)
 
@@ -297,14 +423,37 @@ class GateResidencyController:
     ) -> GateResidencyPlan:
         if not self.enabled:
             return GateResidencyPlan()
+        if self.full_scope:
+            family_tiles = self._all_family_ids()
+            expert_ids = self._all_expert_ids()
+            predicted_tiles = self._all_emitter_tiles()
+            router_hot = bool(getattr(self.model, "router", None) is not None)
+            torus_hot = bool(getattr(self.model, "torus_core", None) is not None)
+            lattice_hot = bool(getattr(self.model, "signature_lattice_attention", None) is not None)
+            token_memory_hot = bool(getattr(self.model, "token_memory_attention", None) is not None)
+            return GateResidencyPlan(
+                family_ids=family_tiles,
+                expert_ids=expert_ids,
+                emitter_tile_ids=predicted_tiles,
+                signature_lattice_hot=lattice_hot,
+                token_memory_hot=token_memory_hot,
+                full_scope=True,
+                router_hot=router_hot,
+                torus_hot=torus_hot,
+                confidence=1.0,
+                hit_budget=len(predicted_tiles),
+                miss_budget=0,
+                predicted_tiles=len(predicted_tiles),
+            )
         family_tiles = self._family_seed_tiles(signature_family_ids)
         route_tiles = self._route_top_tiles(route_stats)
         history_tiles = self._history_tiles()
+        learned_tiles = self._learned_residency_tiles(route_stats)
         expert_ids = self._unique_ids(
             (*self._path_seed_experts(route_stats, path_index), *self._history_seed_experts()),
             budget=self.residency_budget,
         )
-        predicted_tiles = self._unique_ids((*family_tiles, *route_tiles, *history_tiles), budget=self.residency_budget)
+        predicted_tiles = self._unique_ids((*family_tiles, *route_tiles, *history_tiles, *learned_tiles), budget=self.residency_budget)
         lattice_hot = bool(getattr(self.model, "signature_lattice_attention", None) is not None)
         token_memory_hot = bool(getattr(self.model, "token_memory_attention", None) is not None)
         history_summary = self._route_history_summary()
@@ -318,6 +467,7 @@ class GateResidencyController:
                 confidence = max(confidence, float((1.0 / (1.0 + entropy.detach().float().mean())).clamp(0.0, 1.0).item()))
         confidence = max(confidence, history_summary["signature_agreement"])
         confidence = max(confidence, max(0.0, 1.0 - history_summary["avg_entropy"]))
+        confidence = max(confidence, self._learned_residency_confidence(route_stats))
         confidence = max(0.0, min(1.0, confidence))
         return GateResidencyPlan(
             family_ids=family_tiles,
@@ -325,6 +475,9 @@ class GateResidencyController:
             emitter_tile_ids=predicted_tiles,
             signature_lattice_hot=lattice_hot,
             token_memory_hot=token_memory_hot,
+            full_scope=False,
+            router_hot=bool(getattr(self.model, "router", None) is not None),
+            torus_hot=bool(getattr(self.model, "torus_core", None) is not None),
             confidence=confidence,
             hit_budget=len(predicted_tiles),
             miss_budget=max(0, self.residency_budget - len(predicted_tiles)),
@@ -341,17 +494,33 @@ class GateResidencyController:
             return {}
         model = self.model
         stats: Dict[str, torch.Tensor] = {}
-        if self.offload_to_cpu and model.signature_lattice_attention is not None:
+        if plan.full_scope and model.router is not None:
+            self._prefetch_module(model.router, device)
+        if plan.full_scope and model.torus_core is not None:
+            self._prefetch_module(model.torus_core, device)
+        if plan.full_scope and getattr(model, "token_hierarchy", None) is not None:
+            self._prefetch_module(model.token_hierarchy, device)
+        if plan.full_scope and model.signature_lattice_attention is not None:
+            self._prefetch_module(model.signature_lattice_attention, device)
+        if plan.full_scope and model.token_memory_attention is not None:
+            self._prefetch_module(model.token_memory_attention, device)
+        if self.offload_to_cpu and not plan.full_scope and model.signature_lattice_attention is not None:
             target = device if plan.signature_lattice_hot else torch.device("cpu")
             self._prefetch_module(model.signature_lattice_attention, target)
-        if self.offload_to_cpu and model.token_memory_attention is not None:
+        if self.offload_to_cpu and not plan.full_scope and model.token_memory_attention is not None:
             target = device if plan.token_memory_hot else torch.device("cpu")
             self._prefetch_module(model.token_memory_attention, target)
         if self.offload_to_cpu and getattr(model, "token_hierarchy", None) is not None:
             hierarchy = model.token_hierarchy
             if hasattr(hierarchy, "gate_apply_residency"):
-                stats.update(hierarchy.gate_apply_residency(device=device, family_ids=plan.family_ids, expert_ids=plan.expert_ids, offload_to_cpu=True))
-        if self.offload_to_cpu and model.router is not None:
+                if plan.full_scope:
+                    family_ids = self._all_family_ids()
+                    expert_ids = self._all_expert_ids()
+                else:
+                    family_ids = plan.family_ids
+                    expert_ids = plan.expert_ids
+                stats.update(hierarchy.gate_apply_residency(device=device, family_ids=family_ids, expert_ids=expert_ids, offload_to_cpu=not plan.full_scope))
+        if self.offload_to_cpu and not plan.full_scope and model.router is not None:
             model.router.emitter_bank.data = model.router.emitter_bank.data.to(device="cpu")
             model.router.operator_hierarchy_bank.data = model.router.operator_hierarchy_bank.data.to(device="cpu")
             emitter_bank = model.router.emitter_bank.detach().to(device="cpu")
@@ -368,6 +537,9 @@ class GateResidencyController:
             stats[f"_{self.stat_prefix}_operator_bank_override"] = hierarchy_bank
         else:
             stats[self._stat_name("emitter_tiles")] = torch.tensor(float(len(plan.emitter_tile_ids)), device=device)
+        stats[self._stat_name("full_scope")] = torch.tensor(1.0 if plan.full_scope else 0.0, device=device)
+        stats[self._stat_name("router_hot")] = torch.tensor(1.0 if plan.router_hot else 0.0, device=device)
+        stats[self._stat_name("torus_hot")] = torch.tensor(1.0 if plan.torus_hot else 0.0, device=device)
         self._emitter_tiles_on_device = plan.emitter_tile_ids
         return stats
 
@@ -414,6 +586,9 @@ class GateResidencyController:
         )
         summary[self._stat_name("batch_hit")] = torch.tensor(float(gate_hit), device=device)
         summary[self._stat_name("batch_miss")] = torch.tensor(float(gate_miss), device=device)
+        summary[self._stat_name("full_scope")] = torch.tensor(1.0 if plan.full_scope else 0.0, device=device)
+        summary[self._stat_name("router_hot")] = torch.tensor(1.0 if plan.router_hot else 0.0, device=device)
+        summary[self._stat_name("torus_hot")] = torch.tensor(1.0 if plan.torus_hot else 0.0, device=device)
         self.last_plan = plan
         return summary
 
@@ -2841,6 +3016,14 @@ class PrismalTorusCore(nn.Module):
                 relation_context=relation_context,
                 parent_context=parent_context,
             )
+            repair_count = 0
+            next_hidden, repaired = self._sanitize_tensor(next_hidden, fallback=current_hidden)
+            repair_count += repaired
+            next_field_field, repaired = self._sanitize_tensor(next_field.field, fallback=current_state.field)
+            next_field_bus, repaired_bus = self._sanitize_tensor(next_field.bus, fallback=current_state.bus)
+            repair_count += repaired + repaired_bus
+            if repair_count > 0:
+                next_field = PrismalTorusState(field=next_field_field, bus=next_field_bus)
             if current_hidden.shape[-1] != next_hidden.shape[-1]:
                 current_hidden_cmp = current_hidden.mean(dim=-1, keepdim=True).expand_as(next_hidden)
             else:
@@ -2849,7 +3032,12 @@ class PrismalTorusCore(nn.Module):
             field_residual = (next_field.field - current_state.field).abs().mean()
             bus_residual = (next_field.bus - current_state.bus).abs().mean()
             residual = hidden_residual + field_residual + bus_residual
+            residual, residual_repairs = self._sanitize_tensor(residual, fallback=torch.tensor(1e6, device=hidden.device))
+            repair_count += residual_repairs
             last_stats = stats
+            if repair_count > 0:
+                last_stats = dict(last_stats)
+                last_stats["stability_nonfinite_repair_count"] = torch.tensor(float(repair_count), device=hidden.device)
             last_transition_state = transition_state
             iterations_used = iteration + 1
             if check_convergence:
@@ -2935,6 +3123,14 @@ class PrismalTorusCore(nn.Module):
                 relation_context=relation_context,
                 parent_context=parent_context,
             )
+            repair_count = 0
+            next_hidden, repaired = self._sanitize_tensor(next_hidden, fallback=current_hidden)
+            repair_count += repaired
+            next_field_field, repaired = self._sanitize_tensor(next_field.field, fallback=current_state.field)
+            next_field_bus, repaired_bus = self._sanitize_tensor(next_field.bus, fallback=current_state.bus)
+            repair_count += repaired + repaired_bus
+            if repair_count > 0:
+                next_field = PrismalTorusState(field=next_field_field, bus=next_field_bus)
             if current_hidden.shape[-1] != next_hidden.shape[-1]:
                 current_hidden_cmp = current_hidden.mean(dim=-1, keepdim=True).expand_as(next_hidden)
             else:
@@ -2943,7 +3139,12 @@ class PrismalTorusCore(nn.Module):
             field_residual = (next_field.field - current_state.field).abs().mean()
             bus_residual = (next_field.bus - current_state.bus).abs().mean()
             residual = hidden_residual + field_residual + bus_residual
+            residual, residual_repairs = self._sanitize_tensor(residual, fallback=torch.tensor(1e6, device=hidden_chunk.device))
+            repair_count += residual_repairs
             last_stats = stats
+            if repair_count > 0:
+                last_stats = dict(last_stats)
+                last_stats["stability_nonfinite_repair_count"] = torch.tensor(float(repair_count), device=hidden_chunk.device)
             last_transition_state = transition_state
             iterations_used = iteration + 1
             if check_convergence:
@@ -3324,6 +3525,56 @@ class PrismalTorusCore(nn.Module):
             error_msgs,
         )
 
+    def _finite_guard_enabled(self) -> bool:
+        return bool(
+            getattr(self.cfg, "training_finite_guard_enabled", True)
+            if self.training
+            else getattr(self.cfg, "inference_finite_guard_enabled", True)
+        )
+
+    def _sanitize_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        fallback: Optional[torch.Tensor] = None,
+        allow_negative_inf: bool = False,
+    ) -> Tuple[torch.Tensor, int]:
+        if not self._finite_guard_enabled():
+            return tensor, 0
+        return _repair_finite_tensor(tensor, fallback=fallback, allow_negative_inf=allow_negative_inf)
+
+    def _sanitize_route_stats(
+        self,
+        route_stats: Dict[str, torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        if not self._finite_guard_enabled():
+            return route_stats, 0
+        sanitized: Dict[str, torch.Tensor] = {}
+        repairs = 0
+        for key, value in route_stats.items():
+            if torch.is_tensor(value):
+                clean_value, clean_repairs = self._sanitize_tensor(value)
+                sanitized[key] = clean_value
+                repairs += clean_repairs
+            else:
+                sanitized[key] = value
+        sanitized["stability_nonfinite_repair_count"] = torch.tensor(float(repairs), device=device)
+        sanitized["stability_finite_guard_enabled"] = torch.tensor(1.0, device=device)
+        return sanitized, repairs
+
+    def _sanitize_sampling_logits(self, logits: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        clean_logits, repairs = self._sanitize_tensor(logits, allow_negative_inf=True)
+        if not self._finite_guard_enabled() or clean_logits.numel() == 0:
+            return clean_logits, repairs
+        row_has_finite = torch.isfinite(clean_logits).any(dim=-1, keepdim=True)
+        if bool(row_has_finite.all().item()):
+            return clean_logits, repairs
+        cleaned = torch.where(row_has_finite, clean_logits, torch.zeros_like(clean_logits))
+        repairs += int((~row_has_finite).sum().item())
+        return cleaned, repairs
+
     def step(
         self,
         hidden: torch.Tensor,
@@ -3355,12 +3606,23 @@ class PrismalTorusCore(nn.Module):
             relation_context=relation_context,
             parent_context=parent_context,
         )
+        repair_count = 0
+        next_hidden, repaired = self._sanitize_tensor(next_hidden, fallback=hidden)
+        repair_count += repaired
+        if isinstance(next_field, PrismalTorusState):
+            next_field_field, repaired = self._sanitize_tensor(next_field.field, fallback=next_field.field.new_zeros(next_field.field.shape))
+            next_field_bus, repaired_bus = self._sanitize_tensor(next_field.bus, fallback=next_field.bus.new_zeros(next_field.bus.shape))
+            repair_count += repaired + repaired_bus
+            next_field = PrismalTorusState(field=next_field_field, bus=next_field_bus)
+        sanitized_stats, stat_repairs = self._sanitize_route_stats(stats, device=hidden.device)
+        repair_count += stat_repairs
+        sanitized_stats["stability_step_repair_count"] = torch.tensor(float(repair_count), device=hidden.device)
         if profile_enabled:
             _sync_for_timing(hidden.device)
             timing_ms["timing_torus_step_ms"] = (time.perf_counter() - start_total) * 1000.0
             for key, value in timing_ms.items():
-                stats[key] = torch.tensor(value, device=hidden.device)
-        return next_hidden, next_field, stats
+                sanitized_stats[key] = torch.tensor(value, device=hidden.device)
+        return next_hidden, next_field, sanitized_stats
 
 
 class PrismalRecursiveTorusCore(PrismalTorusCore):
@@ -5110,8 +5372,38 @@ class PrismalWaveModel(nn.Module):
         attach_precision_policy(self, self.precision_policy)
         self._precision_tier_map: List[Dict[str, object]] = []
         self._prismal_precision_state: Dict[str, object] = {}
+        self.use_learned_residency_head = bool(
+            getattr(cfg, "use_learned_residency_head", False) or getattr(cfg, "use_residency_with_reinforcement", False)
+        )
+        self.use_residency_with_reinforcement = bool(getattr(cfg, "use_residency_with_reinforcement", False))
+        self.residency_head_layers = max(1, int(getattr(cfg, "residency_head_layers", 1)))
+        self.residency_head_hidden_dim = max(1, int(getattr(cfg, "residency_head_hidden_dim", 256)))
+        self.learned_residency_weight = max(0.0, float(getattr(cfg, "learned_residency_weight", 0.1)))
+        self.learned_residency_head = (
+            LearnedResidencyHead(
+                cfg.d_model,
+                self._learned_residency_tile_vocab_size(),
+                hidden_dim=self.residency_head_hidden_dim,
+                layers=self.residency_head_layers,
+                quantization_config=qcfg,
+            )
+            if self.use_learned_residency_head
+            else None
+        )
+        self.use_contrastive_routing = bool(getattr(cfg, "use_contrastive_routing", False))
+        self.contrastive_routing_weight = max(0.0, float(getattr(cfg, "contrastive_routing_weight", 0.1)))
+        self.contrastive_routing_temperature = max(1e-3, float(getattr(cfg, "contrastive_routing_temperature", 0.1)))
+        self.contrastive_routing_hard_negatives = bool(getattr(cfg, "contrastive_routing_hard_negatives", False))
+        self.use_contrastive_routing_signature_neighborhood = bool(
+            getattr(cfg, "use_contrastive_routing_signature_neighborhood", False)
+        )
+        self.use_contrastive_routing_temporal = bool(getattr(cfg, "use_contrastive_routing_temporal", False))
+        self.use_contrastive_routing_residency = bool(getattr(cfg, "use_contrastive_routing_residency", False))
+        self.use_contrastive_routing_cross_view = bool(getattr(cfg, "use_contrastive_routing_cross_view", False))
+        self.use_contrastive_routing_self_contrast = bool(getattr(cfg, "use_contrastive_routing_self_contrast", False))
         self.use_gate = bool(getattr(cfg, "use_gate", False))
-        self.use_gatetrain = bool(getattr(cfg, "use_gatetrain", False))
+        self.use_fullgatetrain = bool(getattr(cfg, "use_fullgatetrain", False))
+        self.use_gatetrain = bool(getattr(cfg, "use_gatetrain", False)) or self.use_fullgatetrain
         self.gate_controller = GateResidencyController(self) if self.use_gate else None
         self.gatetrain_controller = (
             GateResidencyController(
@@ -5143,6 +5435,386 @@ class PrismalWaveModel(nn.Module):
     @property
     def signature_neighborhood_head(self) -> nn.Module:
         return self.signature_token_head
+
+    def _learned_residency_tile_vocab_size(self) -> int:
+        emitter_count = max(1, int(getattr(self.cfg, "n_emitters", 1)))
+        tile_granularity = max(
+            1,
+            int(
+                getattr(
+                    self.cfg,
+                    "gate_tile_granularity",
+                    getattr(self.cfg, "gatetrain_tile_granularity", 1),
+                )
+            ),
+        )
+        return max(1, math.ceil(emitter_count / tile_granularity))
+
+    def _contrastive_routing_outputs(
+        self,
+        final_hidden: torch.Tensor,
+        input_signature: torch.Tensor,
+        final_output_signature: torch.Tensor,
+        *,
+        path_signatures: Optional[Sequence[torch.Tensor]] = None,
+        path_emitter_top_weights: Optional[Sequence[torch.Tensor]] = None,
+        signature_family_ids: Optional[torch.Tensor] = None,
+        signature_ids: Optional[torch.Tensor] = None,
+        gate_runtime: Optional[Dict[str, torch.Tensor | GateResidencyPlan]] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        device = final_hidden.device
+        zero = torch.tensor(0.0, device=device)
+        stats: Dict[str, torch.Tensor] = {
+            "contrastive_routing_enabled": zero,
+            "contrastive_routing_signature_neighborhood_enabled": zero,
+            "contrastive_routing_temporal_enabled": zero,
+            "contrastive_routing_residency_enabled": zero,
+            "contrastive_routing_cross_view_enabled": zero,
+            "contrastive_routing_self_contrast_enabled": zero,
+            "contrastive_routing_signature_neighborhood_loss": zero,
+            "contrastive_routing_temporal_loss": zero,
+            "contrastive_routing_residency_loss": zero,
+            "contrastive_routing_cross_view_loss": zero,
+            "contrastive_routing_self_contrast_loss": zero,
+            "contrastive_routing_loss": zero,
+            "contrastive_routing_temperature": torch.tensor(self.contrastive_routing_temperature, device=device),
+            "contrastive_routing_weight": torch.tensor(self.contrastive_routing_weight, device=device),
+            "contrastive_routing_hard_negatives": torch.tensor(
+                1.0 if self.contrastive_routing_hard_negatives else 0.0,
+                device=device,
+            ),
+        }
+        if not self.training or not self.use_contrastive_routing:
+            return stats, zero
+
+        temperature = max(self.contrastive_routing_temperature, 1e-3)
+        total_loss = zero
+
+        def _batch_labels(source: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if source is None or not torch.is_tensor(source) or source.numel() == 0:
+                return None
+            values = source.detach().long()
+            if values.dim() == 1:
+                return values.to(device=device)
+            flattened: List[int] = []
+            for row in values:
+                row_values = row.reshape(-1)
+                row_values = row_values[row_values > 0]
+                flattened.append(int(row_values[0].item()) if row_values.numel() > 0 else -1)
+            return torch.tensor(flattened, device=device, dtype=torch.long)
+
+        def _supervised_contrastive(embeddings: torch.Tensor, labels: Optional[torch.Tensor]) -> torch.Tensor:
+            if labels is None or embeddings.numel() == 0:
+                return zero
+            if embeddings.dim() == 1:
+                embeddings = embeddings.unsqueeze(0)
+            labels = labels.reshape(-1).to(device=device)
+            if labels.numel() != embeddings.size(0):
+                return zero
+            valid = labels.ge(0)
+            if not bool(valid.any().item()):
+                return zero
+            embeddings = embeddings[valid]
+            labels = labels[valid]
+            if embeddings.size(0) < 2:
+                return zero
+            if torch.unique(labels).numel() < 1:
+                return zero
+            normalized = F.normalize(embeddings, dim=-1, eps=1e-6)
+            logits = normalized @ normalized.transpose(0, 1)
+            logits = logits / temperature
+            eye = torch.eye(logits.size(0), device=device, dtype=torch.bool)
+            logits = logits.masked_fill(eye, float("-inf"))
+            positive_mask = labels.unsqueeze(0).eq(labels.unsqueeze(1)) & ~eye
+            positive_rows = positive_mask.any(dim=-1)
+            if not bool(positive_rows.any().item()):
+                return zero
+            if self.contrastive_routing_hard_negatives:
+                positive_logits = logits.masked_fill(~positive_mask, float("-inf")).max(dim=-1).values
+                negative_logits = logits.masked_fill(positive_mask, float("-inf")).max(dim=-1).values
+                valid_rows = torch.isfinite(positive_logits) & torch.isfinite(negative_logits)
+                if not bool(valid_rows.any().item()):
+                    return zero
+                loss = F.softplus((negative_logits - positive_logits) / temperature)
+                return loss.masked_select(valid_rows).mean()
+            positive_logsumexp = torch.logsumexp(logits.masked_fill(~positive_mask, float("-inf")), dim=-1)
+            all_logsumexp = torch.logsumexp(logits, dim=-1)
+            valid_rows = positive_rows & torch.isfinite(positive_logsumexp) & torch.isfinite(all_logsumexp)
+            if not bool(valid_rows.any().item()):
+                return zero
+            loss = -(positive_logsumexp - all_logsumexp)
+            return loss.masked_select(valid_rows).mean()
+
+        any_active = False
+
+        if self.use_contrastive_routing_signature_neighborhood:
+            labels = _batch_labels(signature_family_ids if signature_family_ids is not None else signature_ids)
+            signature_neighborhood_loss = _supervised_contrastive(final_output_signature, labels)
+            if torch.is_tensor(signature_neighborhood_loss) and signature_neighborhood_loss.numel() > 0:
+                stats["contrastive_routing_signature_neighborhood_enabled"] = torch.tensor(1.0, device=device)
+                stats["contrastive_routing_signature_neighborhood_loss"] = signature_neighborhood_loss.detach()
+                total_loss = total_loss + signature_neighborhood_loss
+                any_active = True
+
+        if self.use_contrastive_routing_temporal and final_hidden.size(1) > 1:
+            source = signature_family_ids if signature_family_ids is not None else signature_ids
+            if source is not None and torch.is_tensor(source) and source.size(1) > 1:
+                temporal_embeddings = final_hidden[:, :-1, :].reshape(-1, final_hidden.size(-1))
+                temporal_labels = source[:, 1:].reshape(-1).detach().long()
+                temporal_loss = _supervised_contrastive(temporal_embeddings, temporal_labels)
+                if torch.is_tensor(temporal_loss) and temporal_loss.numel() > 0:
+                    stats["contrastive_routing_temporal_enabled"] = torch.tensor(1.0, device=device)
+                    stats["contrastive_routing_temporal_loss"] = temporal_loss.detach()
+                    total_loss = total_loss + temporal_loss
+                    any_active = True
+
+        if self.use_contrastive_routing_residency and self.learned_residency_head is not None:
+            plan = None
+            if gate_runtime is not None:
+                plan = gate_runtime.get("plan")
+            if isinstance(plan, GateResidencyPlan) and plan.emitter_tile_ids:
+                tile_logits = self.learned_residency_head(final_hidden)["tile_logits"]
+                tile_count = tile_logits.size(-1)
+                target_mask = torch.zeros(tile_count, device=device, dtype=torch.bool)
+                for tile_id in plan.emitter_tile_ids:
+                    if 0 <= int(tile_id) < tile_count:
+                        target_mask[int(tile_id)] = True
+                if bool(target_mask.any().item()):
+                    target_mask = target_mask.unsqueeze(0).expand(tile_logits.size(0), -1)
+                    positive_logits = tile_logits.masked_fill(~target_mask, float("-inf")).max(dim=-1).values
+                    negative_logits = tile_logits.masked_fill(target_mask, float("-inf")).max(dim=-1).values
+                    valid_rows = torch.isfinite(positive_logits) & torch.isfinite(negative_logits)
+                    if bool(valid_rows.any().item()):
+                        residency_loss = F.softplus((negative_logits - positive_logits) / temperature)
+                        residency_loss = residency_loss.masked_select(valid_rows).mean()
+                        stats["contrastive_routing_residency_enabled"] = torch.tensor(1.0, device=device)
+                        stats["contrastive_routing_residency_loss"] = residency_loss.detach()
+                        total_loss = total_loss + residency_loss
+                        any_active = True
+
+        if self.use_contrastive_routing_cross_view and path_signatures:
+            path_signature_tensor = torch.stack(list(path_signatures), dim=1)
+            if path_signature_tensor.size(1) > 1:
+                view_embeddings = path_signature_tensor.reshape(-1, path_signature_tensor.size(-1))
+                view_labels = torch.arange(path_signature_tensor.size(0), device=device).repeat_interleave(
+                    path_signature_tensor.size(1)
+                )
+                cross_view_loss = _supervised_contrastive(view_embeddings, view_labels)
+                if torch.is_tensor(cross_view_loss) and cross_view_loss.numel() > 0:
+                    stats["contrastive_routing_cross_view_enabled"] = torch.tensor(1.0, device=device)
+                    stats["contrastive_routing_cross_view_loss"] = cross_view_loss.detach()
+                    total_loss = total_loss + cross_view_loss
+                    any_active = True
+
+        if self.use_contrastive_routing_self_contrast and path_emitter_top_weights:
+            topk_weights = torch.stack(list(path_emitter_top_weights), dim=1)
+            if topk_weights.numel() > 0 and topk_weights.size(-1) > 1:
+                candidate_weights = topk_weights.mean(dim=2).clamp_min(1e-8)
+                candidate_logits = torch.log(candidate_weights)
+                self_contrast_targets = torch.zeros(
+                    candidate_logits.size(0) * candidate_logits.size(1),
+                    device=device,
+                    dtype=torch.long,
+                )
+                self_contrast_loss = F.cross_entropy(
+                    candidate_logits.reshape(-1, candidate_logits.size(-1)) / temperature,
+                    self_contrast_targets,
+                )
+                stats["contrastive_routing_self_contrast_enabled"] = torch.tensor(1.0, device=device)
+                stats["contrastive_routing_self_contrast_loss"] = self_contrast_loss.detach()
+                total_loss = total_loss + self_contrast_loss
+                any_active = True
+
+        stats["contrastive_routing_enabled"] = torch.tensor(1.0 if any_active else 0.0, device=device)
+        stats["contrastive_routing_loss"] = total_loss.detach()
+        return stats, total_loss
+
+    def _learned_residency_target_tiles(self, route_stats: Dict[str, torch.Tensor], *, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        tile_vocab_size = self._learned_residency_tile_vocab_size()
+        top_idx = route_stats.get("emitter_top_idx")
+        if top_idx is None or not torch.is_tensor(top_idx) or top_idx.numel() == 0:
+            return None
+        active_controller = self._active_residency_controller()
+        tile_granularity = max(
+            1,
+            int(
+                getattr(
+                    self.cfg,
+                    "gate_tile_granularity",
+                    getattr(self.cfg, "gatetrain_tile_granularity", 1),
+                )
+            ),
+        )
+        values = top_idx.detach().long()
+        if values.dim() == 0:
+            values = values.view(1, 1).expand(batch_size, 1)
+        elif values.size(0) == batch_size:
+            values = values.reshape(batch_size, -1)
+        else:
+            values = values.reshape(1, -1).expand(batch_size, -1)
+        prefetch_horizon = max(
+            1,
+            int(
+                getattr(
+                    active_controller,
+                    "prefetch_horizon",
+                    getattr(self.cfg, "gate_prefetch_horizon", getattr(self.cfg, "gatetrain_prefetch_horizon", 1)),
+                )
+            ),
+        )
+        targets = torch.zeros(batch_size, tile_vocab_size, device=device)
+        for batch_idx in range(batch_size):
+            tile_ids: List[int] = []
+            for raw_value in values[batch_idx].reshape(-1).tolist():
+                base_tile = max(0, int(raw_value) // tile_granularity)
+                for offset in range(prefetch_horizon):
+                    tile_ids.append(base_tile + offset)
+            for tile_id in self._unique_tile_ids(tile_ids, tile_vocab_size):
+                targets[batch_idx, tile_id] = 1.0
+        return targets
+
+    def _unique_tile_ids(self, values: Sequence[int], limit: int) -> Tuple[int, ...]:
+        seen: set[int] = set()
+        ordered: List[int] = []
+        for value in values:
+            item = int(value)
+            if item < 0 or item >= limit or item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+        return tuple(ordered)
+
+    def _learned_residency_reward(self, route_stats: Dict[str, torch.Tensor], *, batch_size: int, device: torch.device) -> torch.Tensor:
+        def _stat(keys: Sequence[str]) -> Optional[torch.Tensor]:
+            for key in keys:
+                value = route_stats.get(key)
+                if value is not None and torch.is_tensor(value):
+                    return value.detach().to(device=device, dtype=torch.float32)
+            return None
+
+        hit_rate = _stat(("gatetrain_hit_rate", "gate_hit_rate"))
+        if hit_rate is None:
+            hit_count = _stat(("gatetrain_hit_count", "gate_hit_count"))
+            miss_count = _stat(("gatetrain_miss_count", "gate_miss_count"))
+            if hit_count is not None or miss_count is not None:
+                hit_count = hit_count if hit_count is not None else torch.zeros(1, device=device)
+                miss_count = miss_count if miss_count is not None else torch.zeros(1, device=device)
+                hit_rate = hit_count / torch.clamp(hit_count + miss_count, min=1e-6)
+        if hit_rate is None:
+            hit_rate = torch.zeros(1, device=device)
+        churn = _stat(("gatetrain_tile_churn", "gate_tile_churn"))
+        if churn is None:
+            churn = torch.zeros(1, device=device)
+        latency_saved = _stat(("gatetrain_latency_saved_ms", "gate_latency_saved_ms"))
+        if latency_saved is None:
+            latency_saved = torch.zeros(1, device=device)
+        reward = hit_rate.float().mean()
+        reward = reward - 0.05 * torch.tanh(churn.float().mean())
+        reward = reward + 0.01 * torch.tanh(latency_saved.float().mean())
+        reward = reward.clamp(-1.0, 1.0)
+        return reward.expand(batch_size)
+
+    def _learned_residency_outputs(
+        self,
+        hidden: torch.Tensor,
+        route_stats: Dict[str, torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        if not self.use_learned_residency_head or self.learned_residency_head is None:
+            return {}, torch.tensor(0.0, device=hidden.device)
+        head_out = self.learned_residency_head(hidden)
+        tile_logits = head_out["tile_logits"]
+        tile_probs = head_out["tile_probs"]
+        confidence = head_out["confidence"]
+        active_controller = self._active_residency_controller()
+        residency_budget = int(
+            getattr(
+                active_controller,
+                "residency_budget",
+                getattr(self.cfg, "gate_residency_budget", getattr(self.cfg, "gatetrain_residency_budget", 1)),
+            )
+        )
+        top_k = min(self.learned_residency_head.tile_vocab_size, max(1, residency_budget))
+        top_tiles = torch.topk(tile_logits, k=top_k, dim=-1).indices
+        targets = self._learned_residency_target_tiles(route_stats, batch_size=tile_logits.size(0), device=tile_logits.device)
+        reward = self._learned_residency_reward(route_stats, batch_size=tile_logits.size(0), device=tile_logits.device)
+        if targets is not None:
+            base_loss = F.binary_cross_entropy_with_logits(tile_logits, targets, reduction="none")
+            if self.use_residency_with_reinforcement:
+                reward_scale = (1.0 + reward).clamp(0.0, 2.0).unsqueeze(-1)
+                loss = (base_loss * reward_scale).mean()
+            else:
+                loss = base_loss.mean()
+        else:
+            probs = tile_probs.clamp_min(1e-8)
+            if self.use_residency_with_reinforcement:
+                loss = -torch.log(probs.max(dim=-1).values).mean() * (1.0 - reward.mean().clamp(-1.0, 1.0) * 0.5)
+            else:
+                loss = -torch.log(probs.max(dim=-1).values).mean()
+        predicted = top_tiles.detach()
+        outputs: Dict[str, torch.Tensor] = {
+            "learned_residency_tile_logits": tile_logits.detach(),
+            "learned_residency_tile_probs": tile_probs.detach(),
+            "learned_residency_top_tiles": predicted,
+            "learned_residency_confidence": confidence.detach(),
+            "learned_residency_reward": reward.detach(),
+            "learned_residency_loss": loss.detach(),
+            "learned_residency_enabled": torch.tensor(1.0, device=tile_logits.device),
+            "learned_residency_mode": torch.tensor(1.0 if self.use_residency_with_reinforcement else 0.0, device=tile_logits.device),
+        }
+        return outputs, loss
+
+    def _finite_guard_enabled(self) -> bool:
+        return bool(
+            getattr(self.cfg, "training_finite_guard_enabled", True)
+            if self.training
+            else getattr(self.cfg, "inference_finite_guard_enabled", True)
+        )
+
+    def _sanitize_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        fallback: Optional[torch.Tensor] = None,
+        allow_negative_inf: bool = False,
+    ) -> Tuple[torch.Tensor, int]:
+        if not self._finite_guard_enabled():
+            return tensor, 0
+        return _repair_finite_tensor(tensor, fallback=fallback, allow_negative_inf=allow_negative_inf)
+
+    def _sanitize_route_stats(
+        self,
+        route_stats: Dict[str, torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        if not self._finite_guard_enabled():
+            return route_stats, 0
+        sanitized: Dict[str, torch.Tensor] = {}
+        repairs = 0
+        for key, value in route_stats.items():
+            if torch.is_tensor(value):
+                clean_value, clean_repairs = self._sanitize_tensor(value)
+                sanitized[key] = clean_value
+                repairs += clean_repairs
+            else:
+                sanitized[key] = value
+        sanitized["stability_nonfinite_repair_count"] = torch.tensor(float(repairs), device=device)
+        sanitized["stability_finite_guard_enabled"] = torch.tensor(1.0, device=device)
+        return sanitized, repairs
+
+    def _sanitize_generation_logits(self, logits: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        return self._sanitize_tensor(logits, allow_negative_inf=True)
+
+    def _sanitize_sampling_logits(self, logits: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        clean_logits, repairs = self._sanitize_generation_logits(logits)
+        if not self._finite_guard_enabled() or clean_logits.numel() == 0:
+            return clean_logits, repairs
+        row_has_finite = torch.isfinite(clean_logits).any(dim=-1, keepdim=True)
+        if bool(row_has_finite.all().item()):
+            return clean_logits, repairs
+        cleaned = torch.where(row_has_finite, clean_logits, torch.zeros_like(clean_logits))
+        repairs += int((~row_has_finite).sum().item())
+        return cleaned, repairs
 
     def configure_precision(
         self,
@@ -6324,6 +6996,7 @@ class PrismalWaveModel(nn.Module):
         path_usage_entropy: List[torch.Tensor] = []
         path_usage_concentration: List[torch.Tensor] = []
         path_recursive_aux_loss: List[torch.Tensor] = []
+        path_emitter_top_weights: List[torch.Tensor] = []
         path_family_active_counts: List[torch.Tensor] = []
         path_family_unique_families: List[torch.Tensor] = []
         path_family_bank_sizes: List[torch.Tensor] = []
@@ -6422,6 +7095,8 @@ class PrismalWaveModel(nn.Module):
                 path_usage_concentration.append(path_stats["emitter_usage_concentration"].float())
             elif "avg_emitter_usage_concentration" in path_stats:
                 path_usage_concentration.append(path_stats["avg_emitter_usage_concentration"].float())
+            if "emitter_top_weights" in path_stats:
+                path_emitter_top_weights.append(path_stats["emitter_top_weights"].float())
             if "emitter_cell_mixture_loss" in path_stats:
                 path_mixture_loss.append(path_stats["emitter_cell_mixture_loss"].float())
             if "emitter_cell_coverage_loss" in path_stats:
@@ -6681,7 +7356,10 @@ class PrismalWaveModel(nn.Module):
             "signature_cosine": signature_cosine.detach(),
             "signature_loss": signature_loss.detach(),
             "signature_neighborhood_logits": final_neighborhood_logits.detach(),
-            "signature_neighborhood_confidence": F.softmax(final_neighborhood_logits.detach(), dim=-1).amax(dim=-1).mean(),
+            "signature_neighborhood_confidence": F.softmax(
+                self._sanitize_tensor(final_neighborhood_logits.detach(), fallback=torch.zeros_like(final_neighborhood_logits))[0],
+                dim=-1,
+            ).amax(dim=-1).mean(),
             "signature_level_loss": signature_level_loss.detach(),
             "signature_relation_loss": signature_relation_loss.detach(),
             "signature_contrastive_loss": contrastive_loss.detach(),
@@ -6771,6 +7449,8 @@ class PrismalWaveModel(nn.Module):
             ).detach(),
             "recursive_aux_loss": avg_recursive_aux_loss.detach(),
         }
+        learned_residency_stats, learned_residency_loss = self._learned_residency_outputs(final_hidden, route_stats)
+        route_stats.update(learned_residency_stats)
         residency_controller = self._active_residency_controller()
         if residency_controller is not None:
             gate_stats = {key: value for key, value in gate_runtime.items() if torch.is_tensor(value) and not key.startswith("_")}
@@ -6782,9 +7462,34 @@ class PrismalWaveModel(nn.Module):
                     plan=plan if isinstance(plan, GateResidencyPlan) else None,
                 )
             )
+        contrastive_routing_stats, contrastive_routing_loss = self._contrastive_routing_outputs(
+            final_hidden,
+            input_signature,
+            final_output_signature,
+            path_signatures=path_signatures,
+            path_emitter_top_weights=path_emitter_top_weights,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            gate_runtime=gate_runtime,
+        )
+        route_stats.update(contrastive_routing_stats)
+        route_stats, route_repairs = self._sanitize_route_stats(route_stats, device=input_ids.device)
         for key, values in recursive_stat_terms.items():
             if values and key not in route_stats:
                 route_stats[key] = torch.stack([v.reshape(()) for v in values]).mean().detach()
+        route_stats, recursive_repairs = self._sanitize_route_stats(route_stats, device=input_ids.device)
+        route_repairs += recursive_repairs
+        final_logits, logits_repairs = self._sanitize_tensor(final_logits, fallback=torch.zeros_like(final_logits))
+        final_output_signature, signature_repairs = self._sanitize_tensor(
+            final_output_signature,
+            fallback=torch.zeros_like(final_output_signature),
+        )
+        path_logits_tensor, path_repairs = self._sanitize_tensor(path_logits_tensor, fallback=torch.zeros_like(path_logits_tensor))
+        route_stats["stability_nonfinite_repair_count"] = torch.tensor(
+            float(route_repairs + logits_repairs + signature_repairs + path_repairs),
+            device=input_ids.device,
+        )
+        route_stats["stability_finite_guard_enabled"] = torch.tensor(1.0, device=input_ids.device)
         if profile_enabled:
             route_stats.update({key: torch.tensor(value, device=input_ids.device).detach() for key, value in timings.items()})
 
@@ -6793,6 +7498,7 @@ class PrismalWaveModel(nn.Module):
             + getattr(self.cfg, "signature_level_loss_weight", self.cfg.signature_loss_weight) * signature_level_loss
             + getattr(self.cfg, "signature_relation_loss_weight", self.cfg.signature_loss_weight) * signature_relation_loss
             + self.cfg.signature_contrastive_weight * contrastive_loss
+            + self.contrastive_routing_weight * contrastive_routing_loss
             - self.cfg.routing_entropy_weight * avg_entropy
             + float(getattr(self.cfg, "emitter_balance_weight", 0.0))
             * route_stats.get("emitter_balance_loss", torch.tensor(0.0, device=input_ids.device))
@@ -6801,6 +7507,7 @@ class PrismalWaveModel(nn.Module):
             + float(getattr(self.cfg, "torus_active_balance_weight", 0.0))
             * avg_coverage_loss
             - self.cfg.diversity_weight * pairwise_diversity
+            + self.learned_residency_weight * learned_residency_loss
         )
 
         return PrismalWaveOutput(
@@ -6986,6 +7693,7 @@ class PrismalWaveModel(nn.Module):
         path_mixture_loss: List[torch.Tensor] = []
         path_coverage_loss: List[torch.Tensor] = []
         path_balance_loss: List[torch.Tensor] = []
+        path_emitter_top_weights: List[torch.Tensor] = []
         gate_emitter_bank_override = gate_runtime.get("_gate_emitter_bank_override")
         gate_operator_bank_override = gate_runtime.get("_gate_operator_bank_override")
 
@@ -7041,6 +7749,8 @@ class PrismalWaveModel(nn.Module):
                     path_usage_entropy.append(stats["emitter_usage_entropy"].float())
                 if "emitter_usage_concentration" in stats:
                     path_usage_concentration.append(stats["emitter_usage_concentration"].float())
+                if "emitter_top_weights" in stats:
+                    path_emitter_top_weights.append(stats["emitter_top_weights"].float())
                 if "emitter_mixture_loss" in stats:
                     path_mixture_loss.append(stats["emitter_mixture_loss"].float())
                 elif "emitter_cell_mixture_loss" in stats:
@@ -7064,6 +7774,7 @@ class PrismalWaveModel(nn.Module):
         path_hidden_tensor = torch.stack(path_hidden, dim=1)
         path_logits_tensor = torch.stack(path_logits, dim=1)
         path_scores_tensor = torch.stack(path_scores, dim=1)
+        path_scores_tensor, _ = self._sanitize_tensor(path_scores_tensor, fallback=torch.zeros_like(path_scores_tensor))
         if path_index is None:
             path_weights = F.softmax(path_scores_tensor / max(self.cfg.validator_temperature, 1e-3), dim=-1)
             final_hidden = torch.einsum("bp,bptd->btd", path_weights, path_hidden_tensor)
@@ -7199,7 +7910,10 @@ class PrismalWaveModel(nn.Module):
             "signature_cosine": signature_cosine.detach(),
             "signature_loss": signature_loss.detach(),
             "signature_neighborhood_logits": final_neighborhood_logits.detach(),
-            "signature_neighborhood_confidence": F.softmax(final_neighborhood_logits.detach(), dim=-1).amax(dim=-1).mean(),
+            "signature_neighborhood_confidence": F.softmax(
+                self._sanitize_tensor(final_neighborhood_logits.detach(), fallback=torch.zeros_like(final_neighborhood_logits))[0],
+                dim=-1,
+            ).amax(dim=-1).mean(),
             "signature_level_loss": signature_level_loss.detach(),
             "signature_relation_loss": signature_relation_loss.detach(),
             "signature_contrastive_loss": contrastive_loss.detach(),
@@ -7243,6 +7957,8 @@ class PrismalWaveModel(nn.Module):
                 device=input_ids.device,
             ).detach(),
         }
+        learned_residency_stats, learned_residency_loss = self._learned_residency_outputs(final_hidden, route_stats)
+        route_stats.update(learned_residency_stats)
         residency_controller = self._active_residency_controller()
         if residency_controller is not None:
             gate_stats = {key: value for key, value in gate_runtime.items() if torch.is_tensor(value) and not key.startswith("_")}
@@ -7254,12 +7970,25 @@ class PrismalWaveModel(nn.Module):
                     plan=plan if isinstance(plan, GateResidencyPlan) else None,
                 )
             )
+        contrastive_routing_stats, contrastive_routing_loss = self._contrastive_routing_outputs(
+            final_hidden,
+            input_signature,
+            final_output_signature,
+            path_signatures=path_signatures,
+            path_emitter_top_weights=path_emitter_top_weights,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            gate_runtime=gate_runtime,
+        )
+        route_stats.update(contrastive_routing_stats)
+        route_stats, route_repairs = self._sanitize_route_stats(route_stats, device=input_ids.device)
 
         aux_loss = (
             self.cfg.signature_loss_weight * signature_loss
             + getattr(self.cfg, "signature_level_loss_weight", self.cfg.signature_loss_weight) * signature_level_loss
             + getattr(self.cfg, "signature_relation_loss_weight", self.cfg.signature_loss_weight) * signature_relation_loss
             + self.cfg.signature_contrastive_weight * contrastive_loss
+            + self.contrastive_routing_weight * contrastive_routing_loss
             - self.cfg.routing_entropy_weight * avg_entropy
             + float(getattr(self.cfg, "emitter_balance_weight", 0.0))
             * avg_balance_loss
@@ -7269,7 +7998,19 @@ class PrismalWaveModel(nn.Module):
             * route_stats.get("torus_coverage_loss", torch.tensor(0.0, device=input_ids.device))
             + avg_recursive_aux_loss
             - self.cfg.diversity_weight * pairwise_diversity
+            + self.learned_residency_weight * learned_residency_loss
         )
+        final_logits, logits_repairs = self._sanitize_tensor(final_logits, fallback=torch.zeros_like(final_logits))
+        final_output_signature, signature_repairs = self._sanitize_tensor(
+            final_output_signature,
+            fallback=torch.zeros_like(final_output_signature),
+        )
+        path_logits_tensor, path_repairs = self._sanitize_tensor(path_logits_tensor, fallback=torch.zeros_like(path_logits_tensor))
+        route_stats["stability_nonfinite_repair_count"] = torch.tensor(
+            float(route_repairs + logits_repairs + signature_repairs + path_repairs),
+            device=input_ids.device,
+        )
+        route_stats["stability_finite_guard_enabled"] = torch.tensor(1.0, device=input_ids.device)
 
         return PrismalWaveOutput(
             logits=final_logits,
@@ -7674,6 +8415,7 @@ class PrismalWaveModel(nn.Module):
                                 logits = filtered
                             if top_p < 1.0:
                                 sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                                sorted_logits, _ = self._sanitize_sampling_logits(sorted_logits)
                                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                                 cumprobs = torch.cumsum(sorted_probs, dim=-1)
                                 cutoff = cumprobs > top_p
@@ -7681,6 +8423,7 @@ class PrismalWaveModel(nn.Module):
                                 sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
                                 logits = torch.full_like(logits, float("-inf"))
                                 logits.scatter_(1, sorted_idx, sorted_logits)
+                            logits, _ = self._sanitize_sampling_logits(logits)
                             log_probs = F.log_softmax(logits, dim=-1)
                             candidate_k = 1 if anchor_forced else min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
                             top_log_probs, top_token_ids = torch.topk(log_probs, k=candidate_k, dim=-1)
@@ -7791,6 +8534,7 @@ class PrismalWaveModel(nn.Module):
                     logits = filtered
                 if top_p < 1.0:
                     sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                    sorted_logits, _ = self._sanitize_sampling_logits(sorted_logits)
                     sorted_probs = F.softmax(sorted_logits, dim=-1)
                     cumprobs = torch.cumsum(sorted_probs, dim=-1)
                     cutoff = cumprobs > top_p
@@ -7798,7 +8542,7 @@ class PrismalWaveModel(nn.Module):
                     sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
                     logits = torch.full_like(logits, float("-inf"))
                     logits.scatter_(1, sorted_idx, sorted_logits)
-
+                logits, _ = self._sanitize_sampling_logits(logits)
                 log_probs = F.log_softmax(logits, dim=-1)
                 candidate_k = 1 if anchor_forced else min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
                 top_log_probs, top_token_ids = torch.topk(log_probs, k=candidate_k, dim=-1)
@@ -8019,8 +8763,10 @@ class PrismalWaveModel(nn.Module):
                 top_filtered = torch.full_like(filtered, float("-inf"))
                 top_filtered.scatter_(1, top_idx, top_vals)
                 filtered = top_filtered
+            filtered, _ = self._sanitize_sampling_logits(filtered)
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(filtered, descending=True, dim=-1)
+                sorted_logits, _ = self._sanitize_sampling_logits(sorted_logits)
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumprobs = torch.cumsum(sorted_probs, dim=-1)
                 cutoff = cumprobs > top_p
@@ -8143,8 +8889,10 @@ class PrismalWaveModel(nn.Module):
                 )
                 if speculative_temperature > 0.0:
                     draft_logits = draft_logits / max(speculative_temperature, 1e-3)
+                    draft_logits, _ = self._sanitize_sampling_logits(draft_logits)
                     next_token = torch.multinomial(F.softmax(draft_logits, dim=-1), num_samples=1)
                 else:
+                    draft_logits, _ = self._sanitize_sampling_logits(draft_logits)
                     next_token = torch.argmax(draft_logits, dim=-1, keepdim=True)
                 next_signature, next_family, next_level, next_relation, next_parent = _build_signature_tensors(next_token)
                 draft_tokens.append(next_token)
@@ -8630,6 +9378,7 @@ class PrismalWaveModel(nn.Module):
             logits = filtered
         if top_p < 1.0:
             sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            sorted_logits, _ = self._sanitize_sampling_logits(sorted_logits)
             sorted_probs = F.softmax(sorted_logits, dim=-1)
             cumprobs = torch.cumsum(sorted_probs, dim=-1)
             cutoff = cumprobs > top_p
@@ -8637,6 +9386,7 @@ class PrismalWaveModel(nn.Module):
             sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
             logits = torch.full_like(logits, float("-inf"))
             logits.scatter_(1, sorted_idx, sorted_logits)
+        logits, _ = self._sanitize_sampling_logits(logits)
         anchor_next_ids = self._token_memory_anchor_next_ids(anchor_token_memory_state, device=input_ids.device)
         if anchor_next_ids is not None:
             probs = F.softmax(logits, dim=-1)
@@ -8732,6 +9482,7 @@ class PrismalWaveModel(nn.Module):
                 logits = filtered
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                sorted_logits, _ = self._sanitize_sampling_logits(sorted_logits)
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumprobs = torch.cumsum(sorted_probs, dim=-1)
                 cutoff = cumprobs > top_p
@@ -8739,6 +9490,7 @@ class PrismalWaveModel(nn.Module):
                 sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
                 logits = torch.full_like(logits, float("-inf"))
                 logits.scatter_(1, sorted_idx, sorted_logits)
+            logits, _ = self._sanitize_sampling_logits(logits)
             anchor_next_ids = self._token_memory_anchor_next_ids(anchor_token_memory_state, device=input_ids.device)
             if anchor_next_ids is not None:
                 probs = F.softmax(logits, dim=-1)

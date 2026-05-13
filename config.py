@@ -22,10 +22,15 @@ class PrismalWaveConfig:
     optimizer: str = "hierarchical"
     use_gradient_accumulation: bool = True
     gradient_accumulation_steps: int = 8
+    training_finite_guard_enabled: bool = True
+    inference_finite_guard_enabled: bool = True
+    grad_clip_muon: float = 0.75
+    grad_clip_scalar: float = 1.0
+    grad_clip_rowwise: float = 0.85
     hierarchical_precision_enabled: bool = True
     hierarchical_precision_root_dtype: str = "bf16"
     hierarchical_precision_mid_dtype: str = "bf16"
-    hierarchical_precision_leaf_dtype: str = "fp4"
+    hierarchical_precision_leaf_dtype: str = "bf16"
     hierarchical_precision_fallback_dtype: str = "bf16"
     hierarchical_precision_accumulator_dtype: str = "bf16"
     hierarchical_precision_allow_float8_leaf: bool = True
@@ -100,17 +105,23 @@ class PrismalWaveConfig:
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
     use_gate: bool = True
-    gate_residency_budget: int = 12
-    gate_prefetch_horizon: int = 6
+    gate_residency_budget: int = 4
+    gate_prefetch_horizon: int = 2
     gate_tile_granularity: int = 4
     gate_offload_to_cpu: bool = False
     gate_fallback_on_miss: bool = True
     use_gatetrain: bool = True
+    use_fullgatetrain: bool = True
     gatetrain_residency_budget: int = 6
     gatetrain_prefetch_horizon: int = 2
     gatetrain_tile_granularity: int = 4
     gatetrain_offload_to_cpu: bool = False
     gatetrain_fallback_on_miss: bool = True
+    use_learned_residency_head: bool = False
+    residency_head_layers: int = 1
+    residency_head_hidden_dim: int = 256
+    learned_residency_weight: float = 0.1
+    use_residency_with_reinforcement: bool = False
     use_token_memory_cross_attention: bool = False
     use_token_memory_generation_cache: bool = False
     token_memory_window: int = 96
@@ -211,6 +222,15 @@ class PrismalWaveConfig:
     signature_level_loss_weight: float = 0.25
     signature_relation_loss_weight: float = 0.25
     signature_contrastive_weight: float = 0.95
+    use_contrastive_routing: bool = False
+    contrastive_routing_weight: float = 0.10
+    contrastive_routing_temperature: float = 0.10
+    contrastive_routing_hard_negatives: bool = False
+    use_contrastive_routing_signature_neighborhood: bool = False
+    use_contrastive_routing_temporal: bool = False
+    use_contrastive_routing_residency: bool = False
+    use_contrastive_routing_cross_view: bool = False
+    use_contrastive_routing_self_contrast: bool = False
     routing_entropy_weight: float = 0.1
     diversity_weight: float = 0.15
     emitter_neighbor_weight: float = 0.035
@@ -292,6 +312,14 @@ class PrismalWaveConfig:
         self.use_gradient_accumulation = bool(self.use_gradient_accumulation)
         if self.gradient_accumulation_steps < 1:
             self.gradient_accumulation_steps = 1
+        self.training_finite_guard_enabled = bool(self.training_finite_guard_enabled)
+        self.inference_finite_guard_enabled = bool(self.inference_finite_guard_enabled)
+        if self.grad_clip_muon < 0.0:
+            self.grad_clip_muon = 0.0
+        if self.grad_clip_scalar < 0.0:
+            self.grad_clip_scalar = 0.0
+        if self.grad_clip_rowwise < 0.0:
+            self.grad_clip_rowwise = 0.0
         if self.mot_num_experts < 1:
             self.mot_num_experts = 1
         if self.mot_expert_scale <= 0:
@@ -315,6 +343,9 @@ class PrismalWaveConfig:
         self.gate_offload_to_cpu = bool(self.gate_offload_to_cpu)
         self.gate_fallback_on_miss = bool(self.gate_fallback_on_miss)
         self.use_gatetrain = bool(self.use_gatetrain)
+        self.use_fullgatetrain = bool(self.use_fullgatetrain)
+        if self.use_fullgatetrain:
+            self.use_gatetrain = True
         if self.gatetrain_residency_budget < 1:
             self.gatetrain_residency_budget = 1
         if self.gatetrain_prefetch_horizon < 1:
@@ -323,6 +354,16 @@ class PrismalWaveConfig:
             self.gatetrain_tile_granularity = 1
         self.gatetrain_offload_to_cpu = bool(self.gatetrain_offload_to_cpu)
         self.gatetrain_fallback_on_miss = bool(self.gatetrain_fallback_on_miss)
+        self.use_learned_residency_head = bool(self.use_learned_residency_head)
+        self.use_residency_with_reinforcement = bool(self.use_residency_with_reinforcement)
+        if self.use_residency_with_reinforcement:
+            self.use_learned_residency_head = True
+        if self.residency_head_layers < 1:
+            self.residency_head_layers = 1
+        if self.residency_head_hidden_dim < 1:
+            self.residency_head_hidden_dim = 256
+        if self.learned_residency_weight < 0.0:
+            self.learned_residency_weight = 0.0
         self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
         self.use_token_memory_generation_cache = bool(self.use_token_memory_generation_cache)
         self.use_token_copy_cross_attention = bool(self.use_token_copy_cross_attention)
@@ -341,6 +382,17 @@ class PrismalWaveConfig:
             self.signature_lattice_decay = 1.0
         if self.signature_lattice_chunk_len < 1:
             self.signature_lattice_chunk_len = 8
+        self.use_contrastive_routing = bool(self.use_contrastive_routing)
+        self.contrastive_routing_hard_negatives = bool(self.contrastive_routing_hard_negatives)
+        self.use_contrastive_routing_signature_neighborhood = bool(self.use_contrastive_routing_signature_neighborhood)
+        self.use_contrastive_routing_temporal = bool(self.use_contrastive_routing_temporal)
+        self.use_contrastive_routing_residency = bool(self.use_contrastive_routing_residency)
+        self.use_contrastive_routing_cross_view = bool(self.use_contrastive_routing_cross_view)
+        self.use_contrastive_routing_self_contrast = bool(self.use_contrastive_routing_self_contrast)
+        if self.contrastive_routing_weight < 0.0:
+            self.contrastive_routing_weight = 0.0
+        if self.contrastive_routing_temperature <= 0.0:
+            self.contrastive_routing_temperature = 0.1
         if self.token_memory_window < 1:
             self.token_memory_window = 32
         if self.token_memory_top_k < 1:
