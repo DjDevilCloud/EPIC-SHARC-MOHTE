@@ -427,12 +427,13 @@ class PrismalWaveGUI(tk.Tk):
         return row
 
     def _grid_params(self, parent: ttk.Frame, pairs: Sequence[tuple[str, tk.StringVar]]) -> None:
+        cols_per_row = 4
         for idx, (label, var) in enumerate(pairs):
-            r = idx // 3
-            c = (idx % 3) * 2
+            r = idx // cols_per_row
+            c = (idx % cols_per_row) * 2
             ttk.Label(parent, text=label).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=4)
-            ttk.Entry(parent, textvariable=var, width=14).grid(row=r, column=c + 1, sticky="we", padx=(0, 12), pady=4)
-        for col in range(6):
+            ttk.Entry(parent, textvariable=var, width=12).grid(row=r, column=c + 1, sticky="we", padx=(0, 10), pady=4)
+        for col in range(cols_per_row * 2):
             parent.columnconfigure(col, weight=1 if col % 2 == 1 else 0)
 
     def _browse_dataset(self) -> None:
