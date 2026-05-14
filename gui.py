@@ -312,13 +312,17 @@ class PrismalWaveGUI(tk.Tk):
 
         torus_box = ttk.LabelFrame(tab, text="Torus field", padding=8)
         torus_box.pack(fill="x", pady=(10, 0))
+        torus_flags = ttk.Frame(torus_box)
+        torus_flags.pack(fill="x")
         ttk.Checkbutton(
-            torus_box,
+            torus_flags,
             text="Torus SHARC router augmentation",
             variable=self.torus_sharc_router_var,
         ).pack(anchor="w")
+        torus_grid = ttk.Frame(torus_box)
+        torus_grid.pack(fill="x", pady=(8, 0))
         self._grid_params(
-            torus_box,
+            torus_grid,
             [
                 ("Local field r", self.torus_local_field_radius_var),
                 ("Bus slots", self.torus_global_bus_slots_var),
