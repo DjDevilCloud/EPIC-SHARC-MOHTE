@@ -6858,35 +6858,6 @@ class PrismalWaveModel(nn.Module):
         batch_size, seq_len = input_ids.shape
         field_state = self.torus_core.init_state(batch_size, input_ids.device, state=slot_state)
         router_aug_stats: Dict[str, torch.Tensor] = {}
-        if self.router is not None and self.use_torus_sharc_router:
-            router_slots = self.router.init_slots(batch_size, input_ids.device)
-
-            def _run_sharc_router() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-                return self.router.route(
-                    hidden,
-                    router_slots,
-                    signature_family_ids=signature_family_ids,
-                    signature_ids=signature_ids,
-                    signature_level_ids=signature_level_ids,
-                    signature_relation_ids=signature_relation_ids,
-                    parent_signature_ids=parent_signature_ids,
-                    path_index=path_index,
-                    layer_index=0,
-                    torus_center=frame.input_signature.unsqueeze(1),
-                )
-
-            router_delta, _, router_aug_stats = _profile_stage(
-                profile_enabled,
-                input_ids.device,
-                path_timings,
-                "timing_sharc_router_ms",
-                _run_sharc_router,
-            )
-            router_aug_stats = {
-                key: value.detach() if torch.is_tensor(value) else value
-                for key, value in router_aug_stats.items()
-            }
-            hidden = hidden + 0.20 * router_delta
         outputs: List[torch.Tensor] = []
         entropy_terms: List[torch.Tensor] = []
         active_terms: List[torch.Tensor] = []
@@ -6926,6 +6897,46 @@ class PrismalWaveModel(nn.Module):
         parent_context_seq = frame.parent_context_seq
         position_offset = frame.position_offset
         family_ids_for_context = signature_family_ids if signature_family_ids is not None else signature_ids
+
+        if self.router is not None and self.use_torus_sharc_router:
+            router_slots = self.router.init_slots(batch_size, input_ids.device)
+
+            def _run_sharc_router(
+                _hidden=hidden,
+                _router_slots=router_slots,
+                _signature_family_ids=signature_family_ids,
+                _signature_ids=signature_ids,
+                _signature_level_ids=signature_level_ids,
+                _signature_relation_ids=signature_relation_ids,
+                _parent_signature_ids=parent_signature_ids,
+                _torus_center=frame.input_signature.unsqueeze(1),
+                _path_index=path_index,
+            ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+                return self.router.route(
+                    _hidden,
+                    _router_slots,
+                    signature_family_ids=_signature_family_ids,
+                    signature_ids=_signature_ids,
+                    signature_level_ids=_signature_level_ids,
+                    signature_relation_ids=_signature_relation_ids,
+                    parent_signature_ids=_parent_signature_ids,
+                    path_index=_path_index,
+                    layer_index=0,
+                    torus_center=_torus_center,
+                )
+
+            router_delta, _, router_aug_stats = _profile_stage(
+                profile_enabled,
+                input_ids.device,
+                path_timings,
+                "timing_sharc_router_ms",
+                _run_sharc_router,
+            )
+            router_aug_stats = {
+                key: value.detach() if torch.is_tensor(value) else value
+                for key, value in router_aug_stats.items()
+            }
+            hidden = hidden + 0.20 * router_delta
 
         chunk_len = max(1, int(getattr(self.cfg, "torus_chunk_len", seq_len)))
         num_chunks = (seq_len + chunk_len - 1) // chunk_len
@@ -7720,9 +7731,10 @@ class PrismalWaveModel(nn.Module):
             ).detach(),
             "recursive_aux_loss": avg_recursive_aux_loss.detach(),
         }
-        if router_aug_stats:
-            route_stats.update(router_aug_stats)
-            for key, value in router_aug_stats.items():
+        sharc_router_aug_stats = locals().get("router_aug_stats", {})
+        if sharc_router_aug_stats:
+            route_stats.update(sharc_router_aug_stats)
+            for key, value in sharc_router_aug_stats.items():
                 if key.startswith("sharc_router_"):
                     continue
                 route_stats[f"sharc_router_{key}"] = value.detach() if torch.is_tensor(value) else value
