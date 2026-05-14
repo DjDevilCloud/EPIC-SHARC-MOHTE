@@ -28,7 +28,7 @@ class PrismalWaveConfig:
     grad_clip_scalar: float = 0.2
     grad_clip_rowwise: float = 0.45
     hierarchical_precision_enabled: bool = True
-    hierarchical_precision_root_dtype: str = "fp16"
+    hierarchical_precision_root_dtype: str = "bf16"
     hierarchical_precision_mid_dtype: str = "fp8"
     hierarchical_precision_leaf_dtype: str = "fp4"
     hierarchical_precision_fallback_dtype: str = "bf16"
@@ -224,7 +224,7 @@ class PrismalWaveConfig:
     emitter_seed_activity: float = 1.0
     torus_write_family_floor: float = 0.22
     torus_read_family_floor: float = 0.28
-    profile_runtime: bool = True
+    profile_runtime: bool = False
     router_temperature: float = 0.35
     signature_temperature: float = 0.30
     path_noise: float = 0.025

@@ -1463,8 +1463,9 @@ def train_model(
     )
     if hasattr(runtime_model, "set_capacity_growth_locked"):
         runtime_model.set_capacity_growth_locked(True)
-    scaler_enabled = _amp_scaler_enabled(precision_policy, device, use_amp=use_amp)
-    scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and device.type == "cuda"))
+    def _current_scaler_enabled() -> bool:
+        return _amp_scaler_enabled(precision_policy, device, use_amp=use_amp)
     use_grad_accum = bool(getattr(cfg, "use_gradient_accumulation", False))
     if grad_accum_steps is not None:
         requested_grad_accum_steps = max(1, int(grad_accum_steps))
@@ -1645,7 +1646,8 @@ def train_model(
         if accumulation_step <= 0:
             return False, 0
         should_step_scheduler = True
-        if scaler_enabled:
+        step_scaler_enabled = _current_scaler_enabled()
+        if step_scaler_enabled:
             scaler.unscale_(optimizer)
         if not _optimizer_gradients_are_finite(optimizer):
             should_step_scheduler = False
@@ -1663,13 +1665,13 @@ def train_model(
                 stability_clipped_groups += clipped_groups
                 stability_clipped_steps += 1
         if should_step_scheduler:
-            if scaler_enabled:
+            if step_scaler_enabled:
                 scaler.step(optimizer)
             else:
                 optimizer.step()
         else:
             optimizer.zero_grad(set_to_none=True)
-        if scaler_enabled:
+        if step_scaler_enabled:
             scaler.update()
         if scheduler is not None and should_step_scheduler:
             scheduler.step()
@@ -1813,7 +1815,8 @@ def train_model(
             step += 1
             return
         scaled_loss = loss / float(grad_accum_steps)
-        if scaler_enabled:
+        step_scaler_enabled = _current_scaler_enabled()
+        if step_scaler_enabled:
             scaler.scale(scaled_loss).backward()
         else:
             scaled_loss.backward()
