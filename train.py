@@ -33,6 +33,8 @@ try:
     from .muon_optim import (
         MuonAdamW,
         PrecisionAdaptiveHierarchicalOptimizer,
+        _nested_learning_beta_for,
+        _nested_learning_interval_for,
         split_muon_parameter_groups,
         split_precision_adaptive_parameter_groups,
     )
@@ -57,6 +59,8 @@ except ImportError:  # pragma: no cover - supports direct script launching.
     from muon_optim import (
         MuonAdamW,
         PrecisionAdaptiveHierarchicalOptimizer,
+        _nested_learning_beta_for,
+        _nested_learning_interval_for,
         split_muon_parameter_groups,
         split_precision_adaptive_parameter_groups,
     )
@@ -343,6 +347,43 @@ def _amp_scaler_enabled(
     return True
 
 
+def _apply_nested_optimizer_settings(optimizer: torch.optim.Optimizer, cfg: PrismalWaveConfig) -> None:
+    if not isinstance(optimizer, PrecisionAdaptiveHierarchicalOptimizer):
+        return
+
+    nested_enabled = bool(getattr(cfg, "use_nested_learning", False))
+    nest_depth = max(1, int(getattr(cfg, "hierarchical_nest_depth", 1)))
+    local_interval = int(getattr(cfg, "nested_learning_local_interval", 1))
+    mid_interval = int(getattr(cfg, "nested_learning_mid_interval", 2))
+    global_interval = int(getattr(cfg, "nested_learning_global_interval", 4))
+    local_beta = float(getattr(cfg, "nested_learning_local_ema_beta", 0.90))
+    mid_beta = float(getattr(cfg, "nested_learning_mid_ema_beta", 0.95))
+    global_beta = float(getattr(cfg, "nested_learning_global_ema_beta", 0.99))
+
+    for group in optimizer.param_groups:
+        tier = str(group.get("hierarchy_tier", "mid")).lower()
+        group["nested_learning_enabled"] = nested_enabled
+        group["nested_update_interval"] = int(
+            _nested_learning_interval_for(
+                tier,
+                hierarchical_nest_depth=nest_depth,
+                local_interval=local_interval,
+                mid_interval=mid_interval,
+                global_interval=global_interval,
+            )
+        )
+        group["nested_update_ema_beta"] = float(
+            _nested_learning_beta_for(
+                tier,
+                local_beta=local_beta,
+                mid_beta=mid_beta,
+                global_beta=global_beta,
+            )
+        )
+        if nested_enabled and "_nested_group_step" not in group:
+            group["_nested_group_step"] = 0
+
+
 def _build_optimizer(
     model: PrismalWaveModel,
     *,
@@ -365,11 +406,21 @@ def _build_optimizer(
             ns_steps=int(getattr(cfg, "muon_ns_steps", 5)),
             extra_scale_factor=float(getattr(cfg, "muon_extra_scale_factor", 1.0)),
             scalar_optimizer=str(getattr(cfg, "muon_scalar_optimizer", "adamw")),
+            nested_learning_enabled=bool(getattr(cfg, "use_nested_learning", False)),
+            hierarchical_nest_depth=int(getattr(cfg, "hierarchical_nest_depth", 1)),
+            nested_learning_local_interval=int(getattr(cfg, "nested_learning_local_interval", 1)),
+            nested_learning_mid_interval=int(getattr(cfg, "nested_learning_mid_interval", 2)),
+            nested_learning_global_interval=int(getattr(cfg, "nested_learning_global_interval", 4)),
+            nested_learning_local_ema_beta=float(getattr(cfg, "nested_learning_local_ema_beta", 0.90)),
+            nested_learning_mid_ema_beta=float(getattr(cfg, "nested_learning_mid_ema_beta", 0.95)),
+            nested_learning_global_ema_beta=float(getattr(cfg, "nested_learning_global_ema_beta", 0.99)),
             precision_policy=precision_policy,
         )
         if not param_groups:
             return torch.optim.AdamW(model.parameters(), lr=base_lr)
-        return PrecisionAdaptiveHierarchicalOptimizer(param_groups)
+        optimizer = PrecisionAdaptiveHierarchicalOptimizer(param_groups)
+        _apply_nested_optimizer_settings(optimizer, cfg)
+        return optimizer
     if name != "muon":
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
@@ -1431,6 +1482,7 @@ def train_model(
         if resume_optimizer_name == optimizer_name_norm and isinstance(resume_optimizer_state, dict):
             try:
                 optimizer.load_state_dict(resume_optimizer_state)
+                _apply_nested_optimizer_settings(optimizer, cfg)
                 if _optimizer_state_is_shape_compatible(optimizer):
                     optimizer_state_loaded = True
                 else:
@@ -1720,6 +1772,14 @@ def train_model(
 
         if accumulation_step == 0:
             _maybe_update_qat_precision(resume_global_step + optimizer_step)
+        next_step = step + 1
+        should_collect = (
+            next_step == 1
+            or next_step % diagnostic_interval == 0
+            or batch_idx == 1
+            or batch_idx == batches_per_epoch
+            or (step_limit > 0 and next_step == step_limit)
+        )
         context = _precision_context(precision_policy, device, use_amp=use_amp)
         with context:
             loss, output = model.compute_loss(
@@ -1732,6 +1792,7 @@ def train_model(
                 signature_family_ids=signature_family_ids,
                 loss_mask=loss_mask,
                 superposition_bag_size=token_superposition_bag_size,
+                collect_telemetry=should_collect,
             )
         repair_count = 0
         stability_value = output.route_stats.get("stability_nonfinite_repair_count")
@@ -1776,13 +1837,6 @@ def train_model(
         aux_loss_sum = aux_value if aux_loss_sum is None else aux_loss_sum + aux_value
         best_loss_tensor = loss_value if best_loss_tensor is None else min(best_loss_tensor, loss_value)
 
-        should_collect = (
-            step == 1
-            or step % diagnostic_interval == 0
-            or batch_idx == 1
-            or batch_idx == batches_per_epoch
-            or (step_limit > 0 and step == step_limit)
-        )
         if should_collect:
             sig_value = float(output.route_stats["signature_agreement"].mean().detach().item())
             ent_value = float(output.route_stats["avg_entropy"].detach().item())

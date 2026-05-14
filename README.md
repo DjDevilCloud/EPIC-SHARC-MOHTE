@@ -1,12 +1,8 @@
-# EPIC-SHARC MOHTE+GATE | Torus SHARC Router v0.3.1 
-
-v0.3.1 Fixed a critical router oversight override to NONE when torus core was on. See the new Torus_SHARC_Router config option.
-Added optional token binning and superpostion inspired by NousResearch: https://nousresearch.com/token-superposition
-Updated tests.
+# EPIC-SHARC MOHTE v0.2.1 
 
 v0.2.1 Update added:
 
-EPIC-SHARC MOHTE+GATE
+EPIC-SHARC MOHTE GATE
 
 Guided Activations Through Emitters
 A predictive parameter residency controller that uses:

@@ -145,6 +145,15 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--muon-ns-steps", type=int, default=default_cfg.muon_ns_steps)
         p.add_argument("--muon-extra-scale-factor", type=float, default=default_cfg.muon_extra_scale_factor)
         p.add_argument("--muon-scalar-optimizer", type=str, default=default_cfg.muon_scalar_optimizer)
+        p.add_argument("--use-nested-learning", dest="use_nested_learning", action="store_true")
+        p.add_argument("--no-nested-learning", dest="use_nested_learning", action="store_false")
+        p.set_defaults(use_nested_learning=default_cfg.use_nested_learning)
+        p.add_argument("--nested-learning-local-interval", type=int, default=default_cfg.nested_learning_local_interval)
+        p.add_argument("--nested-learning-mid-interval", type=int, default=default_cfg.nested_learning_mid_interval)
+        p.add_argument("--nested-learning-global-interval", type=int, default=default_cfg.nested_learning_global_interval)
+        p.add_argument("--nested-learning-local-ema-beta", type=float, default=default_cfg.nested_learning_local_ema_beta)
+        p.add_argument("--nested-learning-mid-ema-beta", type=float, default=default_cfg.nested_learning_mid_ema_beta)
+        p.add_argument("--nested-learning-global-ema-beta", type=float, default=default_cfg.nested_learning_global_ema_beta)
         p.add_argument("--training-finite-guard-enabled", dest="training_finite_guard_enabled", action="store_true")
         p.add_argument("--no-training-finite-guard-enabled", dest="training_finite_guard_enabled", action="store_false")
         p.set_defaults(training_finite_guard_enabled=default_cfg.training_finite_guard_enabled)
@@ -602,6 +611,13 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         muon_ns_steps=getattr(args, "muon_ns_steps", default_cfg.muon_ns_steps),
         muon_extra_scale_factor=getattr(args, "muon_extra_scale_factor", default_cfg.muon_extra_scale_factor),
         muon_scalar_optimizer=getattr(args, "muon_scalar_optimizer", default_cfg.muon_scalar_optimizer),
+        use_nested_learning=getattr(args, "use_nested_learning", default_cfg.use_nested_learning),
+        nested_learning_local_interval=getattr(args, "nested_learning_local_interval", default_cfg.nested_learning_local_interval),
+        nested_learning_mid_interval=getattr(args, "nested_learning_mid_interval", default_cfg.nested_learning_mid_interval),
+        nested_learning_global_interval=getattr(args, "nested_learning_global_interval", default_cfg.nested_learning_global_interval),
+        nested_learning_local_ema_beta=getattr(args, "nested_learning_local_ema_beta", default_cfg.nested_learning_local_ema_beta),
+        nested_learning_mid_ema_beta=getattr(args, "nested_learning_mid_ema_beta", default_cfg.nested_learning_mid_ema_beta),
+        nested_learning_global_ema_beta=getattr(args, "nested_learning_global_ema_beta", default_cfg.nested_learning_global_ema_beta),
         signature_vocab_size=getattr(args, "signature_vocab_size", 0),
         signature_level_vocab_size=getattr(args, "signature_level_vocab_size", 0),
         signature_relation_vocab_size=getattr(args, "signature_relation_vocab_size", 0),
@@ -952,6 +968,13 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.muon_ns_steps = getattr(args, "muon_ns_steps", raw_cfg.muon_ns_steps)
             raw_cfg.muon_extra_scale_factor = getattr(args, "muon_extra_scale_factor", raw_cfg.muon_extra_scale_factor)
             raw_cfg.muon_scalar_optimizer = getattr(args, "muon_scalar_optimizer", raw_cfg.muon_scalar_optimizer)
+            raw_cfg.use_nested_learning = getattr(args, "use_nested_learning", raw_cfg.use_nested_learning)
+            raw_cfg.nested_learning_local_interval = getattr(args, "nested_learning_local_interval", raw_cfg.nested_learning_local_interval)
+            raw_cfg.nested_learning_mid_interval = getattr(args, "nested_learning_mid_interval", raw_cfg.nested_learning_mid_interval)
+            raw_cfg.nested_learning_global_interval = getattr(args, "nested_learning_global_interval", raw_cfg.nested_learning_global_interval)
+            raw_cfg.nested_learning_local_ema_beta = getattr(args, "nested_learning_local_ema_beta", raw_cfg.nested_learning_local_ema_beta)
+            raw_cfg.nested_learning_mid_ema_beta = getattr(args, "nested_learning_mid_ema_beta", raw_cfg.nested_learning_mid_ema_beta)
+            raw_cfg.nested_learning_global_ema_beta = getattr(args, "nested_learning_global_ema_beta", raw_cfg.nested_learning_global_ema_beta)
             raw_cfg.training_finite_guard_enabled = getattr(args, "training_finite_guard_enabled", raw_cfg.training_finite_guard_enabled)
             raw_cfg.inference_finite_guard_enabled = getattr(args, "inference_finite_guard_enabled", raw_cfg.inference_finite_guard_enabled)
             raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)
@@ -1041,6 +1064,13 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.muon_ns_steps = getattr(args, "muon_ns_steps", raw_cfg.muon_ns_steps)
             raw_cfg.muon_extra_scale_factor = getattr(args, "muon_extra_scale_factor", raw_cfg.muon_extra_scale_factor)
             raw_cfg.muon_scalar_optimizer = getattr(args, "muon_scalar_optimizer", raw_cfg.muon_scalar_optimizer)
+            raw_cfg.use_nested_learning = getattr(args, "use_nested_learning", raw_cfg.use_nested_learning)
+            raw_cfg.nested_learning_local_interval = getattr(args, "nested_learning_local_interval", raw_cfg.nested_learning_local_interval)
+            raw_cfg.nested_learning_mid_interval = getattr(args, "nested_learning_mid_interval", raw_cfg.nested_learning_mid_interval)
+            raw_cfg.nested_learning_global_interval = getattr(args, "nested_learning_global_interval", raw_cfg.nested_learning_global_interval)
+            raw_cfg.nested_learning_local_ema_beta = getattr(args, "nested_learning_local_ema_beta", raw_cfg.nested_learning_local_ema_beta)
+            raw_cfg.nested_learning_mid_ema_beta = getattr(args, "nested_learning_mid_ema_beta", raw_cfg.nested_learning_mid_ema_beta)
+            raw_cfg.nested_learning_global_ema_beta = getattr(args, "nested_learning_global_ema_beta", raw_cfg.nested_learning_global_ema_beta)
             raw_cfg.training_finite_guard_enabled = getattr(args, "training_finite_guard_enabled", raw_cfg.training_finite_guard_enabled)
             raw_cfg.inference_finite_guard_enabled = getattr(args, "inference_finite_guard_enabled", raw_cfg.inference_finite_guard_enabled)
             raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)

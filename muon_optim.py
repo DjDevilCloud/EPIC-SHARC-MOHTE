@@ -190,6 +190,43 @@ def _weight_decay_for(role: str, tier: str, *, muon_weight_decay: float) -> floa
     return float(muon_weight_decay) * tier_scale
 
 
+def _nested_learning_interval_for(
+    tier: str,
+    *,
+    hierarchical_nest_depth: int,
+    local_interval: int,
+    mid_interval: int,
+    global_interval: int,
+) -> int:
+    depth = max(1, int(hierarchical_nest_depth))
+    base_interval = {
+        "local": int(local_interval),
+        "mid": int(mid_interval),
+        "global": int(global_interval),
+    }.get(tier, int(mid_interval))
+    tier_scale = {
+        "local": 1,
+        "mid": max(1, depth // 2),
+        "global": max(1, depth),
+    }.get(tier, 1)
+    return max(1, base_interval * tier_scale)
+
+
+def _nested_learning_beta_for(
+    tier: str,
+    *,
+    local_beta: float,
+    mid_beta: float,
+    global_beta: float,
+) -> float:
+    beta = {
+        "local": float(local_beta),
+        "mid": float(mid_beta),
+        "global": float(global_beta),
+    }.get(tier, float(mid_beta))
+    return min(max(beta, 0.0), 0.9999)
+
+
 def _precision_adaptive_spec(
     name: str,
     param: torch.nn.Parameter,
@@ -197,6 +234,14 @@ def _precision_adaptive_spec(
     base_lr: float,
     muon_lr: float,
     muon_weight_decay: float,
+    nested_learning_enabled: bool = False,
+    hierarchical_nest_depth: int = 1,
+    nested_learning_local_interval: int = 1,
+    nested_learning_mid_interval: int = 2,
+    nested_learning_global_interval: int = 4,
+    nested_learning_local_ema_beta: float = 0.90,
+    nested_learning_mid_ema_beta: float = 0.95,
+    nested_learning_global_ema_beta: float = 0.99,
     state_precision: str = "mixed",
 ) -> Optional[_PrecisionAdaptiveSpec]:
     if not param.requires_grad or param.numel() == 0:
@@ -237,6 +282,14 @@ def split_precision_adaptive_parameter_groups(
     ns_steps: int = 5,
     extra_scale_factor: float = 1.0,
     scalar_optimizer: str = "adamw",
+    nested_learning_enabled: bool = False,
+    hierarchical_nest_depth: int = 1,
+    nested_learning_local_interval: int = 1,
+    nested_learning_mid_interval: int = 2,
+    nested_learning_global_interval: int = 4,
+    nested_learning_local_ema_beta: float = 0.90,
+    nested_learning_mid_ema_beta: float = 0.95,
+    nested_learning_global_ema_beta: float = 0.99,
     state_precision: str = "mixed",
     precision_policy: Optional[HierarchicalPrecisionPolicy] = None,
 ) -> list[dict]:
@@ -248,6 +301,14 @@ def split_precision_adaptive_parameter_groups(
             base_lr=base_lr,
             muon_lr=muon_lr,
             muon_weight_decay=muon_weight_decay,
+            nested_learning_enabled=nested_learning_enabled,
+            hierarchical_nest_depth=hierarchical_nest_depth,
+            nested_learning_local_interval=nested_learning_local_interval,
+            nested_learning_mid_interval=nested_learning_mid_interval,
+            nested_learning_global_interval=nested_learning_global_interval,
+            nested_learning_local_ema_beta=nested_learning_local_ema_beta,
+            nested_learning_mid_ema_beta=nested_learning_mid_ema_beta,
+            nested_learning_global_ema_beta=nested_learning_global_ema_beta,
             state_precision=state_precision,
         )
         if spec is None:
@@ -265,6 +326,24 @@ def split_precision_adaptive_parameter_groups(
                 "lr": float(spec.lr),
                 "weight_decay": float(spec.weight_decay),
                 "scalar_optimizer": scalar_optimizer.lower(),
+                "nested_learning_enabled": bool(nested_learning_enabled),
+                "nested_update_interval": int(
+                    _nested_learning_interval_for(
+                        spec.tier,
+                        hierarchical_nest_depth=hierarchical_nest_depth,
+                        local_interval=nested_learning_local_interval,
+                        mid_interval=nested_learning_mid_interval,
+                        global_interval=nested_learning_global_interval,
+                    )
+                ),
+                "nested_update_ema_beta": float(
+                    _nested_learning_beta_for(
+                        spec.tier,
+                        local_beta=nested_learning_local_ema_beta,
+                        mid_beta=nested_learning_mid_ema_beta,
+                        global_beta=nested_learning_global_ema_beta,
+                    )
+                ),
             }
             if precision_policy is not None:
                 requested_dtype = (
@@ -427,6 +506,58 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         dtype = group.get("state_dtype")
         return dtype if isinstance(dtype, torch.dtype) else torch.float32
 
+    def _nested_group_enabled(self, group: dict) -> bool:
+        return bool(group.get("nested_learning_enabled", False))
+
+    def _nested_group_interval(self, group: dict) -> int:
+        return max(1, int(group.get("nested_update_interval", 1)))
+
+    def _nested_group_beta(self, group: dict) -> float:
+        beta = float(group.get("nested_update_ema_beta", 0.95))
+        return min(max(beta, 0.0), 0.9999)
+
+    def _nested_group_update_due(self, group: dict) -> bool:
+        if not self._nested_group_enabled(group):
+            return True
+        interval = self._nested_group_interval(group)
+        step = int(group.get("_nested_group_step", 0)) + 1
+        group["_nested_group_step"] = step
+        return (step % interval) == 0
+
+    def _nested_prepare_grad(
+        self,
+        group: dict,
+        param: torch.nn.Parameter,
+        grad: torch.Tensor,
+        *,
+        update_due: bool,
+    ) -> torch.Tensor | None:
+        if not self._nested_group_enabled(group):
+            return grad
+
+        state = self.state[param]
+        state_dtype = self._state_dtype(group)
+        if "nested_grad_buffer" not in state:
+            state["nested_window_count"] = 0
+            state["nested_grad_buffer"] = torch.zeros_like(param, dtype=state_dtype)
+            state["nested_grad_ema"] = torch.zeros_like(param, dtype=state_dtype)
+
+        buffer = state["nested_grad_buffer"]
+        buffer.add_(grad.to(buffer.dtype))
+        state["nested_window_count"] = int(state.get("nested_window_count", 0)) + 1
+
+        if not update_due:
+            return None
+
+        window_count = max(int(state.get("nested_window_count", 0)), 1)
+        window_grad = buffer / float(window_count)
+        ema = state["nested_grad_ema"]
+        beta = self._nested_group_beta(group)
+        ema.mul_(beta).add_(window_grad.to(ema.dtype), alpha=1.0 - beta)
+        state["nested_window_count"] = 0
+        buffer.zero_()
+        return window_grad
+
     def _step_muon_group(self, group: dict, params: Sequence[torch.nn.Parameter]) -> None:
         lr = float(group.get("lr", 1e-3))
         weight_decay = float(group.get("weight_decay", 0.0))
@@ -435,18 +566,21 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         ns_steps = int(group.get("ns_steps", 5))
         extra_scale_factor = float(group.get("extra_scale_factor", 1.0))
         state_dtype = self._state_dtype(group)
+        nested_update_due = self._nested_group_update_due(group)
 
         for p in params:
             if p.grad is None:
                 continue
-            grad = p.grad.detach()
+            grad = self._nested_prepare_grad(group, p, p.grad.detach(), update_due=nested_update_due)
+            if grad is None:
+                continue
             if grad.is_sparse:
                 raise RuntimeError("PrecisionAdaptiveHierarchicalOptimizer does not support sparse gradients.")
             if p.ndim != 2:
                 raise RuntimeError("Muon-tier parameters must be matrix-shaped.")
 
             state = self.state[p]
-            if len(state) == 0:
+            if "momentum_buffer" not in state:
                 state["step"] = 0
                 state["momentum_buffer"] = torch.zeros_like(p, dtype=state_dtype)
             buf = state["momentum_buffer"]
@@ -471,18 +605,21 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         beta1, beta2 = float(betas[0]), float(betas[1])
         eps = float(group.get("eps", 1e-8))
         state_dtype = self._state_dtype(group)
+        nested_update_due = self._nested_group_update_due(group)
 
         for p in params:
             if p.grad is None:
                 continue
-            grad = p.grad.detach()
+            grad = self._nested_prepare_grad(group, p, p.grad.detach(), update_due=nested_update_due)
+            if grad is None:
+                continue
             if grad.is_sparse:
                 raise RuntimeError("PrecisionAdaptiveHierarchicalOptimizer does not support sparse gradients.")
             if p.ndim != 2:
                 raise RuntimeError("Row-wise parameters must be matrix-shaped.")
 
             state = self.state[p]
-            if len(state) == 0:
+            if "exp_avg_row" not in state:
                 state["step"] = 0
                 row_shape = (p.shape[0], 1)
                 state["exp_avg_row"] = torch.zeros(row_shape, dtype=state_dtype, device=p.device)
@@ -513,16 +650,19 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         beta1, beta2 = float(betas[0]), float(betas[1])
         eps = float(group.get("eps", 1e-8))
         state_dtype = self._state_dtype(group)
+        nested_update_due = self._nested_group_update_due(group)
 
         for p in params:
             if p.grad is None:
                 continue
-            grad = p.grad.detach()
+            grad = self._nested_prepare_grad(group, p, p.grad.detach(), update_due=nested_update_due)
+            if grad is None:
+                continue
             if grad.is_sparse:
                 raise RuntimeError("PrecisionAdaptiveHierarchicalOptimizer does not support sparse gradients.")
 
             state = self.state[p]
-            if len(state) == 0:
+            if "exp_avg" not in state:
                 state["step"] = 0
                 state["exp_avg"] = torch.zeros_like(p, dtype=state_dtype)
                 state["exp_avg_sq"] = torch.zeros_like(p, dtype=state_dtype)

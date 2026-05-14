@@ -2732,6 +2732,24 @@ class PrismalTorusCore(nn.Module):
         gathered = field[batch_idx, zz, yy, xx]
         return gathered
 
+    def _patch_linear_indices(
+        self,
+        center_z: torch.Tensor,
+        center_y: torch.Tensor,
+        center_x: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        offsets = offsets.to(device=center_z.device)
+        zz = torch.remainder(center_z.unsqueeze(1) + offsets[:, 0].view(1, -1), self.depth)
+        yy = torch.remainder(center_y.unsqueeze(1) + offsets[:, 1].view(1, -1), self.height)
+        xx = torch.remainder(center_x.unsqueeze(1) + offsets[:, 2].view(1, -1), self.width)
+        return zz * (self.height * self.width) + yy * self.width + xx
+
+    def _gather_patch_from_linear_idx(self, field: torch.Tensor, linear_idx: torch.Tensor) -> torch.Tensor:
+        field_dim = field.size(-1)
+        flat = field.reshape(field.size(0), -1, field_dim)
+        return torch.gather(flat, 1, linear_idx.unsqueeze(-1).expand(-1, -1, field_dim))
+
     def _aggregate_stencil_weights(self, stencil_weights: torch.Tensor, offset_groups: torch.Tensor, group_count: int) -> torch.Tensor:
         if stencil_weights.numel() == 0:
             return stencil_weights
@@ -2853,16 +2871,12 @@ class PrismalTorusCore(nn.Module):
         write_strength = self.write_strength / temperature_scale
 
         next_field = field_tensor.clone()
-        offsets_tensor = active_offsets.to(hidden.device)
-        zz = torch.remainder(center_z.unsqueeze(1) + offsets_tensor[:, 0].view(1, -1), self.depth)
-        yy = torch.remainder(center_y.unsqueeze(1) + offsets_tensor[:, 1].view(1, -1), self.height)
-        xx = torch.remainder(center_x.unsqueeze(1) + offsets_tensor[:, 2].view(1, -1), self.width)
+        patch_linear_idx = self._patch_linear_indices(center_z, center_y, center_x, active_offsets)
         scalar = (write_strength * write_gate).unsqueeze(1) * stencil_weights.unsqueeze(-1)
         update = scalar * write_update.unsqueeze(1)
-        field_flat = next_field.view(batch_size, self.depth * self.height * self.width, field_dim)
+        field_flat = next_field.reshape(batch_size, self.depth * self.height * self.width, field_dim)
         update = update.to(dtype=field_flat.dtype)
-        linear_idx = (zz * (self.height * self.width) + yy * self.width + xx).unsqueeze(-1)
-        field_flat.scatter_add_(1, linear_idx.expand(-1, -1, field_dim), update)
+        field_flat.scatter_add_(1, patch_linear_idx.unsqueeze(-1).expand(-1, -1, field_dim), update)
         next_field = field_flat.view(batch_size, self.depth, self.height, self.width, field_dim)
 
         if step_index % self.transport_interval == 0:
@@ -2878,7 +2892,7 @@ class PrismalTorusCore(nn.Module):
             transport_gate = torch.sigmoid(self.transport_gate(hidden)).view(batch_size, 1, 1, 1, 1)
             next_field = next_field + self.transport_rate * transport_gate * temperature_scale.view(batch_size, 1, 1, 1, 1) * (transport - next_field)
 
-        read_patch = self._gather_patch(next_field, center_z, center_y, center_x, active_radius)
+        read_patch = self._gather_patch_from_linear_idx(next_field, patch_linear_idx)
         local_summary = read_patch.mean(dim=1)
         if local_summary.shape[-1] != core_hidden_dim:
             local_summary = local_summary.mean(dim=-1, keepdim=True).expand(batch_size, core_hidden_dim)
@@ -3235,19 +3249,6 @@ class PrismalTorusCore(nn.Module):
             )
             return step_output.unsqueeze(1), current_state, stats
 
-        outputs: List[torch.Tensor] = []
-        entropy_terms: List[torch.Tensor] = []
-        active_terms: List[torch.Tensor] = []
-        soft_active_terms: List[torch.Tensor] = []
-        cell_effective_terms: List[torch.Tensor] = []
-        cell_mixture_terms: List[torch.Tensor] = []
-        cell_coverage_terms: List[torch.Tensor] = []
-        soft_breadth_terms: List[torch.Tensor] = []
-        usage_entropy_terms: List[torch.Tensor] = []
-        usage_concentration_terms: List[torch.Tensor] = []
-        scalar_terms: Dict[str, List[torch.Tensor]] = {}
-        last_stats: Dict[str, torch.Tensor] = {}
-
         step_hidden = hidden_chunk[:, 0, :]
         step_registry_context = registry_context[:, 0, :] if registry_context is not None and registry_context.dim() == 3 else registry_context
         step_family_context = family_context[:, 0, :] if family_context is not None and family_context.dim() == 3 else family_context
@@ -3267,49 +3268,7 @@ class PrismalTorusCore(nn.Module):
             parent_context=step_parent_context,
         )
         chunk_output = hidden_chunk + (step_output - step_hidden).unsqueeze(1)
-        entropy_terms.append(stats["torus_entropy"])
-        active_terms.append(stats.get("emitter_cell_occupancy", stats["active_cells"]).float())
-        if "emitter_cell_soft_occupancy" in stats:
-            soft_active_terms.append(stats["emitter_cell_soft_occupancy"].float())
-        if "emitter_cell_effective_count" in stats:
-            cell_effective_terms.append(stats["emitter_cell_effective_count"].float())
-        if "emitter_cell_mixture_loss" in stats:
-            cell_mixture_terms.append(stats["emitter_cell_mixture_loss"].float())
-        if "emitter_cell_coverage_loss" in stats:
-            cell_coverage_terms.append(stats["emitter_cell_coverage_loss"].float())
-        if "emitter_cell_soft_breadth" in stats:
-            soft_breadth_terms.append(stats["emitter_cell_soft_breadth"].float())
-        if "emitter_usage_entropy" in stats:
-            usage_entropy_terms.append(stats["emitter_usage_entropy"].float())
-        if "emitter_usage_concentration" in stats:
-            usage_concentration_terms.append(stats["emitter_usage_concentration"].float())
-        for key, value in stats.items():
-            if key.startswith("recursive_") and torch.is_tensor(value) and value.numel() == 1:
-                scalar_terms.setdefault(key, []).append(value.float())
-        last_stats = stats
-        chunk_stats = dict(last_stats)
-        if entropy_terms:
-            chunk_stats["torus_entropy"] = torch.stack(entropy_terms).mean()
-        if active_terms:
-            chunk_stats["emitter_cell_occupancy"] = torch.stack(active_terms).mean()
-        if soft_active_terms:
-            chunk_stats["emitter_cell_soft_occupancy"] = torch.stack(soft_active_terms).mean()
-        if cell_effective_terms:
-            chunk_stats["emitter_cell_effective_count"] = torch.stack(cell_effective_terms).mean()
-        if cell_mixture_terms:
-            chunk_stats["emitter_cell_mixture_loss"] = torch.stack(cell_mixture_terms).mean()
-        if cell_coverage_terms:
-            chunk_stats["emitter_cell_coverage_loss"] = torch.stack(cell_coverage_terms).mean()
-        if soft_breadth_terms:
-            chunk_stats["emitter_cell_soft_breadth"] = torch.stack(soft_breadth_terms).mean()
-        if usage_entropy_terms:
-            chunk_stats["emitter_usage_entropy"] = torch.stack(usage_entropy_terms).mean()
-        if usage_concentration_terms:
-            chunk_stats["emitter_usage_concentration"] = torch.stack(usage_concentration_terms).mean()
-        for key, values in scalar_terms.items():
-            if values:
-                chunk_stats[key] = torch.stack(values).mean()
-        return chunk_output, current_state, chunk_stats
+        return chunk_output, current_state, dict(stats)
 
     def chunk_solver_step(
         self,
@@ -3606,6 +3565,7 @@ class PrismalTorusCore(nn.Module):
         level_context: Optional[torch.Tensor] = None,
         relation_context: Optional[torch.Tensor] = None,
         parent_context: Optional[torch.Tensor] = None,
+        collect_telemetry: bool = True,
     ) -> Tuple[torch.Tensor, PrismalTorusState, Dict[str, torch.Tensor]]:
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
         timing_ms: Dict[str, float] = {}
@@ -4058,6 +4018,7 @@ class SignatureLatticeAttention(nn.Module):
         parent_signature_ids: Optional[torch.Tensor] = None,
         state: Optional[SignatureLatticeState] = None,
         return_state: bool = False,
+        collect_telemetry: bool = True,
     ) -> Tuple[torch.Tensor, Optional[SignatureLatticeState], Dict[str, torch.Tensor]]:
         batch, seq_len, _d = hidden.shape
         device = hidden.device
@@ -4094,7 +4055,7 @@ class SignatureLatticeAttention(nn.Module):
         level_bias_all = self.level_bias(level_ids)
         relation_bias_all = self.relation_bias(relation_ids)
         outputs: List[torch.Tensor] = []
-        gate_terms: List[torch.Tensor] = []
+        gate_terms: List[torch.Tensor] = [] if collect_telemetry else []
         num_chunks = (seq_len + self.chunk_len - 1) // self.chunk_len
         for chunk_index in range(num_chunks):
             chunk_start = chunk_index * self.chunk_len
@@ -4123,7 +4084,8 @@ class SignatureLatticeAttention(nn.Module):
             h_out = h + self.weight * gate * delta
             chunk_output = hidden[:, chunk_start:chunk_end, :] + (h_out - h).unsqueeze(1)
             outputs.append(chunk_output)
-            gate_terms.append(gate.mean().detach())
+            if collect_telemetry:
+                gate_terms.append(gate.mean().detach())
 
             write_value = self.v_proj(h_out).to(dtype=cache.dtype)
             write_ids = candidate_ids[:, : min(4, candidate_ids.size(1))]
@@ -4169,13 +4131,16 @@ class SignatureLatticeAttention(nn.Module):
                 prev_family_bucket=prev_family.detach(),
             )
         effective_cache = cache * lattice_state.cache_decay_scale
-        stats = {
-            "signature_lattice_cache_norm": effective_cache.detach().float().norm(dim=-1).mean(),
-            "signature_lattice_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
-            "signature_lattice_candidate_count": torch.tensor(float(self.candidates), device=device),
-            "signature_lattice_enabled": torch.tensor(1.0, device=device),
-            "signature_lattice_decay_scale_mean": lattice_state.cache_decay_scale.detach().float().mean(),
+        if collect_telemetry:
+            stats = {
+                "signature_lattice_cache_norm": effective_cache.detach().float().norm(dim=-1).mean(),
+                "signature_lattice_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
+                "signature_lattice_candidate_count": torch.tensor(float(self.candidates), device=device),
+                "signature_lattice_enabled": torch.tensor(1.0, device=device),
+                "signature_lattice_decay_scale_mean": lattice_state.cache_decay_scale.detach().float().mean(),
             }
+        else:
+            stats = {}
         return torch.cat(outputs, dim=1), next_state, stats
 
 
@@ -4570,6 +4535,7 @@ class TokenMemoryCrossAttention(nn.Module):
         token_ids: Optional[torch.Tensor] = None,
         state: Optional[TokenMemoryState] = None,
         return_state: bool = False,
+        collect_telemetry: bool = True,
     ) -> Tuple[torch.Tensor, Optional[TokenMemoryState], Dict[str, torch.Tensor]]:
         if hidden.dim() == 2:
             hidden = hidden.unsqueeze(1)
@@ -4728,8 +4694,9 @@ class TokenMemoryCrossAttention(nn.Module):
                     (time.perf_counter() - start_project) * 1000.0
                 )
             outputs.append(step_output.unsqueeze(1))
-            gate_terms.append(gate.mean().detach())
-            copy_conf_terms.append(step_confidence.mean().detach())
+            if collect_telemetry:
+                gate_terms.append(gate.mean().detach())
+                copy_conf_terms.append(step_confidence.mean().detach())
             copy_logits = step_copy_logits
             start_append = time.perf_counter()
             memory_state = self._append_state(
@@ -4774,28 +4741,31 @@ class TokenMemoryCrossAttention(nn.Module):
                 anchor_cursor_tag=memory_state.anchor_cursor_tag.detach(),
                 anchor_cursor_active=memory_state.anchor_cursor_active.detach(),
             )
-        stats = {
-            "token_memory_enabled": torch.tensor(1.0, device=device),
-            "copy_attention_enabled": torch.tensor(1.0, device=device),
-            "token_memory_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
-            "copy_attention_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
-            "token_memory_copy_confidence": torch.stack(copy_conf_terms).mean() if copy_conf_terms else torch.tensor(0.0, device=device),
-            "copy_attention_max_weight": torch.stack(copy_conf_terms).max() if copy_conf_terms else torch.tensor(0.0, device=device),
-            "token_memory_memory_fill": (
-                memory_state.lengths.float().mean().clamp(min=0.0) / max(float(self.window), 1.0)
-            ).detach(),
-            "copy_attention_memory_fill": (
-                memory_state.lengths.float().mean().clamp(min=0.0) / max(float(self.window), 1.0)
-            ).detach(),
-            "token_memory_window": torch.tensor(float(self.window), device=device),
-            "token_memory_top_k": torch.tensor(float(self.top_k), device=device),
-            "token_memory_copy_logits": copy_logits.detach(),
-            "copy_attention_candidate_count": torch.tensor(float(self.top_k), device=device),
-        }
-        if timing_totals:
-            timing_totals["timing_token_memory_total_ms"] = sum(timing_totals.values())
-            for key, value in timing_totals.items():
-                stats[key] = torch.tensor(value, device=device)
+        if collect_telemetry:
+            stats = {
+                "token_memory_enabled": torch.tensor(1.0, device=device),
+                "copy_attention_enabled": torch.tensor(1.0, device=device),
+                "token_memory_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
+                "copy_attention_gate_mean": torch.stack(gate_terms).mean() if gate_terms else torch.tensor(0.0, device=device),
+                "token_memory_copy_confidence": torch.stack(copy_conf_terms).mean() if copy_conf_terms else torch.tensor(0.0, device=device),
+                "copy_attention_max_weight": torch.stack(copy_conf_terms).max() if copy_conf_terms else torch.tensor(0.0, device=device),
+                "token_memory_memory_fill": (
+                    memory_state.lengths.float().mean().clamp(min=0.0) / max(float(self.window), 1.0)
+                ).detach(),
+                "copy_attention_memory_fill": (
+                    memory_state.lengths.float().mean().clamp(min=0.0) / max(float(self.window), 1.0)
+                ).detach(),
+                "token_memory_window": torch.tensor(float(self.window), device=device),
+                "token_memory_top_k": torch.tensor(float(self.top_k), device=device),
+                "token_memory_copy_logits": copy_logits.detach(),
+                "copy_attention_candidate_count": torch.tensor(float(self.top_k), device=device),
+            }
+            if timing_totals:
+                timing_totals["timing_token_memory_total_ms"] = sum(timing_totals.values())
+                for key, value in timing_totals.items():
+                    stats[key] = torch.tensor(value, device=device)
+        else:
+            stats = {}
         return torch.cat(outputs, dim=1), next_state, stats
 
 
@@ -4804,7 +4774,7 @@ class PrismalWaveOutput:
     logits: torch.Tensor
     input_signature: torch.Tensor
     output_signature: torch.Tensor
-    path_logits: torch.Tensor
+    path_logits: Optional[torch.Tensor]
     route_stats: Dict[str, torch.Tensor]
     ce_loss: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
     aux_loss: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
@@ -5142,6 +5112,8 @@ class PrismalEmitterRouter(nn.Module):
         ) / max(emitter_mixture_target, 1.0)
 
         slot_query = self.slot_query(hidden)
+        if slots.dtype != slot_query.dtype:
+            slots = slots.to(dtype=slot_query.dtype)
         slot_scores = torch.einsum("btd,bsd->bts", slot_query, slots) / math.sqrt(dim)
         top_k_slots = max(1, min(self.cfg.top_k_slots, slot_scores.size(-1)))
         top_slot_scores, top_slot_idx = torch.topk(slot_scores, k=top_k_slots, dim=-1)
@@ -5379,6 +5351,8 @@ class PrismalWaveModel(nn.Module):
             bias=True,
             quantization_config=qcfg,
         )
+        self.use_path_logits = bool(getattr(cfg, "use_path_logits", False))
+        self.return_path_logits = self.use_path_logits
         self.signature_level_head = create_quantized_linear(
             cfg.d_model,
             self.signature_level_vocab_size,
@@ -6249,9 +6223,8 @@ class PrismalWaveModel(nn.Module):
         bucket_vocab = max(1, int(self.signature_bucket_vocab_size))
         return family_ids.clamp(min=0).remainder(bucket_vocab)
 
-    def _construction_logits_from_hidden(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Predict signature neighborhood first, then construct units from that context."""
-
+    def _guide_hidden_from_neighborhood(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict signature neighborhood first, then use it to guide the hidden state."""
         neighborhood_logits = self.signature_neighborhood_head(hidden)
         neighborhood_probs = F.softmax(neighborhood_logits / max(self.cfg.signature_temperature, 1e-3), dim=-1)
         neighborhood_weight = getattr(
@@ -6265,7 +6238,15 @@ class PrismalWaveModel(nn.Module):
         neighborhood_context = torch.matmul(neighborhood_probs, neighborhood_weight)
         gate = torch.sigmoid(self.signature_neighborhood_gate(torch.cat([hidden, neighborhood_context], dim=-1)))
         guided_hidden = hidden + gate * neighborhood_context
-        construction_logits = self.construction_head(guided_hidden)
+        return guided_hidden, neighborhood_logits
+
+    def _construction_logits_from_guided(self, guided_hidden: torch.Tensor) -> torch.Tensor:
+        return self.construction_head(guided_hidden)
+
+    def _construction_logits_from_hidden(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backward-compatible wrapper for callers that still expect logits + guided hidden."""
+        guided_hidden, neighborhood_logits = self._guide_hidden_from_neighborhood(hidden)
+        construction_logits = self._construction_logits_from_guided(guided_hidden)
         return construction_logits, guided_hidden, neighborhood_logits
 
     def _apply_token_memory_copy_bias(self, logits: torch.Tensor, output: "PrismalWaveOutput") -> torch.Tensor:
@@ -6675,6 +6656,7 @@ class PrismalWaveModel(nn.Module):
         signature_lattice_state: Optional[SignatureLatticeState] = None,
         token_memory_state: Optional[TokenMemoryState] = None,
         position_offset: int = 0,
+        collect_telemetry: bool = True,
     ) -> PrismalTorusFrame:
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
         prep_timings: Dict[str, float] = {}
@@ -6730,6 +6712,7 @@ class PrismalWaveModel(nn.Module):
                     state=signature_lattice_state,
                     return_state=bool(getattr(self.cfg, "use_signature_lattice_generation_cache", True))
                     and not self.training,
+                    collect_telemetry=collect_telemetry,
                 ),
             )
         if self.cfg.max_seq_len <= 0:
@@ -6798,6 +6781,7 @@ class PrismalWaveModel(nn.Module):
                     token_ids=input_ids[:, :seq_len],
                     state=token_memory_state,
                     return_state=not self.training and bool(getattr(self.cfg, "use_token_memory_generation_cache", True)),
+                    collect_telemetry=collect_telemetry,
                 ),
             )
         if profile_enabled:
@@ -6835,6 +6819,7 @@ class PrismalWaveModel(nn.Module):
         slot_state: Optional[torch.Tensor] = None,
         return_signature_lattice_state: bool = False,
         path_index: int = 0,
+        collect_telemetry: bool = True,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -6848,6 +6833,7 @@ class PrismalWaveModel(nn.Module):
         Dict[str, float],
         Optional[SignatureLatticeState],
     ]:
+        collect_telemetry = bool(collect_telemetry)
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
         path_timings: Dict[str, float] = dict(frame.prep_timings)
         input_ids = frame.input_ids
@@ -6940,6 +6926,17 @@ class PrismalWaveModel(nn.Module):
 
         chunk_len = max(1, int(getattr(self.cfg, "torus_chunk_len", seq_len)))
         num_chunks = (seq_len + chunk_len - 1) // chunk_len
+        use_chunk_solver = (
+            bool(getattr(self.cfg, "use_fixed_point_solver", False))
+            and bool(getattr(self.cfg, "use_chunk_solver_training", True))
+        )
+        core_step_fn = (
+            self.torus_core.main_core_step
+            if hasattr(self.torus_core, "main_core_step")
+            else (self.torus_core.chunk_solver_step if use_chunk_solver else self.torus_core.chunked_step)
+        )
+        overlay_step_fn = self.torus_core.overlay_step if hasattr(self.torus_core, "overlay_step") else None
+        empty_context = torch.empty(0, device=input_ids.device)
 
         for chunk_index in range(num_chunks):
             chunk_start = chunk_index * chunk_len
@@ -6956,88 +6953,39 @@ class PrismalWaveModel(nn.Module):
             chunk_level_context = level_context_seq[:, chunk_start:chunk_end] if level_context_seq is not None else None
             chunk_relation_context = relation_context_seq[:, chunk_start:chunk_end] if relation_context_seq is not None else None
             chunk_parent_context = parent_context_seq[:, chunk_start:chunk_end] if parent_context_seq is not None else None
-            use_chunk_solver = (
-                bool(getattr(self.cfg, "use_fixed_point_solver", False))
-                and bool(getattr(self.cfg, "use_chunk_solver_training", True))
-            )
-            core_step_fn = (
-                self.torus_core.main_core_step
-                if hasattr(self.torus_core, "main_core_step")
-                else (self.torus_core.chunk_solver_step if use_chunk_solver else self.torus_core.chunked_step)
-            )
-            overlay_step_fn = self.torus_core.overlay_step if hasattr(self.torus_core, "overlay_step") else None
-
-            def _run_chunk_core(
-                chunk_hidden_: torch.Tensor,
-                field_state_: torch.Tensor,
-                family_context_: torch.Tensor,
-                level_context_: torch.Tensor,
-                relation_context_: torch.Tensor,
-                parent_context_: torch.Tensor,
-                _step_fn=core_step_fn,
-                _chunk_start=chunk_start,
-                _signature_family_slice=signature_family_slice,
-                _signature_ids_slice=signature_ids_slice,
-                _signature_level_slice=signature_level_slice,
-                _signature_relation_slice=signature_relation_slice,
-                _parent_signature_slice=parent_signature_slice,
-            ):
-                return _step_fn(
-                    chunk_hidden_,
-                    field_state_,
-                    signature_family_ids=_signature_family_slice,
-                    signature_ids=_signature_ids_slice,
-                    signature_level_ids=_signature_level_slice,
-                    signature_relation_ids=_signature_relation_slice,
-                    parent_signature_ids=_parent_signature_slice,
-                    registry_context=None,
-                    family_context=family_context_ if family_context_.numel() > 0 else None,
-                    level_context=level_context_ if level_context_.numel() > 0 else None,
-                    relation_context=relation_context_ if relation_context_.numel() > 0 else None,
-                    parent_context=parent_context_ if parent_context_.numel() > 0 else None,
-                    path_index=path_index,
-                    step_index_offset=_chunk_start,
-                )
-
-            def _run_chunk_overlay(
-                chunk_hidden_: torch.Tensor,
-                field_state_: torch.Tensor,
-                chunk_stats_: Dict[str, torch.Tensor],
-                _chunk_start=chunk_start,
-                _signature_family_slice=signature_family_slice,
-                _signature_ids_slice=signature_ids_slice,
-                _signature_level_slice=signature_level_slice,
-                _signature_relation_slice=signature_relation_slice,
-                _parent_signature_slice=parent_signature_slice,
-                _overlay_step_fn=overlay_step_fn,
-            ):
-                if _overlay_step_fn is None:
-                    return chunk_hidden_, field_state_, chunk_stats_
-                return _overlay_step_fn(
-                    chunk_hidden_,
-                    field_state_,
-                    chunk_stats_,
-                    signature_family_ids=_signature_family_slice,
-                    signature_ids=_signature_ids_slice,
-                    signature_level_ids=_signature_level_slice,
-                    signature_relation_ids=_signature_relation_slice,
-                    parent_signature_ids=_parent_signature_slice,
-                    registry_context=None,
-                    family_context=chunk_family_context,
-                    level_context=chunk_level_context,
-                    relation_context=chunk_relation_context,
-                    parent_context=chunk_parent_context,
-                    path_index=path_index,
-                    step_index_offset=_chunk_start,
-                    use_solver=use_chunk_solver,
-                    relay_mode=False,
-                )
 
             if self.training and self.use_gradient_checkpointing:
-                family_arg = chunk_family_context if chunk_family_context is not None else torch.empty(0, device=input_ids.device)
-                level_arg = chunk_level_context if chunk_level_context is not None else torch.empty(0, device=input_ids.device)
-                relation_arg = chunk_relation_context if chunk_relation_context is not None else torch.empty(0, device=input_ids.device)
-                parent_arg = chunk_parent_context if chunk_parent_context is not None else torch.empty(0, device=input_ids.device)
+                def _run_chunk_core(
+                    chunk_hidden_: torch.Tensor,
+                    field_state_: torch.Tensor,
+                    family_context_: torch.Tensor,
+                    level_context_: torch.Tensor,
+                    relation_context_: torch.Tensor,
+                    parent_context_: torch.Tensor,
+                    _chunk_start=chunk_start,
+                    _signature_family_slice=signature_family_slice,
+                    _signature_ids_slice=signature_ids_slice,
+                    _signature_level_slice=signature_level_slice,
+                    _signature_relation_slice=signature_relation_slice,
+                    _parent_signature_slice=parent_signature_slice,
+                ):
+                    return core_step_fn(
+                        chunk_hidden_,
+                        field_state_,
+                        signature_family_ids=_signature_family_slice,
+                        signature_ids=_signature_ids_slice,
+                        signature_level_ids=_signature_level_slice,
+                        signature_relation_ids=_signature_relation_slice,
+                        parent_signature_ids=_parent_signature_slice,
+                        registry_context=None,
+                        family_context=family_context_ if family_context_.numel() > 0 else None,
+                        level_context=level_context_ if level_context_.numel() > 0 else None,
+                        relation_context=relation_context_ if relation_context_.numel() > 0 else None,
+                        parent_context=parent_context_ if parent_context_.numel() > 0 else None,
+                        path_index=path_index,
+                        step_index_offset=_chunk_start,
+                    )
+
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     start_chunk_core = time.perf_counter()
@@ -7045,17 +6993,38 @@ class PrismalWaveModel(nn.Module):
                     _run_chunk_core,
                     chunk_hidden,
                     field_state,
-                    family_arg,
-                    level_arg,
-                    relation_arg,
-                    parent_arg,
+                    chunk_family_context if chunk_family_context is not None else empty_context,
+                    chunk_level_context if chunk_level_context is not None else empty_context,
+                    chunk_relation_context if chunk_relation_context is not None else empty_context,
+                    chunk_parent_context if chunk_parent_context is not None else empty_context,
                     use_reentrant=False,
                 )
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     path_timings["timing_path_core_ms"] = path_timings.get("timing_path_core_ms", 0.0) + (time.perf_counter() - start_chunk_core) * 1000.0
                     start_chunk_overlay = time.perf_counter()
-                chunk_output, field_state, chunk_stats = _run_chunk_overlay(core_output, field_state, core_stats)
+                if overlay_step_fn is None:
+                    chunk_output, field_state, chunk_stats = core_output, field_state, core_stats
+                else:
+                    chunk_output, field_state, chunk_stats = overlay_step_fn(
+                        core_output,
+                        field_state,
+                        core_stats,
+                        signature_family_ids=signature_family_slice,
+                        signature_ids=signature_ids_slice,
+                        signature_level_ids=signature_level_slice,
+                        signature_relation_ids=signature_relation_slice,
+                        parent_signature_ids=parent_signature_slice,
+                        registry_context=None,
+                        family_context=chunk_family_context,
+                        level_context=chunk_level_context,
+                        relation_context=chunk_relation_context,
+                        parent_context=chunk_parent_context,
+                        path_index=path_index,
+                        step_index_offset=chunk_start,
+                        use_solver=use_chunk_solver,
+                        relay_mode=False,
+                    )
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     path_timings["timing_path_overlay_ms"] = path_timings.get("timing_path_overlay_ms", 0.0) + (time.perf_counter() - start_chunk_overlay) * 1000.0
@@ -7063,67 +7032,98 @@ class PrismalWaveModel(nn.Module):
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     start_chunk_core = time.perf_counter()
-                core_output, field_state, core_stats = _run_chunk_core(
+                core_output, field_state, core_stats = core_step_fn(
                     chunk_hidden,
                     field_state,
-                    chunk_family_context if chunk_family_context is not None else torch.empty(0, device=input_ids.device),
-                    chunk_level_context if chunk_level_context is not None else torch.empty(0, device=input_ids.device),
-                    chunk_relation_context if chunk_relation_context is not None else torch.empty(0, device=input_ids.device),
-                    chunk_parent_context if chunk_parent_context is not None else torch.empty(0, device=input_ids.device),
+                    signature_family_ids=signature_family_slice,
+                    signature_ids=signature_ids_slice,
+                    signature_level_ids=signature_level_slice,
+                    signature_relation_ids=signature_relation_slice,
+                    parent_signature_ids=parent_signature_slice,
+                    registry_context=None,
+                    family_context=chunk_family_context if chunk_family_context is not None else empty_context,
+                    level_context=chunk_level_context if chunk_level_context is not None else empty_context,
+                    relation_context=chunk_relation_context if chunk_relation_context is not None else empty_context,
+                    parent_context=chunk_parent_context if chunk_parent_context is not None else empty_context,
+                    path_index=path_index,
+                    step_index_offset=chunk_start,
                 )
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     path_timings["timing_path_core_ms"] = path_timings.get("timing_path_core_ms", 0.0) + (time.perf_counter() - start_chunk_core) * 1000.0
                     start_chunk_overlay = time.perf_counter()
-                chunk_output, field_state, chunk_stats = _run_chunk_overlay(core_output, field_state, core_stats)
+                if overlay_step_fn is None:
+                    chunk_output, field_state, chunk_stats = core_output, field_state, core_stats
+                else:
+                    chunk_output, field_state, chunk_stats = overlay_step_fn(
+                        core_output,
+                        field_state,
+                        core_stats,
+                        signature_family_ids=signature_family_slice,
+                        signature_ids=signature_ids_slice,
+                        signature_level_ids=signature_level_slice,
+                        signature_relation_ids=signature_relation_slice,
+                        parent_signature_ids=parent_signature_slice,
+                        registry_context=None,
+                        family_context=chunk_family_context,
+                        level_context=chunk_level_context,
+                        relation_context=chunk_relation_context,
+                        parent_context=chunk_parent_context,
+                        path_index=path_index,
+                        step_index_offset=chunk_start,
+                        use_solver=use_chunk_solver,
+                        relay_mode=False,
+                    )
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     path_timings["timing_path_overlay_ms"] = path_timings.get("timing_path_overlay_ms", 0.0) + (time.perf_counter() - start_chunk_overlay) * 1000.0
             outputs.append(chunk_output)
             entropy_terms.append(chunk_stats["torus_entropy"])
-            active_terms.append(chunk_stats.get("emitter_cell_occupancy", chunk_stats.get("active_cells", torch.tensor(0.0, device=input_ids.device))).float())
-            if "emitter_cell_soft_occupancy" in chunk_stats:
-                soft_active_terms.append(chunk_stats["emitter_cell_soft_occupancy"].float())
-            if "emitter_cell_effective_count" in chunk_stats:
-                cell_effective_terms.append(chunk_stats["emitter_cell_effective_count"].float())
+            if collect_telemetry:
+                active_terms.append(chunk_stats.get("emitter_cell_occupancy", chunk_stats.get("active_cells", torch.tensor(0.0, device=input_ids.device))).float())
+                if "emitter_cell_soft_occupancy" in chunk_stats:
+                    soft_active_terms.append(chunk_stats["emitter_cell_soft_occupancy"].float())
+                if "emitter_cell_effective_count" in chunk_stats:
+                    cell_effective_terms.append(chunk_stats["emitter_cell_effective_count"].float())
             if "emitter_cell_mixture_loss" in chunk_stats:
                 cell_mixture_terms.append(chunk_stats["emitter_cell_mixture_loss"].float())
             if "emitter_cell_coverage_loss" in chunk_stats:
                 cell_coverage_terms.append(chunk_stats["emitter_cell_coverage_loss"].float())
-            if "emitter_cell_soft_breadth" in chunk_stats:
-                soft_breadth_terms.append(chunk_stats["emitter_cell_soft_breadth"].float())
-            if "emitter_usage_entropy" in chunk_stats:
-                path_usage_entropy_terms.append(chunk_stats["emitter_usage_entropy"].float())
-            if "emitter_usage_concentration" in chunk_stats:
-                path_usage_concentration_terms.append(chunk_stats["emitter_usage_concentration"].float())
-            if "torus_activity_threshold" in chunk_stats:
-                torus_threshold_terms.append(chunk_stats["torus_activity_threshold"].float())
-            if "mot_active_experts" in chunk_stats:
-                mot_active_expert_terms.append(chunk_stats["mot_active_experts"].float())
-            elif "mot_mot_active_experts" in chunk_stats:
-                mot_active_expert_terms.append(chunk_stats["mot_mot_active_experts"].float())
-            if "specialist_family_specialist_active_count" in chunk_stats:
-                family_active_terms.append(chunk_stats["specialist_family_specialist_active_count"].float())
-            if "specialist_family_specialist_unique_families" in chunk_stats:
-                family_unique_terms.append(chunk_stats["specialist_family_specialist_unique_families"].float())
-            if "specialist_family_specialist_bank_size" in chunk_stats:
-                family_bank_terms.append(chunk_stats["specialist_family_specialist_bank_size"].float())
-            if "specialist_family_specialist_capacity" in chunk_stats:
-                family_capacity_terms.append(chunk_stats["specialist_family_specialist_capacity"].float())
-            if "specialist_family_specialist_budget" in chunk_stats:
-                family_budget_terms.append(chunk_stats["specialist_family_specialist_budget"].float())
-            if "specialist_family_specialist_hit_rate" in chunk_stats:
-                family_hit_rate_terms.append(chunk_stats["specialist_family_specialist_hit_rate"].float())
-            if "specialist_family_specialist_gate_mean" in chunk_stats:
-                family_gate_terms.append(chunk_stats["specialist_family_specialist_gate_mean"].float())
-            if "cell_energy_mean" in chunk_stats:
-                cell_energy_mean_terms.append(chunk_stats["cell_energy_mean"].float())
-            if "cell_energy_min" in chunk_stats:
-                cell_energy_min_terms.append(chunk_stats["cell_energy_min"].float())
-            if "cell_energy_max" in chunk_stats:
-                cell_energy_max_terms.append(chunk_stats["cell_energy_max"].float())
-            if "global_bus_norm" in chunk_stats:
-                global_bus_norm_terms.append(chunk_stats["global_bus_norm"].float())
+            if collect_telemetry:
+                if "emitter_cell_soft_breadth" in chunk_stats:
+                    soft_breadth_terms.append(chunk_stats["emitter_cell_soft_breadth"].float())
+                if "emitter_usage_entropy" in chunk_stats:
+                    path_usage_entropy_terms.append(chunk_stats["emitter_usage_entropy"].float())
+                if "emitter_usage_concentration" in chunk_stats:
+                    path_usage_concentration_terms.append(chunk_stats["emitter_usage_concentration"].float())
+                if "torus_activity_threshold" in chunk_stats:
+                    torus_threshold_terms.append(chunk_stats["torus_activity_threshold"].float())
+                if "mot_active_experts" in chunk_stats:
+                    mot_active_expert_terms.append(chunk_stats["mot_active_experts"].float())
+                elif "mot_mot_active_experts" in chunk_stats:
+                    mot_active_expert_terms.append(chunk_stats["mot_mot_active_experts"].float())
+                if "specialist_family_specialist_active_count" in chunk_stats:
+                    family_active_terms.append(chunk_stats["specialist_family_specialist_active_count"].float())
+                if "specialist_family_specialist_unique_families" in chunk_stats:
+                    family_unique_terms.append(chunk_stats["specialist_family_specialist_unique_families"].float())
+                if "specialist_family_specialist_bank_size" in chunk_stats:
+                    family_bank_terms.append(chunk_stats["specialist_family_specialist_bank_size"].float())
+                if "specialist_family_specialist_capacity" in chunk_stats:
+                    family_capacity_terms.append(chunk_stats["specialist_family_specialist_capacity"].float())
+                if "specialist_family_specialist_budget" in chunk_stats:
+                    family_budget_terms.append(chunk_stats["specialist_family_specialist_budget"].float())
+                if "specialist_family_specialist_hit_rate" in chunk_stats:
+                    family_hit_rate_terms.append(chunk_stats["specialist_family_specialist_hit_rate"].float())
+                if "specialist_family_specialist_gate_mean" in chunk_stats:
+                    family_gate_terms.append(chunk_stats["specialist_family_specialist_gate_mean"].float())
+                if "cell_energy_mean" in chunk_stats:
+                    cell_energy_mean_terms.append(chunk_stats["cell_energy_mean"].float())
+                if "cell_energy_min" in chunk_stats:
+                    cell_energy_min_terms.append(chunk_stats["cell_energy_min"].float())
+                if "cell_energy_max" in chunk_stats:
+                    cell_energy_max_terms.append(chunk_stats["cell_energy_max"].float())
+                if "global_bus_norm" in chunk_stats:
+                    global_bus_norm_terms.append(chunk_stats["global_bus_norm"].float())
             if "fixed_point_iterations" in chunk_stats:
                 chunk_solver_iterations.append(chunk_stats["fixed_point_iterations"].float())
             if "fixed_point_residual" in chunk_stats:
@@ -7132,9 +7132,10 @@ class PrismalWaveModel(nn.Module):
                 chunk_solver_converged.append(chunk_stats["fixed_point_converged"].float())
             if "recursive_aux_loss" in chunk_stats and torch.is_tensor(chunk_stats["recursive_aux_loss"]):
                 recursive_aux_terms.append(chunk_stats["recursive_aux_loss"].float())
-            for key, value in chunk_stats.items():
-                if key.startswith("recursive_") and torch.is_tensor(value) and value.numel() == 1:
-                    recursive_stat_terms.setdefault(key, []).append(value.detach().float().reshape(()))
+            if collect_telemetry:
+                for key, value in chunk_stats.items():
+                    if key.startswith("recursive_") and torch.is_tensor(value) and value.numel() == 1:
+                        recursive_stat_terms.setdefault(key, []).append(value.detach().float().reshape(()))
             if profile_enabled:
                 for key, value in chunk_stats.items():
                     if key.startswith("timing_"):
@@ -7148,7 +7149,8 @@ class PrismalWaveModel(nn.Module):
             lambda: torch.cat(outputs, dim=1),
         )
         path_hidden_state = self.final_norm(path_hidden_state)
-        logits, path_hidden_state, neighborhood_logits = self._construction_logits_from_hidden(path_hidden_state)
+        path_hidden_state, neighborhood_logits = self._guide_hidden_from_neighborhood(path_hidden_state)
+        logits = self._construction_logits_from_guided(path_hidden_state) if self.use_path_logits else None
         output_signature = F.normalize(self.signature_head(path_hidden_state.mean(dim=1)), dim=-1)
         agreement = F.cosine_similarity(input_signature, output_signature, dim=-1)
         route_entropy = torch.stack(entropy_terms).mean() if entropy_terms else torch.tensor(0.0, device=input_ids.device)
@@ -7181,40 +7183,45 @@ class PrismalWaveModel(nn.Module):
         if profile_enabled:
             path_timings["timing_path_total_ms"] = sum(path_timings.values())
         path_stats = {
-            "active_cells": active_emitters.detach(),
-            "emitter_cell_occupancy": active_emitters.detach(),
-            "emitter_cell_breadth": (
-                active_emitters
-                / max(float(self.torus_core.depth * self.torus_core.height * self.torus_core.width), 1.0)
-            ).detach(),
-            "avg_emitter_cell_soft_occupancy": soft_active_emitters.detach(),
-            "emitter_cell_soft_occupancy": soft_active_emitters.detach(),
-            "avg_emitter_cell_soft_breadth": soft_breadth.detach(),
-            "emitter_cell_soft_breadth": soft_breadth.detach(),
-            "emitter_cell_effective_count": cell_effective,
             "emitter_cell_mixture_loss": cell_mixture_loss,
             "emitter_cell_coverage_loss": cell_coverage_loss,
             "torus_coverage_loss": cell_coverage_loss,
-            "avg_emitter_usage_entropy": usage_entropy.detach(),
-            "avg_emitter_usage_concentration": usage_concentration.detach(),
-            "emitter_usage_entropy": usage_entropy.detach(),
-            "emitter_usage_concentration": usage_concentration.detach(),
-            "torus_activity_threshold": torus_activity_threshold,
-            "cell_energy_mean": cell_energy_mean,
-            "cell_energy_min": cell_energy_min,
-            "cell_energy_max": cell_energy_max,
             "torus_entropy": route_entropy,
-            "global_bus_norm": global_bus_norm.detach(),
-            "signature_neighborhood_logits": neighborhood_logits,
-            "mot_active_experts": mot_active_experts.detach(),
-            "specialist_family_specialist_active_count": family_active_count.detach(),
-            "specialist_family_specialist_unique_families": family_unique_count.detach(),
-            "specialist_family_specialist_bank_size": family_bank_size.detach(),
-            "specialist_family_specialist_capacity": family_capacity.detach(),
-            "specialist_family_specialist_budget": family_budget.detach(),
-            "specialist_family_specialist_hit_rate": family_hit_rate.detach(),
-            "specialist_family_specialist_gate_mean": family_gate_mean.detach(),
         }
+        if collect_telemetry:
+            path_stats.update(
+                {
+                    "active_cells": active_emitters.detach(),
+                    "emitter_cell_occupancy": active_emitters.detach(),
+                    "emitter_cell_breadth": (
+                        active_emitters
+                        / max(float(self.torus_core.depth * self.torus_core.height * self.torus_core.width), 1.0)
+                    ).detach(),
+                    "avg_emitter_cell_soft_occupancy": soft_active_emitters.detach(),
+                    "emitter_cell_soft_occupancy": soft_active_emitters.detach(),
+                    "avg_emitter_cell_soft_breadth": soft_breadth.detach(),
+                    "emitter_cell_soft_breadth": soft_breadth.detach(),
+                    "emitter_cell_effective_count": cell_effective,
+                    "avg_emitter_usage_entropy": usage_entropy.detach(),
+                    "avg_emitter_usage_concentration": usage_concentration.detach(),
+                    "emitter_usage_entropy": usage_entropy.detach(),
+                    "emitter_usage_concentration": usage_concentration.detach(),
+                    "torus_activity_threshold": torus_activity_threshold,
+                    "cell_energy_mean": cell_energy_mean,
+                    "cell_energy_min": cell_energy_min,
+                    "cell_energy_max": cell_energy_max,
+                    "global_bus_norm": global_bus_norm.detach(),
+                    "signature_neighborhood_logits": neighborhood_logits,
+                    "mot_active_experts": mot_active_experts.detach(),
+                    "specialist_family_specialist_active_count": family_active_count.detach(),
+                    "specialist_family_specialist_unique_families": family_unique_count.detach(),
+                    "specialist_family_specialist_bank_size": family_bank_size.detach(),
+                    "specialist_family_specialist_capacity": family_capacity.detach(),
+                    "specialist_family_specialist_budget": family_budget.detach(),
+                    "specialist_family_specialist_hit_rate": family_hit_rate.detach(),
+                    "specialist_family_specialist_gate_mean": family_gate_mean.detach(),
+                }
+            )
         path_stats.update(lattice_stats)
         if chunk_solver_iterations:
             path_stats["fixed_point_iterations"] = torch.stack(chunk_solver_iterations).mean().detach()
@@ -7254,7 +7261,9 @@ class PrismalWaveModel(nn.Module):
         path_index: Optional[int] = None,
         position_offset: int = 0,
         gate_runtime: Optional[Dict[str, torch.Tensor | GateResidencyPlan]] = None,
+        collect_telemetry: bool = True,
     ) -> PrismalWaveOutput:
+        collect_telemetry = bool(collect_telemetry)
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
         timings: Dict[str, float] = {}
         gate_runtime = gate_runtime or {}
@@ -7302,6 +7311,7 @@ class PrismalWaveModel(nn.Module):
             signature_lattice_state=signature_lattice_state,
             token_memory_state=token_memory_state,
             position_offset=position_offset,
+            collect_telemetry=collect_telemetry,
         )
         final_signature_lattice_state: Optional[SignatureLatticeState] = frame.signature_lattice_state
         race_audit = False
@@ -7346,69 +7356,73 @@ class PrismalWaveModel(nn.Module):
                     and not self.training
                 ),
                 path_index=current_path_index,
+                collect_telemetry=collect_telemetry,
             )
             if final_signature_lattice_state is None and path_signature_lattice_state is not None:
                 final_signature_lattice_state = path_signature_lattice_state
             path_hidden.append(hidden_state)
-            path_logits.append(logits)
+            if self.use_path_logits:
+                path_logits.append(logits)
             path_signatures.append(output_signature)
             path_scores.append(path_score)
             path_entropy.append(route_entropy)
-            path_active_emitters.append(active_emitters)
-            if "emitter_cell_soft_occupancy" in path_stats:
-                path_soft_occupancy.append(path_stats["emitter_cell_soft_occupancy"].float())
-            elif "avg_emitter_cell_soft_occupancy" in path_stats:
-                path_soft_occupancy.append(path_stats["avg_emitter_cell_soft_occupancy"].float())
-            if "emitter_cell_soft_breadth" in path_stats:
-                path_soft_breadth.append(path_stats["emitter_cell_soft_breadth"].float())
-            elif "avg_emitter_cell_soft_breadth" in path_stats:
-                path_soft_breadth.append(path_stats["avg_emitter_cell_soft_breadth"].float())
-            if "global_bus_norm" in path_stats:
-                path_global_bus_norm.append(path_stats["global_bus_norm"].float())
-            if "emitter_cell_effective_count" in path_stats:
-                path_topk_effective_count.append(path_stats["emitter_cell_effective_count"].float())
-            elif "avg_emitter_topk_effective_count" in path_stats:
-                path_topk_effective_count.append(path_stats["avg_emitter_topk_effective_count"].float())
-            if "emitter_usage_entropy" in path_stats:
-                path_usage_entropy.append(path_stats["emitter_usage_entropy"].float())
-            elif "avg_emitter_usage_entropy" in path_stats:
-                path_usage_entropy.append(path_stats["avg_emitter_usage_entropy"].float())
-            if "emitter_usage_concentration" in path_stats:
-                path_usage_concentration.append(path_stats["emitter_usage_concentration"].float())
-            elif "avg_emitter_usage_concentration" in path_stats:
-                path_usage_concentration.append(path_stats["avg_emitter_usage_concentration"].float())
+            if collect_telemetry:
+                path_active_emitters.append(active_emitters)
+                if "emitter_cell_soft_occupancy" in path_stats:
+                    path_soft_occupancy.append(path_stats["emitter_cell_soft_occupancy"].float())
+                elif "avg_emitter_cell_soft_occupancy" in path_stats:
+                    path_soft_occupancy.append(path_stats["avg_emitter_cell_soft_occupancy"].float())
+                if "emitter_cell_soft_breadth" in path_stats:
+                    path_soft_breadth.append(path_stats["emitter_cell_soft_breadth"].float())
+                elif "avg_emitter_cell_soft_breadth" in path_stats:
+                    path_soft_breadth.append(path_stats["avg_emitter_cell_soft_breadth"].float())
+                if "global_bus_norm" in path_stats:
+                    path_global_bus_norm.append(path_stats["global_bus_norm"].float())
+                if "emitter_cell_effective_count" in path_stats:
+                    path_topk_effective_count.append(path_stats["emitter_cell_effective_count"].float())
+                elif "avg_emitter_topk_effective_count" in path_stats:
+                    path_topk_effective_count.append(path_stats["avg_emitter_topk_effective_count"].float())
+                if "emitter_usage_entropy" in path_stats:
+                    path_usage_entropy.append(path_stats["emitter_usage_entropy"].float())
+                elif "avg_emitter_usage_entropy" in path_stats:
+                    path_usage_entropy.append(path_stats["avg_emitter_usage_entropy"].float())
+                if "emitter_usage_concentration" in path_stats:
+                    path_usage_concentration.append(path_stats["emitter_usage_concentration"].float())
+                elif "avg_emitter_usage_concentration" in path_stats:
+                    path_usage_concentration.append(path_stats["avg_emitter_usage_concentration"].float())
             if "emitter_top_weights" in path_stats:
                 path_emitter_top_weights.append(path_stats["emitter_top_weights"].float())
             if "emitter_cell_mixture_loss" in path_stats:
                 path_mixture_loss.append(path_stats["emitter_cell_mixture_loss"].float())
             if "emitter_cell_coverage_loss" in path_stats:
                 path_coverage_loss.append(path_stats["emitter_cell_coverage_loss"].float())
-            if "signature_lattice_cache_norm" in path_stats:
-                path_signature_lattice_cache_norm.append(path_stats["signature_lattice_cache_norm"].float())
-            if "signature_lattice_gate_mean" in path_stats:
-                path_signature_lattice_gate_mean.append(path_stats["signature_lattice_gate_mean"].float())
-            if "signature_lattice_candidate_count" in path_stats:
-                path_signature_lattice_candidate_count.append(path_stats["signature_lattice_candidate_count"].float())
-            if "signature_lattice_enabled" in path_stats:
-                path_signature_lattice_enabled.append(path_stats["signature_lattice_enabled"].float())
-            if "mot_active_experts" in path_stats:
-                path_mot_active_experts.append(path_stats["mot_active_experts"].float())
-            if "specialist_family_specialist_active_count" in path_stats:
-                path_family_active_counts.append(path_stats["specialist_family_specialist_active_count"].float())
-            if "specialist_family_specialist_unique_families" in path_stats:
-                path_family_unique_families.append(path_stats["specialist_family_specialist_unique_families"].float())
-            if "specialist_family_specialist_bank_size" in path_stats:
-                path_family_bank_sizes.append(path_stats["specialist_family_specialist_bank_size"].float())
-            if "specialist_family_specialist_capacity" in path_stats:
-                path_family_capacities.append(path_stats["specialist_family_specialist_capacity"].float())
-            if "specialist_family_specialist_budget" in path_stats:
-                path_family_budgets.append(path_stats["specialist_family_specialist_budget"].float())
-            if "specialist_family_specialist_hit_rate" in path_stats:
-                path_family_hit_rates.append(path_stats["specialist_family_specialist_hit_rate"].float())
-            if "specialist_family_specialist_gate_mean" in path_stats:
-                path_family_gate_means.append(path_stats["specialist_family_specialist_gate_mean"].float())
+            if collect_telemetry:
+                if "signature_lattice_cache_norm" in path_stats:
+                    path_signature_lattice_cache_norm.append(path_stats["signature_lattice_cache_norm"].float())
+                if "signature_lattice_gate_mean" in path_stats:
+                    path_signature_lattice_gate_mean.append(path_stats["signature_lattice_gate_mean"].float())
+                if "signature_lattice_candidate_count" in path_stats:
+                    path_signature_lattice_candidate_count.append(path_stats["signature_lattice_candidate_count"].float())
+                if "signature_lattice_enabled" in path_stats:
+                    path_signature_lattice_enabled.append(path_stats["signature_lattice_enabled"].float())
+                if "mot_active_experts" in path_stats:
+                    path_mot_active_experts.append(path_stats["mot_active_experts"].float())
+                if "specialist_family_specialist_active_count" in path_stats:
+                    path_family_active_counts.append(path_stats["specialist_family_specialist_active_count"].float())
+                if "specialist_family_specialist_unique_families" in path_stats:
+                    path_family_unique_families.append(path_stats["specialist_family_specialist_unique_families"].float())
+                if "specialist_family_specialist_bank_size" in path_stats:
+                    path_family_bank_sizes.append(path_stats["specialist_family_specialist_bank_size"].float())
+                if "specialist_family_specialist_capacity" in path_stats:
+                    path_family_capacities.append(path_stats["specialist_family_specialist_capacity"].float())
+                if "specialist_family_specialist_budget" in path_stats:
+                    path_family_budgets.append(path_stats["specialist_family_specialist_budget"].float())
+                if "specialist_family_specialist_hit_rate" in path_stats:
+                    path_family_hit_rates.append(path_stats["specialist_family_specialist_hit_rate"].float())
+                if "specialist_family_specialist_gate_mean" in path_stats:
+                    path_family_gate_means.append(path_stats["specialist_family_specialist_gate_mean"].float())
             for key, value in path_stats.items():
-                if key.startswith("recursive_") and torch.is_tensor(value) and value.numel() == 1:
+                if collect_telemetry and key.startswith("recursive_") and torch.is_tensor(value) and value.numel() == 1:
                     recursive_stat_terms.setdefault(key, []).append(value.detach().float().reshape(()))
             if torch.is_tensor(recursive_aux_loss):
                 path_recursive_aux_loss.append(recursive_aux_loss.float())
@@ -7423,17 +7437,33 @@ class PrismalWaveModel(nn.Module):
         if profile_enabled:
             _sync_for_timing(input_ids.device)
             start_aggregate = time.perf_counter()
-        path_hidden_tensor = torch.stack(path_hidden, dim=1)
-        path_logits_tensor = torch.stack(path_logits, dim=1)
-        path_scores_tensor = torch.stack(path_scores, dim=1)
+        # Fast path for the common n_paths == 1 case: keep the exact tensor
+        # shapes, but skip multi-path reductions that would be no-ops.
+        single_path = len(path_hidden) == 1
+        if single_path:
+            path_hidden_tensor = path_hidden[0].unsqueeze(1)
+            path_logits_tensor = path_logits[0].unsqueeze(1) if self.use_path_logits else None
+            path_scores_tensor = path_scores[0].unsqueeze(1)
+        else:
+            path_hidden_tensor = torch.stack(path_hidden, dim=1)
+            path_logits_tensor = torch.stack(path_logits, dim=1) if self.use_path_logits else None
+            path_scores_tensor = torch.stack(path_scores, dim=1)
         if race_enabled and path_index is None and not race_audit and selected_lane_index is not None:
             path_weights = torch.ones(path_scores_tensor.size(0), 1, device=input_ids.device)
-            final_hidden = self.final_norm(path_hidden_tensor[:, 0])
+            final_hidden = self.final_norm(path_hidden[0])
             selected_path_index = torch.full(
                 (input_ids.size(0),),
                 selected_lane_index,
                 device=input_ids.device,
                 dtype=torch.long,
+            )
+        elif single_path:
+            path_weights = torch.ones(path_scores_tensor.size(0), 1, device=input_ids.device)
+            final_hidden = self.final_norm(path_hidden[0])
+            selected_path_index = (
+                torch.full((input_ids.size(0),), int(path_index), device=input_ids.device, dtype=torch.long)
+                if path_index is not None
+                else path_scores_tensor.argmax(dim=-1)
             )
         elif path_index is None:
             path_weights = F.softmax(path_scores_tensor / max(self.cfg.validator_temperature, 1e-3), dim=-1)
@@ -7444,7 +7474,8 @@ class PrismalWaveModel(nn.Module):
             path_weights = torch.ones(path_scores_tensor.size(0), 1, device=input_ids.device)
             final_hidden = self.final_norm(path_hidden_tensor[:, 0])
             selected_path_index = torch.full((input_ids.size(0),), int(path_index), device=input_ids.device, dtype=torch.long)
-        final_logits, final_hidden, final_neighborhood_logits = self._construction_logits_from_hidden(final_hidden)
+        final_hidden, final_neighborhood_logits = self._guide_hidden_from_neighborhood(final_hidden)
+        final_logits = self._construction_logits_from_guided(final_hidden)
         if profile_enabled:
             _sync_for_timing(input_ids.device)
             timings["timing_path_aggregate_ms"] = (time.perf_counter() - start_aggregate) * 1000.0
@@ -7623,114 +7654,114 @@ class PrismalWaveModel(nn.Module):
         route_stats = {
             "path_weights": path_weights.detach(),
             "path_scores": path_scores_tensor.detach(),
-            "race_scout_path_scores": (
-                race_lane_scores.detach()
-                if race_lane_scores is not None
-                else path_scores_tensor.detach()
-            ),
             "selected_path_index": selected_path_index.detach(),
             "path_entropy": torch.stack(path_entropy).detach() if path_entropy else torch.zeros(1, device=input_ids.device).detach(),
-            "path_active_emitters": torch.stack(path_active_emitters).detach() if path_active_emitters else torch.zeros(1, device=input_ids.device).detach(),
             "signature_agreement": signature_agreement.detach(),
             "signature_accuracy": signature_accuracy.detach(),
             "signature_level_accuracy": signature_level_accuracy.detach(),
             "signature_relation_accuracy": signature_relation_accuracy.detach(),
             "signature_cosine": signature_cosine.detach(),
             "signature_loss": signature_loss.detach(),
-            "signature_neighborhood_logits": final_neighborhood_logits.detach(),
-            "signature_neighborhood_confidence": F.softmax(
-                self._sanitize_tensor(final_neighborhood_logits.detach(), fallback=torch.zeros_like(final_neighborhood_logits))[0],
-                dim=-1,
-            ).amax(dim=-1).mean(),
             "signature_level_loss": signature_level_loss.detach(),
             "signature_relation_loss": signature_relation_loss.detach(),
             "signature_contrastive_loss": contrastive_loss.detach(),
             "pairwise_diversity": pairwise_diversity.detach(),
             "avg_entropy": avg_entropy.detach(),
-            "avg_active_emitters": avg_active.detach(),
-            "emitter_cell_occupancy": avg_active.detach(),
-            "avg_emitter_cell_soft_occupancy": avg_soft_active.detach(),
-            "emitter_cell_soft_occupancy": avg_soft_active.detach(),
-            "avg_emitter_usage_entropy": avg_usage_entropy.detach(),
-            "avg_emitter_usage_concentration": avg_usage_concentration.detach(),
-            "emitter_usage_entropy": avg_usage_entropy.detach(),
-            "emitter_usage_concentration": avg_usage_concentration.detach(),
-            "specialist_family_specialist_active_count": avg_family_active_count.detach(),
-            "specialist_family_specialist_unique_families": avg_family_unique_families.detach(),
-            "specialist_family_specialist_bank_size": avg_family_bank_size.detach(),
-            "specialist_family_specialist_capacity": avg_family_capacity.detach(),
-            "specialist_family_specialist_budget": avg_family_budget.detach(),
-            "specialist_family_specialist_hit_rate": avg_family_hit_rate.detach(),
-            "specialist_family_specialist_gate_mean": avg_family_gate_mean.detach(),
-            "emitter_cell_breadth": (
-                avg_active / max(float(self.torus_core.depth * self.torus_core.height * self.torus_core.width), 1.0)
-            ).detach(),
-            "avg_emitter_cell_soft_breadth": avg_soft_breadth.detach(),
-            "emitter_cell_soft_breadth": avg_soft_breadth.detach(),
-            "emitter_cell_effective_count": torch.stack(path_topk_effective_count).mean().detach() if path_topk_effective_count else torch.tensor(0.0, device=input_ids.device).detach(),
             "emitter_cell_mixture_loss": avg_mixture_loss.detach(),
             "emitter_cell_coverage_loss": avg_coverage_loss.detach(),
             "torus_coverage_loss": avg_coverage_loss.detach(),
             "emitter_mixture_loss": avg_mixture_loss.detach(),
-            "global_bus_norm": avg_global_bus_norm.detach(),
-            "signature_lattice_cache_norm": (
-                torch.stack(path_signature_lattice_cache_norm).mean().detach()
-                if path_signature_lattice_cache_norm
-                else torch.tensor(0.0, device=input_ids.device).detach()
-            ),
-            "signature_lattice_gate_mean": (
-                torch.stack(path_signature_lattice_gate_mean).mean().detach()
-                if path_signature_lattice_gate_mean
-                else torch.tensor(0.0, device=input_ids.device).detach()
-            ),
-            "signature_lattice_candidate_count": (
-                torch.stack(path_signature_lattice_candidate_count).mean().detach()
-                if path_signature_lattice_candidate_count
-                else torch.tensor(0.0, device=input_ids.device).detach()
-            ),
-            "signature_lattice_enabled": (
-                torch.stack(path_signature_lattice_enabled).mean().detach()
-                if path_signature_lattice_enabled
-                else torch.tensor(0.0, device=input_ids.device).detach()
-            ),
-            "token_memory_enabled": frame.token_memory_stats.get("token_memory_enabled", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "copy_attention_enabled": frame.token_memory_stats.get("copy_attention_enabled", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "token_memory_gate_mean": frame.token_memory_stats.get("token_memory_gate_mean", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "copy_attention_gate_mean": frame.token_memory_stats.get("copy_attention_gate_mean", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "token_memory_copy_confidence": frame.token_memory_stats.get("token_memory_copy_confidence", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "copy_attention_max_weight": frame.token_memory_stats.get("copy_attention_max_weight", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "token_memory_memory_fill": frame.token_memory_stats.get("token_memory_memory_fill", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "copy_attention_memory_fill": frame.token_memory_stats.get("copy_attention_memory_fill", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "token_memory_window": frame.token_memory_stats.get("token_memory_window", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "token_memory_top_k": frame.token_memory_stats.get("token_memory_top_k", torch.tensor(0.0, device=input_ids.device)).detach(),
-            "copy_attention_candidate_count": frame.token_memory_stats.get(
-                "copy_attention_candidate_count",
-                torch.tensor(0.0, device=input_ids.device),
-            ).detach(),
-            "token_memory_copy_logits": frame.token_memory_stats.get(
-                "token_memory_copy_logits",
-                torch.zeros(input_ids.size(0), self.vocab_size, device=input_ids.device, dtype=final_logits.dtype),
-            ).detach(),
-            "mot_active_experts": (
-                torch.stack(path_mot_active_experts).mean().detach()
-                if path_mot_active_experts
-                else torch.tensor(0.0, device=input_ids.device).detach()
-            ),
-            "race_lane_limit": torch.tensor(float(lane_limit), device=input_ids.device).detach(),
-            "race_scout_count": torch.tensor(float(scout_count), device=input_ids.device).detach(),
-            "race_lane_band": lane_band.detach(),
-            "race_lane_temperature": lane_temperature.detach(),
-            "race_scout_score": scout_score.detach(),
-            "registry_active_families": torch.tensor(
-                float((self.registry.family_active_mask > 0).sum().item()),
-                device=input_ids.device,
-            ).detach(),
-            "registry_active_relations": torch.tensor(
-                float((self.registry.relation_active_mask > 0).sum().item()),
-                device=input_ids.device,
-            ).detach(),
             "recursive_aux_loss": avg_recursive_aux_loss.detach(),
         }
+        if collect_telemetry:
+            route_stats.update(
+                {
+                    "race_scout_path_scores": (
+                        race_lane_scores.detach()
+                        if race_lane_scores is not None
+                        else path_scores_tensor.detach()
+                    ),
+                    "path_active_emitters": torch.stack(path_active_emitters).detach() if path_active_emitters else torch.zeros(1, device=input_ids.device).detach(),
+                    "avg_active_emitters": avg_active.detach(),
+                    "emitter_cell_occupancy": avg_active.detach(),
+                    "avg_emitter_cell_soft_occupancy": avg_soft_active.detach(),
+                    "emitter_cell_soft_occupancy": avg_soft_active.detach(),
+                    "avg_emitter_usage_entropy": avg_usage_entropy.detach(),
+                    "avg_emitter_usage_concentration": avg_usage_concentration.detach(),
+                    "emitter_usage_entropy": avg_usage_entropy.detach(),
+                    "emitter_usage_concentration": avg_usage_concentration.detach(),
+                    "specialist_family_specialist_active_count": avg_family_active_count.detach(),
+                    "specialist_family_specialist_unique_families": avg_family_unique_families.detach(),
+                    "specialist_family_specialist_bank_size": avg_family_bank_size.detach(),
+                    "specialist_family_specialist_capacity": avg_family_capacity.detach(),
+                    "specialist_family_specialist_budget": avg_family_budget.detach(),
+                    "specialist_family_specialist_hit_rate": avg_family_hit_rate.detach(),
+                    "specialist_family_specialist_gate_mean": avg_family_gate_mean.detach(),
+                    "emitter_cell_breadth": (
+                        avg_active / max(float(self.torus_core.depth * self.torus_core.height * self.torus_core.width), 1.0)
+                    ).detach(),
+                    "avg_emitter_cell_soft_breadth": avg_soft_breadth.detach(),
+                    "emitter_cell_soft_breadth": avg_soft_breadth.detach(),
+                    "emitter_cell_effective_count": torch.stack(path_topk_effective_count).mean().detach() if path_topk_effective_count else torch.tensor(0.0, device=input_ids.device).detach(),
+                    "global_bus_norm": avg_global_bus_norm.detach(),
+                    "signature_lattice_cache_norm": (
+                        torch.stack(path_signature_lattice_cache_norm).mean().detach()
+                        if path_signature_lattice_cache_norm
+                        else torch.tensor(0.0, device=input_ids.device).detach()
+                    ),
+                    "signature_lattice_gate_mean": (
+                        torch.stack(path_signature_lattice_gate_mean).mean().detach()
+                        if path_signature_lattice_gate_mean
+                        else torch.tensor(0.0, device=input_ids.device).detach()
+                    ),
+                    "signature_lattice_candidate_count": (
+                        torch.stack(path_signature_lattice_candidate_count).mean().detach()
+                        if path_signature_lattice_candidate_count
+                        else torch.tensor(0.0, device=input_ids.device).detach()
+                    ),
+                    "signature_lattice_enabled": (
+                        torch.stack(path_signature_lattice_enabled).mean().detach()
+                        if path_signature_lattice_enabled
+                        else torch.tensor(0.0, device=input_ids.device).detach()
+                    ),
+                    "token_memory_enabled": frame.token_memory_stats.get("token_memory_enabled", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "copy_attention_enabled": frame.token_memory_stats.get("copy_attention_enabled", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "token_memory_gate_mean": frame.token_memory_stats.get("token_memory_gate_mean", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "copy_attention_gate_mean": frame.token_memory_stats.get("copy_attention_gate_mean", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "token_memory_copy_confidence": frame.token_memory_stats.get("token_memory_copy_confidence", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "copy_attention_max_weight": frame.token_memory_stats.get("copy_attention_max_weight", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "token_memory_memory_fill": frame.token_memory_stats.get("token_memory_memory_fill", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "copy_attention_memory_fill": frame.token_memory_stats.get("copy_attention_memory_fill", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "token_memory_window": frame.token_memory_stats.get("token_memory_window", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "token_memory_top_k": frame.token_memory_stats.get("token_memory_top_k", torch.tensor(0.0, device=input_ids.device)).detach(),
+                    "copy_attention_candidate_count": frame.token_memory_stats.get(
+                        "copy_attention_candidate_count",
+                        torch.tensor(0.0, device=input_ids.device),
+                    ).detach(),
+                    "token_memory_copy_logits": frame.token_memory_stats.get(
+                        "token_memory_copy_logits",
+                        torch.zeros(input_ids.size(0), self.vocab_size, device=input_ids.device, dtype=final_logits.dtype),
+                    ).detach(),
+                    "mot_active_experts": (
+                        torch.stack(path_mot_active_experts).mean().detach()
+                        if path_mot_active_experts
+                        else torch.tensor(0.0, device=input_ids.device).detach()
+                    ),
+                    "race_lane_limit": torch.tensor(float(lane_limit), device=input_ids.device).detach(),
+                    "race_scout_count": torch.tensor(float(scout_count), device=input_ids.device).detach(),
+                    "race_lane_band": lane_band.detach(),
+                    "race_lane_temperature": lane_temperature.detach(),
+                    "race_scout_score": scout_score.detach(),
+                    "registry_active_families": torch.tensor(
+                        float((self.registry.family_active_mask > 0).sum().item()),
+                        device=input_ids.device,
+                    ).detach(),
+                    "registry_active_relations": torch.tensor(
+                        float((self.registry.relation_active_mask > 0).sum().item()),
+                        device=input_ids.device,
+                    ).detach(),
+                }
+            )
         sharc_router_aug_stats = locals().get("router_aug_stats", {})
         if sharc_router_aug_stats:
             route_stats.update(sharc_router_aug_stats)
@@ -7776,7 +7807,12 @@ class PrismalWaveModel(nn.Module):
             final_output_signature,
             fallback=torch.zeros_like(final_output_signature),
         )
-        path_logits_tensor, path_repairs = self._sanitize_tensor(path_logits_tensor, fallback=torch.zeros_like(path_logits_tensor))
+        path_repairs = 0
+        if path_logits_tensor is not None:
+            path_logits_tensor, path_repairs = self._sanitize_tensor(
+                path_logits_tensor,
+                fallback=torch.zeros_like(path_logits_tensor),
+            )
         route_stats["stability_nonfinite_repair_count"] = torch.tensor(
             float(route_repairs + logits_repairs + signature_repairs + path_repairs),
             device=input_ids.device,
@@ -7923,6 +7959,7 @@ class PrismalWaveModel(nn.Module):
         torus_center: Optional[torch.Tensor] = None,
         superposition_token_groups: Optional[torch.Tensor] = None,
         superposition_bag_size: int = 1,
+        collect_telemetry: bool = True,
     ) -> PrismalWaveOutput:
         _validate_aligned_signature_tensors(
             input_ids,
@@ -7955,6 +7992,7 @@ class PrismalWaveModel(nn.Module):
                 path_index=path_index,
                 position_offset=position_index,
                 gate_runtime=gate_runtime,
+                collect_telemetry=collect_telemetry,
             )
         hidden = self._encode(
             input_ids,
@@ -8054,13 +8092,15 @@ class PrismalWaveModel(nn.Module):
             if "emitter_balance_loss" in stats:
                 path_balance_loss.append(stats["emitter_balance_loss"].float())
             path_hidden_state = self.final_norm(path_hidden_state)
-            logits, path_hidden_state, neighborhood_logits = self._construction_logits_from_hidden(path_hidden_state)
+            path_hidden_state, neighborhood_logits = self._guide_hidden_from_neighborhood(path_hidden_state)
+            logits = self._construction_logits_from_guided(path_hidden_state) if self.use_path_logits else None
             output_signature = F.normalize(self.signature_head(path_hidden_state.mean(dim=1)), dim=-1)
             agreement = F.cosine_similarity(input_signature, output_signature, dim=-1)
             route_entropy = torch.stack(entropy_terms).mean()
             validator_score = agreement - 0.15 * route_entropy
             path_hidden.append(path_hidden_state)
-            path_logits.append(logits)
+            if self.use_path_logits:
+                path_logits.append(logits)
             path_signatures.append(output_signature)
             path_scores.append(validator_score)
             path_entropy.append(route_entropy)
@@ -8068,7 +8108,12 @@ class PrismalWaveModel(nn.Module):
             path_slot_states.append(slots)
 
         path_hidden_tensor = torch.stack(path_hidden, dim=1)
-        path_logits_tensor = torch.stack(path_logits, dim=1)
+        path_logits_tensor: Optional[torch.Tensor] = None
+        if self.use_path_logits:
+            if len(path_logits) == 1:
+                path_logits_tensor = path_logits[0].unsqueeze(1)
+            else:
+                path_logits_tensor = torch.stack(path_logits, dim=1)
         path_scores_tensor = torch.stack(path_scores, dim=1)
         path_scores_tensor, _ = self._sanitize_tensor(path_scores_tensor, fallback=torch.zeros_like(path_scores_tensor))
         if path_index is None:
@@ -8080,7 +8125,8 @@ class PrismalWaveModel(nn.Module):
             path_weights = torch.ones(path_scores_tensor.size(0), 1, device=input_ids.device)
             final_hidden = self.final_norm(path_hidden_tensor[:, 0])
             selected_path_index = torch.full((input_ids.size(0),), int(path_index), device=input_ids.device, dtype=torch.long)
-        final_logits, final_hidden, final_neighborhood_logits = self._construction_logits_from_hidden(final_hidden)
+        final_hidden, final_neighborhood_logits = self._guide_hidden_from_neighborhood(final_hidden)
+        final_logits = self._construction_logits_from_guided(final_hidden)
 
         final_output_signature = F.normalize(self.signature_head(final_hidden.mean(dim=1)), dim=-1)
         signature_cosine = F.cosine_similarity(input_signature, final_output_signature, dim=-1)
@@ -8301,7 +8347,12 @@ class PrismalWaveModel(nn.Module):
             final_output_signature,
             fallback=torch.zeros_like(final_output_signature),
         )
-        path_logits_tensor, path_repairs = self._sanitize_tensor(path_logits_tensor, fallback=torch.zeros_like(path_logits_tensor))
+        path_repairs = 0
+        if path_logits_tensor is not None:
+            path_logits_tensor, path_repairs = self._sanitize_tensor(
+                path_logits_tensor,
+                fallback=torch.zeros_like(path_logits_tensor),
+            )
         route_stats["stability_nonfinite_repair_count"] = torch.tensor(
             float(route_repairs + logits_repairs + signature_repairs + path_repairs),
             device=input_ids.device,
@@ -9319,6 +9370,7 @@ class PrismalWaveModel(nn.Module):
         parent_signature_ids: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         superposition_bag_size: int = 1,
+        collect_telemetry: bool = True,
     ) -> Tuple[torch.Tensor, PrismalWaveOutput]:
         superposition_bag_size = max(1, int(superposition_bag_size))
         use_superposition = (
@@ -9347,6 +9399,7 @@ class PrismalWaveModel(nn.Module):
                 loss_mask=superposition.forward_loss_mask,
                 superposition_token_groups=superposition.token_groups,
                 superposition_bag_size=superposition.bag_size,
+                collect_telemetry=collect_telemetry,
             )
             target_count = superposition.target_ids.size(1)
             logits = output.logits[:, :target_count, :]
@@ -9373,6 +9426,7 @@ class PrismalWaveModel(nn.Module):
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
                 loss_mask=loss_mask,
+                collect_telemetry=collect_telemetry,
             )
             token_losses = F.cross_entropy(
                 output.logits.reshape(-1, output.logits.size(-1)),

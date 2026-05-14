@@ -115,6 +115,13 @@ class PrismalWaveGUI(tk.Tk):
         self.muon_extra_scale_factor_var = tk.StringVar(value="0.8")
         self.muon_scalar_optimizer_var = tk.StringVar(value=DEFAULT_CFG.muon_scalar_optimizer)
         self.muon_nesterov_var = tk.BooleanVar(value=DEFAULT_CFG.muon_nesterov)
+        self.use_nested_learning_var = tk.BooleanVar(value=DEFAULT_CFG.use_nested_learning)
+        self.nested_learning_local_interval_var = tk.StringVar(value=str(DEFAULT_CFG.nested_learning_local_interval))
+        self.nested_learning_mid_interval_var = tk.StringVar(value=str(DEFAULT_CFG.nested_learning_mid_interval))
+        self.nested_learning_global_interval_var = tk.StringVar(value=str(DEFAULT_CFG.nested_learning_global_interval))
+        self.nested_learning_local_ema_beta_var = tk.StringVar(value=str(DEFAULT_CFG.nested_learning_local_ema_beta))
+        self.nested_learning_mid_ema_beta_var = tk.StringVar(value=str(DEFAULT_CFG.nested_learning_mid_ema_beta))
+        self.nested_learning_global_ema_beta_var = tk.StringVar(value=str(DEFAULT_CFG.nested_learning_global_ema_beta))
         self.val_fraction_var = tk.StringVar(value="0.1")
         self.min_token_frequency_var = tk.StringVar(value="2")
         self.post_prompt_var = tk.StringVar(value="What is a cat?")
@@ -260,9 +267,10 @@ class PrismalWaveGUI(tk.Tk):
         opt_top = ttk.Frame(opt_box)
         opt_top.pack(fill="x")
         ttk.Label(opt_top, text="Optimizer", width=18).pack(side="left")
-        opt_choice = ttk.Combobox(opt_top, textvariable=self.optimizer_var, values=("muon", "adamw"), state="readonly", width=14)
+        opt_choice = ttk.Combobox(opt_top, textvariable=self.optimizer_var, values=("hierarchical", "muon", "adamw"), state="readonly", width=14)
         opt_choice.pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opt_top, text="Muon Nesterov", variable=self.muon_nesterov_var).pack(side="left")
+        ttk.Checkbutton(opt_top, text="Nested learning", variable=self.use_nested_learning_var).pack(side="left", padx=(12, 0))
         opt_grid = ttk.Frame(opt_box)
         opt_grid.pack(fill="x", pady=(8, 0))
         self._grid_params(
@@ -274,6 +282,12 @@ class PrismalWaveGUI(tk.Tk):
                 ("Muon NS", self.muon_ns_steps_var),
                 ("Muon scale", self.muon_extra_scale_factor_var),
                 ("Scalar opt", self.muon_scalar_optimizer_var),
+                ("Nested local", self.nested_learning_local_interval_var),
+                ("Nested mid", self.nested_learning_mid_interval_var),
+                ("Nested global", self.nested_learning_global_interval_var),
+                ("Local EMA", self.nested_learning_local_ema_beta_var),
+                ("Mid EMA", self.nested_learning_mid_ema_beta_var),
+                ("Global EMA", self.nested_learning_global_ema_beta_var),
             ],
         )
 
@@ -530,7 +544,7 @@ class PrismalWaveGUI(tk.Tk):
             "--lr",
             self.lr_var.get().strip() or "0.0001",
             "--optimizer",
-            self.optimizer_var.get().strip() or "muon",
+            self.optimizer_var.get().strip() or DEFAULT_CFG.optimizer,
             "--muon-lr",
             self.muon_lr_var.get().strip() or "0.02",
             "--muon-weight-decay",
@@ -543,6 +557,19 @@ class PrismalWaveGUI(tk.Tk):
             self.muon_extra_scale_factor_var.get().strip() or "1.0",
             "--muon-scalar-optimizer",
             self.muon_scalar_optimizer_var.get().strip() or "adamw",
+            "--use-nested-learning" if self.use_nested_learning_var.get() else "--no-nested-learning",
+            "--nested-learning-local-interval",
+            self.nested_learning_local_interval_var.get().strip() or str(DEFAULT_CFG.nested_learning_local_interval),
+            "--nested-learning-mid-interval",
+            self.nested_learning_mid_interval_var.get().strip() or str(DEFAULT_CFG.nested_learning_mid_interval),
+            "--nested-learning-global-interval",
+            self.nested_learning_global_interval_var.get().strip() or str(DEFAULT_CFG.nested_learning_global_interval),
+            "--nested-learning-local-ema-beta",
+            self.nested_learning_local_ema_beta_var.get().strip() or str(DEFAULT_CFG.nested_learning_local_ema_beta),
+            "--nested-learning-mid-ema-beta",
+            self.nested_learning_mid_ema_beta_var.get().strip() or str(DEFAULT_CFG.nested_learning_mid_ema_beta),
+            "--nested-learning-global-ema-beta",
+            self.nested_learning_global_ema_beta_var.get().strip() or str(DEFAULT_CFG.nested_learning_global_ema_beta),
             "--val-fraction",
             self.val_fraction_var.get().strip() or "0.1",
             "--min-token-frequency",
