@@ -22,9 +22,14 @@ class PrismalWaveConfig:
     optimizer: str = "hierarchical"
     use_gradient_accumulation: bool = True
     gradient_accumulation_steps: int = 4
+    training_finite_guard_enabled: bool = True
+    inference_finite_guard_enabled: bool = True
+    grad_clip_muon: float = 0.25
+    grad_clip_scalar: float = 1.0
+    grad_clip_rowwise: float = 0.85
     hierarchical_precision_enabled: bool = True
     hierarchical_precision_root_dtype: str = "bf16"
-    hierarchical_precision_mid_dtype: str = "bf16"
+    hierarchical_precision_mid_dtype: str = "fp8"
     hierarchical_precision_leaf_dtype: str = "fp4"
     hierarchical_precision_fallback_dtype: str = "bf16"
     hierarchical_precision_accumulator_dtype: str = "bf16"
@@ -36,9 +41,9 @@ class PrismalWaveConfig:
     muon_ns_steps: int = 8
     muon_extra_scale_factor: float = 0.5
     muon_scalar_optimizer: str = "adamw"
-    d_model: int = 512
+    d_model: int = 256
     n_layers: int = 1
-    n_emitters: int = 64
+    n_emitters: int = 512
     n_slots: int = 32
     n_paths: int = 1
     top_k_emitters: int = 4
@@ -52,7 +57,7 @@ class PrismalWaveConfig:
     use_turbo_quantization: bool = False
     turbo_quantization_bits: int = 3
     turbo_quantization_method: str = "turbo"
-    use_bitsandbytes_leaf_precision: bool = False
+    use_bitsandbytes_leaf_precision: bool = True
     bitsandbytes_leaf_precision_mode: str = "fp4"
     bitsandbytes_leaf_quant_type: str = "fp4"
     bitsandbytes_leaf_compute_dtype: str = "fp4"
@@ -60,6 +65,7 @@ class PrismalWaveConfig:
     qat_start_fraction: float = 0.65
     qat_ramp_fraction: float = 0.20
     use_torus_core: bool = True
+    Torus_SHARC_Router: bool = True
     use_hmote: bool = True
     use_recursive_hmoe: bool = True
     use_gradient_checkpointing: bool = False
@@ -99,6 +105,27 @@ class PrismalWaveConfig:
     signature_lattice_decay: float = 0.85
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = True
+    use_token_superposition_training: bool = True
+    token_superposition_bag_size: int = 8
+    token_superposition_phase_fraction: float = 0.30
+    use_gate: bool = True
+    gate_residency_budget: int = 4
+    gate_prefetch_horizon: int = 2
+    gate_tile_granularity: int = 4
+    gate_offload_to_cpu: bool = False
+    gate_fallback_on_miss: bool = True
+    use_gatetrain: bool = True
+    use_fullgatetrain: bool = True
+    gatetrain_residency_budget: int = 6
+    gatetrain_prefetch_horizon: int = 2
+    gatetrain_tile_granularity: int = 4
+    gatetrain_offload_to_cpu: bool = False
+    gatetrain_fallback_on_miss: bool = True
+    use_learned_residency_head: bool = True
+    residency_head_layers: int = 1
+    residency_head_hidden_dim: int = 256
+    learned_residency_weight: float = 0.1
+    use_residency_with_reinforcement: bool = True
     use_token_memory_cross_attention: bool = False
     use_token_memory_generation_cache: bool = False
     token_memory_window: int = 96
@@ -137,7 +164,7 @@ class PrismalWaveConfig:
     torus_depth: int = 3
     torus_height: int = 3
     torus_width: int = 3
-    torus_local_field_radius: int = 1
+    torus_local_field_radius: int = 2
     torus_global_bus_slots: int = 4
     torus_global_bus_decay: float = 0.92
     torus_global_bus_write_scale: float = 0.32
@@ -145,7 +172,7 @@ class PrismalWaveConfig:
     torus_scout_read_radius: int = 4
     torus_transport: float = 0.25
     torus_write_strength: float = 0.95
-    torus_relay_write_radius: int = 2
+    torus_relay_write_radius: int = 3
     torus_inner_temperature: float = 0.20
     torus_outer_temperature: float = 1.00
     torus_relay_interval: int = 12
@@ -182,7 +209,7 @@ class PrismalWaveConfig:
     emitter_hierarchy_score_weight: float = 0.25
     emitter_balance_weight: float = 0.65
     emitter_mixture_target_count: float = 4
-    emitter_mixture_weight: float = 0.75
+    emitter_mixture_weight: float = 0.95
     emitter_birth_threshold: float = 0.008
     emitter_promotion_threshold: float = 0.25
     seed_all_emitter_families: bool = True
@@ -199,6 +226,15 @@ class PrismalWaveConfig:
     signature_level_loss_weight: float = 0.25
     signature_relation_loss_weight: float = 0.25
     signature_contrastive_weight: float = 0.95
+    use_contrastive_routing: bool = True
+    contrastive_routing_weight: float = 0.10
+    contrastive_routing_temperature: float = 0.10
+    contrastive_routing_hard_negatives: bool = True
+    use_contrastive_routing_signature_neighborhood: bool = True
+    use_contrastive_routing_temporal: bool = True
+    use_contrastive_routing_residency: bool = True
+    use_contrastive_routing_cross_view: bool = True
+    use_contrastive_routing_self_contrast: bool = True
     routing_entropy_weight: float = 0.1
     diversity_weight: float = 0.15
     emitter_neighbor_weight: float = 0.035
@@ -239,6 +275,8 @@ class PrismalWaveConfig:
         _sync_alias("token_memory_copy_bias", "token_copy_bias_strength")
         _sync_alias("token_memory_rare_token_cutoff", "token_copy_rare_token_cutoff")
         _sync_alias("token_memory_copy_min_confidence", "token_copy_min_confidence")
+        self.Torus_SHARC_Router = bool(getattr(self, "Torus_SHARC_Router", True))
+        self.use_torus_sharc_router = self.Torus_SHARC_Router
         if self.hmote_depth <= 0:
             self.hmote_depth = 1
         if self.hmote_branching <= 0:
@@ -280,6 +318,14 @@ class PrismalWaveConfig:
         self.use_gradient_accumulation = bool(self.use_gradient_accumulation)
         if self.gradient_accumulation_steps < 1:
             self.gradient_accumulation_steps = 1
+        self.training_finite_guard_enabled = bool(self.training_finite_guard_enabled)
+        self.inference_finite_guard_enabled = bool(self.inference_finite_guard_enabled)
+        if self.grad_clip_muon < 0.0:
+            self.grad_clip_muon = 0.0
+        if self.grad_clip_scalar < 0.0:
+            self.grad_clip_scalar = 0.0
+        if self.grad_clip_rowwise < 0.0:
+            self.grad_clip_rowwise = 0.0
         if self.mot_num_experts < 1:
             self.mot_num_experts = 1
         if self.mot_expert_scale <= 0:
@@ -293,6 +339,44 @@ class PrismalWaveConfig:
             self.emitter_hierarchy_score_weight = 0.0
         self.use_signature_lattice_attention = bool(self.use_signature_lattice_attention)
         self.use_signature_lattice_generation_cache = bool(self.use_signature_lattice_generation_cache)
+        self.use_token_superposition_training = bool(self.use_token_superposition_training)
+        if self.token_superposition_bag_size < 1:
+            self.token_superposition_bag_size = 1
+        if self.token_superposition_phase_fraction < 0.0:
+            self.token_superposition_phase_fraction = 0.0
+        if self.token_superposition_phase_fraction > 1.0:
+            self.token_superposition_phase_fraction = 1.0
+        self.use_gate = bool(self.use_gate)
+        if self.gate_residency_budget < 1:
+            self.gate_residency_budget = 1
+        if self.gate_prefetch_horizon < 1:
+            self.gate_prefetch_horizon = 1
+        if self.gate_tile_granularity < 1:
+            self.gate_tile_granularity = 1
+        self.gate_offload_to_cpu = bool(self.gate_offload_to_cpu)
+        self.gate_fallback_on_miss = bool(self.gate_fallback_on_miss)
+        self.use_gatetrain = bool(self.use_gatetrain)
+        self.use_fullgatetrain = bool(self.use_fullgatetrain)
+        if self.use_fullgatetrain:
+            self.use_gatetrain = True
+        if self.gatetrain_residency_budget < 1:
+            self.gatetrain_residency_budget = 1
+        if self.gatetrain_prefetch_horizon < 1:
+            self.gatetrain_prefetch_horizon = 1
+        if self.gatetrain_tile_granularity < 1:
+            self.gatetrain_tile_granularity = 1
+        self.gatetrain_offload_to_cpu = bool(self.gatetrain_offload_to_cpu)
+        self.gatetrain_fallback_on_miss = bool(self.gatetrain_fallback_on_miss)
+        self.use_learned_residency_head = bool(self.use_learned_residency_head)
+        self.use_residency_with_reinforcement = bool(self.use_residency_with_reinforcement)
+        if self.use_residency_with_reinforcement:
+            self.use_learned_residency_head = True
+        if self.residency_head_layers < 1:
+            self.residency_head_layers = 1
+        if self.residency_head_hidden_dim < 1:
+            self.residency_head_hidden_dim = 256
+        if self.learned_residency_weight < 0.0:
+            self.learned_residency_weight = 0.0
         self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
         self.use_token_memory_generation_cache = bool(self.use_token_memory_generation_cache)
         self.use_token_copy_cross_attention = bool(self.use_token_copy_cross_attention)
@@ -311,6 +395,17 @@ class PrismalWaveConfig:
             self.signature_lattice_decay = 1.0
         if self.signature_lattice_chunk_len < 1:
             self.signature_lattice_chunk_len = 8
+        self.use_contrastive_routing = bool(self.use_contrastive_routing)
+        self.contrastive_routing_hard_negatives = bool(self.contrastive_routing_hard_negatives)
+        self.use_contrastive_routing_signature_neighborhood = bool(self.use_contrastive_routing_signature_neighborhood)
+        self.use_contrastive_routing_temporal = bool(self.use_contrastive_routing_temporal)
+        self.use_contrastive_routing_residency = bool(self.use_contrastive_routing_residency)
+        self.use_contrastive_routing_cross_view = bool(self.use_contrastive_routing_cross_view)
+        self.use_contrastive_routing_self_contrast = bool(self.use_contrastive_routing_self_contrast)
+        if self.contrastive_routing_weight < 0.0:
+            self.contrastive_routing_weight = 0.0
+        if self.contrastive_routing_temperature <= 0.0:
+            self.contrastive_routing_temperature = 0.1
         if self.token_memory_window < 1:
             self.token_memory_window = 32
         if self.token_memory_top_k < 1:
@@ -432,6 +527,8 @@ class PrismalWaveConfig:
     def from_dict(cls, payload: Dict[str, Any]) -> "PrismalWaveConfig":
         fields = {f.name for f in cls.__dataclass_fields__.values()}
         data = {k: v for k, v in payload.items() if k in fields}
+        if "Torus_SHARC_Router" not in data and "use_torus_sharc_router" in payload:
+            data["Torus_SHARC_Router"] = payload["use_torus_sharc_router"]
         if "torus_local_field_radius" not in data and "torus_write_radius" in payload:
             data["torus_local_field_radius"] = payload["torus_write_radius"]
         if "torus_scout_read_radius" not in data and "torus_read_radius" in payload:

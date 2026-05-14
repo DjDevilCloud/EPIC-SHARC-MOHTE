@@ -184,9 +184,10 @@ In practice:
 1. Text is tokenized and converted into aligned hierarchy tracks.
 2. The model resolves runtime vocab and signature sizes from the tokenizer or checkpoint state.
 3. Routing state determines whether a family specialist or the main torus path should dominate.
-4. The torus core performs local and global memory updates.
-5. Recursive and speculative paths can refine the output before final logits are produced.
-6. Auxiliary signature and routing losses help keep the hierarchy coherent.
+4. When `Torus_SHARC_Router` is enabled, the SHARC/router path stays active alongside torus mode and conditions the torus hidden state.
+5. The torus core performs local and global memory updates.
+6. Recursive and speculative paths can refine the output before final logits are produced.
+7. Auxiliary signature and routing losses help keep the hierarchy coherent.
 
 ## Training And Generation
 

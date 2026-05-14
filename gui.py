@@ -135,6 +135,7 @@ class PrismalWaveGUI(tk.Tk):
         self.torus_global_bus_slots_var = tk.StringVar(value=str(DEFAULT_CFG.torus_global_bus_slots))
         self.torus_global_bus_decay_var = tk.StringVar(value=str(DEFAULT_CFG.torus_global_bus_decay))
         self.torus_global_bus_write_scale_var = tk.StringVar(value=str(DEFAULT_CFG.torus_global_bus_write_scale))
+        self.torus_sharc_router_var = tk.BooleanVar(value=DEFAULT_CFG.Torus_SHARC_Router)
         self.use_signature_lattice_attention_var = tk.BooleanVar(value=DEFAULT_CFG.use_signature_lattice_attention)
         self.signature_lattice_dim_var = tk.StringVar(value=str(DEFAULT_CFG.signature_lattice_dim))
         self.signature_lattice_buckets_var = tk.StringVar(value=str(DEFAULT_CFG.signature_lattice_buckets))
@@ -311,6 +312,11 @@ class PrismalWaveGUI(tk.Tk):
 
         torus_box = ttk.LabelFrame(tab, text="Torus field", padding=8)
         torus_box.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            torus_box,
+            text="Torus SHARC router augmentation",
+            variable=self.torus_sharc_router_var,
+        ).pack(anchor="w")
         self._grid_params(
             torus_box,
             [
@@ -606,6 +612,10 @@ class PrismalWaveGUI(tk.Tk):
             cmd.append("--use-topk-mot")
         else:
             cmd.append("--no-topk-mot")
+        if self.torus_sharc_router_var.get():
+            cmd.append("--torus-sharc-router")
+        else:
+            cmd.append("--no-torus-sharc-router")
         if resume:
             cmd.extend(["--continue-checkpoint", self.resume_var.get().strip()])
         cmd.extend(_split_extra_args(self.extra_train_args_var.get()))

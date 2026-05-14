@@ -1,6 +1,7 @@
 import sys
 import unittest
 import tempfile
+import math
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -14,12 +15,127 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import PrismalWaveConfig
+from config import load_config
+from cli import build_parser, _resolve_tokenizer_bootstrap
 from data import PrismalTokenizer
 from model import PrismalWaveModel
-from train import build_train_val_dataloaders, train_model
+from train import build_train_val_dataloaders, load_model_from_checkpoint, save_checkpoint, train_model, _clip_optimizer_group_gradients, _token_superposition_phase_active
 
 
 class SmokeTests(unittest.TestCase):
+    def _build_gate_cfg(
+        self,
+        tokenizer: PrismalTokenizer,
+        *,
+        use_gate: bool,
+        use_gatetrain: bool = False,
+        use_fullgatetrain: bool = False,
+        use_hmote: bool = False,
+        use_torus_core: bool = False,
+        use_learned_residency_head: bool = False,
+        use_residency_with_reinforcement: bool = False,
+        use_contrastive_routing: bool = False,
+        use_contrastive_routing_signature_neighborhood: bool = False,
+        use_contrastive_routing_temporal: bool = False,
+        use_contrastive_routing_residency: bool = False,
+        use_contrastive_routing_cross_view: bool = False,
+        use_contrastive_routing_self_contrast: bool = False,
+    ) -> PrismalWaveConfig:
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 16
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 8
+        cfg.n_slots = 8
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 2
+        cfg.top_k_slots = 2
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 8
+        cfg.use_torus_core = use_torus_core
+        cfg.Torus_SHARC_Router = use_torus_core
+        cfg.use_hmote = use_hmote
+        cfg.hmote_branching = 4
+        cfg.use_recursive_hmoe = False
+        cfg.hierarchical_nest_depth = 2
+        cfg.use_signature_lattice_attention = False
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 32
+        cfg.use_gate = use_gate
+        cfg.gate_residency_budget = 4
+        cfg.gate_prefetch_horizon = 1
+        cfg.gate_tile_granularity = 2
+        cfg.gate_offload_to_cpu = False
+        cfg.gate_fallback_on_miss = True
+        cfg.use_gatetrain = use_gatetrain
+        cfg.use_fullgatetrain = use_fullgatetrain
+        cfg.gatetrain_residency_budget = 4
+        cfg.gatetrain_prefetch_horizon = 1
+        cfg.gatetrain_tile_granularity = 2
+        cfg.gatetrain_offload_to_cpu = False
+        cfg.gatetrain_fallback_on_miss = True
+        cfg.use_learned_residency_head = use_learned_residency_head
+        cfg.residency_head_layers = 1
+        cfg.residency_head_hidden_dim = 32
+        cfg.learned_residency_weight = 0.1
+        cfg.use_residency_with_reinforcement = use_residency_with_reinforcement
+        cfg.use_contrastive_routing = use_contrastive_routing
+        cfg.contrastive_routing_weight = 0.1
+        cfg.contrastive_routing_temperature = 0.1
+        cfg.contrastive_routing_hard_negatives = False
+        cfg.use_contrastive_routing_signature_neighborhood = use_contrastive_routing_signature_neighborhood
+        cfg.use_contrastive_routing_temporal = use_contrastive_routing_temporal
+        cfg.use_contrastive_routing_residency = use_contrastive_routing_residency
+        cfg.use_contrastive_routing_cross_view = use_contrastive_routing_cross_view
+        cfg.use_contrastive_routing_self_contrast = use_contrastive_routing_self_contrast
+        return cfg
+
+    def _build_small_stability_cfg(self, tokenizer: PrismalTokenizer) -> PrismalWaveConfig:
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 16
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 4
+        cfg.n_slots = 4
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 1
+        cfg.top_k_slots = 1
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 8
+        cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
+        cfg.use_hmote = False
+        cfg.use_recursive_hmoe = False
+        cfg.use_signature_lattice_attention = False
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 16
+        cfg.training_finite_guard_enabled = True
+        cfg.inference_finite_guard_enabled = True
+        cfg.grad_clip_muon = 0.5
+        cfg.grad_clip_scalar = 0.75
+        cfg.grad_clip_rowwise = 0.6
+        return cfg
+
     def test_tokenizer_roundtrip(self) -> None:
         tokenizer = PrismalTokenizer()
         text = "Hello world."
@@ -42,6 +158,45 @@ class SmokeTests(unittest.TestCase):
         }
         self.assertEqual(len(lengths), 1)
         self.assertTrue(any(tokenizer.token_kind_by_id.get(token_id) == "byte" for token_id in bundle.token_ids))
+
+    def test_pretokenized_bootstrap_uses_bundle_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source.jsonl"
+            source.write_text("{}", encoding="utf-8")
+            meta_path = root / "meta.json"
+            meta_path.write_text(
+                "{\"source\": \"%s\", \"vocab_size\": 12345}" % source.as_posix(),
+                encoding="utf-8",
+            )
+
+            (
+                tokenizer_source,
+                tokenizer_max_source_samples,
+                tokenizer_max_new_tokens,
+                tokenizer_min_frequency,
+                tokenizer_max_line_tokens,
+                tokenizer_max_signature_tokens,
+                tokenizer_supervised_only,
+                meta_vocab_size,
+            ) = _resolve_tokenizer_bootstrap(
+                root,
+                max_source_samples=99,
+                max_new_tokens=77,
+                min_frequency=9,
+                max_line_tokens=11,
+                max_signature_tokens=13,
+                supervised_only=False,
+            )
+
+            self.assertEqual(Path(tokenizer_source), source)
+            self.assertEqual(tokenizer_max_source_samples, 0)
+            self.assertEqual(tokenizer_max_new_tokens, 0)
+            self.assertEqual(tokenizer_min_frequency, 2)
+            self.assertEqual(tokenizer_max_line_tokens, 0)
+            self.assertEqual(tokenizer_max_signature_tokens, 0)
+            self.assertTrue(tokenizer_supervised_only)
+            self.assertEqual(meta_vocab_size, 12345)
 
     def test_hierarchy_alignment(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -77,6 +232,7 @@ class SmokeTests(unittest.TestCase):
         cfg.use_factorized_embedding = True
         cfg.factorized_embedding_dim = 16
         cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
         cfg.use_hmote = False
         cfg.use_recursive_hmoe = False
         cfg.hierarchical_nest_depth = 2
@@ -109,6 +265,791 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(tuple(output.logits.shape[:2]), tuple(input_ids.shape))
         self.assertEqual(output.logits.shape[-1], cfg.vocab_size)
 
+    def test_gate_config_roundtrip(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=True)
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.use_gate)
+        self.assertEqual(clone.gate_residency_budget, cfg.gate_residency_budget)
+        self.assertEqual(clone.gate_prefetch_horizon, cfg.gate_prefetch_horizon)
+        self.assertEqual(clone.gate_tile_granularity, cfg.gate_tile_granularity)
+        self.assertFalse(clone.gate_offload_to_cpu)
+        self.assertTrue(clone.gate_fallback_on_miss)
+
+    def test_gatetrain_config_roundtrip(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_gatetrain=True)
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.use_gatetrain)
+        self.assertEqual(clone.gatetrain_residency_budget, cfg.gatetrain_residency_budget)
+        self.assertEqual(clone.gatetrain_prefetch_horizon, cfg.gatetrain_prefetch_horizon)
+        self.assertEqual(clone.gatetrain_tile_granularity, cfg.gatetrain_tile_granularity)
+        self.assertFalse(clone.gatetrain_offload_to_cpu)
+        self.assertTrue(clone.gatetrain_fallback_on_miss)
+
+    def test_full_gatetrain_config_roundtrip(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_gatetrain=True, use_fullgatetrain=True)
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.use_fullgatetrain)
+        self.assertTrue(clone.use_gatetrain)
+
+    def test_torus_sharc_router_requires_torus_core(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        cfg.Torus_SHARC_Router = True
+        cfg.use_torus_core = False
+        with self.assertRaises(ValueError):
+            PrismalWaveModel(cfg)
+
+    def test_learned_residency_config_roundtrip(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(
+            tokenizer,
+            use_gate=False,
+            use_learned_residency_head=True,
+            use_residency_with_reinforcement=True,
+        )
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.use_learned_residency_head)
+        self.assertTrue(clone.use_residency_with_reinforcement)
+        self.assertEqual(clone.residency_head_layers, cfg.residency_head_layers)
+        self.assertEqual(clone.residency_head_hidden_dim, cfg.residency_head_hidden_dim)
+        self.assertEqual(clone.learned_residency_weight, cfg.learned_residency_weight)
+
+    def test_learned_residency_head_constructs_when_enabled(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_learned_residency_head=True)
+        model = PrismalWaveModel(cfg)
+        self.assertIsNotNone(model.learned_residency_head)
+        self.assertTrue(model.use_learned_residency_head)
+        self.assertEqual(model.residency_head_layers, 1)
+
+    def test_contrastive_routing_config_roundtrip(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(
+            tokenizer,
+            use_gate=False,
+            use_contrastive_routing=True,
+            use_contrastive_routing_signature_neighborhood=True,
+            use_contrastive_routing_temporal=True,
+            use_contrastive_routing_cross_view=True,
+        )
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.use_contrastive_routing)
+        self.assertTrue(clone.use_contrastive_routing_signature_neighborhood)
+        self.assertTrue(clone.use_contrastive_routing_temporal)
+        self.assertTrue(clone.use_contrastive_routing_cross_view)
+        self.assertFalse(clone.use_contrastive_routing_residency)
+        self.assertFalse(clone.use_contrastive_routing_self_contrast)
+        self.assertEqual(clone.contrastive_routing_weight, cfg.contrastive_routing_weight)
+        self.assertEqual(clone.contrastive_routing_temperature, cfg.contrastive_routing_temperature)
+
+    def test_contrastive_routing_disabled_is_noop(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_contrastive_routing=False)
+        model = PrismalWaveModel(cfg)
+        bundle = tokenizer.encode_hierarchy_bundle("Contrastive routing remains off.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+        output = model(
+            input_ids,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
+        self.assertTrue(torch.isfinite(output.aux_loss))
+        self.assertEqual(float(output.route_stats["contrastive_routing_enabled"].item()), 0.0)
+        self.assertEqual(float(output.route_stats["contrastive_routing_loss"].item()), 0.0)
+
+    def test_contrastive_routing_enabled_emits_losses(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(
+            tokenizer,
+            use_gate=True,
+            use_gatetrain=True,
+            use_learned_residency_head=True,
+            use_contrastive_routing=True,
+            use_contrastive_routing_signature_neighborhood=True,
+            use_contrastive_routing_temporal=True,
+            use_contrastive_routing_residency=True,
+            use_contrastive_routing_cross_view=True,
+            use_contrastive_routing_self_contrast=True,
+        )
+        cfg.n_paths = 2
+        cfg.hierarchical_nest_depth = 1
+        model = PrismalWaveModel(cfg)
+        bundle = tokenizer.encode_hierarchy_bundle("Contrastive routing should light up.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids, bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids, bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids, bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids, bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids, bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids, bundle.signature_family_ids], dtype=torch.long)
+        output = model(
+            input_ids,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
+        self.assertTrue(torch.isfinite(output.aux_loss))
+        self.assertEqual(float(output.route_stats["contrastive_routing_enabled"].item()), 1.0)
+        self.assertIn("contrastive_routing_signature_neighborhood_loss", output.route_stats)
+        self.assertIn("contrastive_routing_temporal_loss", output.route_stats)
+        self.assertIn("contrastive_routing_residency_loss", output.route_stats)
+        self.assertIn("contrastive_routing_cross_view_loss", output.route_stats)
+        self.assertIn("contrastive_routing_self_contrast_loss", output.route_stats)
+        self.assertTrue(torch.isfinite(output.route_stats["contrastive_routing_loss"]))
+
+    def test_contrastive_routing_cli_flags_parse(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "train",
+            "--data",
+            "demo/corpus",
+            "--save-dir",
+            "tmp/run",
+        ])
+        self.assertFalse(args.use_contrastive_routing)
+        self.assertFalse(args.use_contrastive_routing_signature_neighborhood)
+        args = parser.parse_args([
+            "train",
+            "--data",
+            "demo/corpus",
+            "--save-dir",
+            "tmp/run",
+            "--use-contrastive-routing",
+            "--use-contrastive-routing-temporal",
+            "--use-contrastive-routing-cross-view",
+        ])
+        self.assertTrue(args.use_contrastive_routing)
+        self.assertTrue(args.use_contrastive_routing_temporal)
+        self.assertTrue(args.use_contrastive_routing_cross_view)
+
+    def test_token_superposition_config_roundtrip_and_checkpoint_persistence(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        cfg.use_token_superposition_training = True
+        cfg.token_superposition_bag_size = 8
+        cfg.token_superposition_phase_fraction = 0.25
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.use_token_superposition_training)
+        self.assertEqual(clone.token_superposition_bag_size, cfg.token_superposition_bag_size)
+        self.assertEqual(clone.token_superposition_phase_fraction, cfg.token_superposition_phase_fraction)
+
+        model = PrismalWaveModel(cfg)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_checkpoint(model, tmpdir, config=cfg)
+            saved_cfg = load_config(Path(tmpdir) / "config.json")
+        self.assertTrue(saved_cfg.use_token_superposition_training)
+        self.assertEqual(saved_cfg.token_superposition_bag_size, cfg.token_superposition_bag_size)
+        self.assertEqual(saved_cfg.token_superposition_phase_fraction, cfg.token_superposition_phase_fraction)
+
+    def test_token_superposition_cli_flags_parse(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "train",
+            "--data",
+            "demo/corpus",
+            "--save-dir",
+            "tmp/run",
+        ])
+        self.assertFalse(args.use_token_superposition_training)
+        self.assertEqual(args.token_superposition_bag_size, PrismalWaveConfig().token_superposition_bag_size)
+
+        args = parser.parse_args([
+            "train",
+            "--data",
+            "demo/corpus",
+            "--save-dir",
+            "tmp/run",
+            "--use-token-superposition-training",
+            "--token-superposition-bag-size",
+            "4",
+            "--token-superposition-phase-fraction",
+            "0.4",
+        ])
+        self.assertTrue(args.use_token_superposition_training)
+        self.assertEqual(args.token_superposition_bag_size, 4)
+        self.assertAlmostEqual(args.token_superposition_phase_fraction, 0.4)
+
+    def test_token_superposition_phase_schedule_is_resume_safe(self) -> None:
+        cfg = PrismalWaveConfig(
+            use_token_superposition_training=True,
+            token_superposition_bag_size=8,
+            token_superposition_phase_fraction=0.5,
+        )
+        self.assertTrue(
+            _token_superposition_phase_active(
+                cfg,
+                resume_global_step=2,
+                optimizer_step=0,
+                scheduler_total_steps=8,
+            )
+        )
+        self.assertFalse(
+            _token_superposition_phase_active(
+                cfg,
+                resume_global_step=2,
+                optimizer_step=3,
+                scheduler_total_steps=8,
+            )
+        )
+        self.assertFalse(
+            _token_superposition_phase_active(
+                PrismalWaveConfig(use_token_superposition_training=False),
+                resume_global_step=0,
+                optimizer_step=0,
+                scheduler_total_steps=8,
+            )
+        )
+
+    def test_token_superposition_compute_loss_bags_odd_length_batches(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        cfg.use_token_superposition_training = True
+        cfg.token_superposition_bag_size = 3
+        cfg.token_superposition_phase_fraction = 1.0
+        model = PrismalWaveModel(cfg)
+        model.train()
+
+        bundle = tokenizer.encode_hierarchy_bundle("Token superposition smoke test.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+
+        pad_id = tokenizer.pad_id
+        target_len = input_ids.size(1) + (1 if input_ids.size(1) % 2 == 0 else 2)
+        pad_width = target_len - input_ids.size(1)
+        if pad_width > 0:
+            pad_tokens = torch.full((1, pad_width), pad_id, dtype=torch.long)
+            pad_mask = torch.zeros((1, pad_width), dtype=torch.float32)
+            input_ids = torch.cat([input_ids, pad_tokens], dim=1)
+            signature_ids = torch.cat([signature_ids, torch.zeros_like(pad_tokens)], dim=1)
+            signature_level_ids = torch.cat([signature_level_ids, torch.zeros_like(pad_tokens)], dim=1)
+            signature_relation_ids = torch.cat([signature_relation_ids, torch.zeros_like(pad_tokens)], dim=1)
+            parent_signature_ids = torch.cat([parent_signature_ids, torch.zeros_like(pad_tokens)], dim=1)
+            signature_family_ids = torch.cat([signature_family_ids, torch.zeros_like(pad_tokens)], dim=1)
+            loss_mask = torch.cat([torch.ones((1, input_ids.size(1) - pad_width), dtype=torch.float32), pad_mask], dim=1)
+        else:
+            loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+
+        labels = input_ids.clone()
+        loss, output = model.compute_loss(
+            input_ids,
+            labels,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+            signature_family_ids=signature_family_ids,
+            loss_mask=loss_mask,
+            superposition_bag_size=3,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        expected_bag_count = math.ceil(input_ids.size(1) / 3)
+        self.assertEqual(tuple(output.logits.shape[:2]), (1, expected_bag_count))
+        self.assertEqual(float(output.route_stats["token_superposition_active"].item()), 1.0)
+        self.assertEqual(int(output.route_stats["token_superposition_bag_size"].item()), 3)
+        self.assertEqual(int(output.route_stats["token_superposition_bag_count"].item()), expected_bag_count)
+
+    def test_stability_config_roundtrip_and_checkpoint_persistence(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.training_finite_guard_enabled)
+        self.assertTrue(clone.inference_finite_guard_enabled)
+        self.assertEqual(clone.grad_clip_muon, cfg.grad_clip_muon)
+        self.assertEqual(clone.grad_clip_scalar, cfg.grad_clip_scalar)
+        self.assertEqual(clone.grad_clip_rowwise, cfg.grad_clip_rowwise)
+
+        model = PrismalWaveModel(cfg)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_checkpoint(model, tmpdir, config=cfg)
+            saved_cfg = load_config(Path(tmpdir) / "config.json")
+        self.assertTrue(saved_cfg.training_finite_guard_enabled)
+        self.assertTrue(saved_cfg.inference_finite_guard_enabled)
+        self.assertEqual(saved_cfg.grad_clip_muon, cfg.grad_clip_muon)
+        self.assertEqual(saved_cfg.grad_clip_scalar, cfg.grad_clip_scalar)
+        self.assertEqual(saved_cfg.grad_clip_rowwise, cfg.grad_clip_rowwise)
+
+    def test_torus_checkpoint_without_router_weights_loads(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_gatetrain=True, use_fullgatetrain=True, use_hmote=True, use_torus_core=True)
+        model = PrismalWaveModel(cfg)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_checkpoint(model, tmpdir, config=cfg)
+            checkpoint_path = Path(tmpdir) / "model.pt"
+            payload = torch.load(checkpoint_path, map_location="cpu")
+            payload["model_state"] = {
+                key: value for key, value in payload["model_state"].items() if not key.startswith("router.")
+            }
+            torch.save(payload, checkpoint_path)
+            loaded = load_model_from_checkpoint(checkpoint_path, device="cpu")
+
+        self.assertTrue(loaded.use_torus_core)
+        self.assertIsNotNone(loaded.router)
+
+    def test_gate_disabled_matches_baseline_logits(self) -> None:
+        tokenizer = PrismalTokenizer()
+        torch.manual_seed(1234)
+        baseline_cfg = self._build_gate_cfg(tokenizer, use_gate=False)
+        gated_cfg = self._build_gate_cfg(tokenizer, use_gate=True)
+        base_model = PrismalWaveModel(baseline_cfg)
+        gated_model = PrismalWaveModel(gated_cfg)
+        gated_model.load_state_dict(base_model.state_dict(), strict=False)
+        base_model.eval()
+        gated_model.eval()
+        bundle = tokenizer.encode_hierarchy_bundle("Gate parity check.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+
+        base_output = base_model(
+            input_ids,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
+        gated_output = gated_model(
+            input_ids,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
+
+        torch.testing.assert_close(gated_output.logits, base_output.logits, rtol=0.0, atol=0.0)
+        self.assertIn("gate_predicted_tiles", gated_output.route_stats)
+
+    def test_gate_planner_selects_expected_tiles(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=True, use_hmote=True)
+        model = PrismalWaveModel(cfg)
+        self.assertIsNotNone(model.gate_controller)
+        assert model.gate_controller is not None
+
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        signature_family_ids = torch.tensor([[1, 2]], dtype=torch.long)
+        route_stats = {
+            "selected_path_index": torch.tensor([3], dtype=torch.long),
+            "emitter_top_idx": torch.tensor([[[1, 7]]], dtype=torch.long),
+            "signature_agreement": torch.tensor(0.92),
+            "avg_entropy": torch.tensor(0.25),
+        }
+
+        plan = model.gate_controller.plan(
+            input_ids=input_ids,
+            signature_family_ids=signature_family_ids,
+            route_stats=route_stats,
+            path_index=3,
+            position_index=0,
+        )
+
+        self.assertEqual(plan.family_ids, (1, 2))
+        self.assertEqual(plan.expert_ids, (3,))
+        self.assertEqual(plan.emitter_tile_ids, (1, 2, 0, 3))
+        self.assertFalse(plan.signature_lattice_hot)
+        self.assertFalse(plan.token_memory_hot)
+        self.assertGreater(plan.confidence, 0.0)
+
+    def test_gate_planner_blends_learned_tiles(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=True, use_learned_residency_head=True, use_hmote=True)
+        cfg.gate_residency_budget = 6
+        model = PrismalWaveModel(cfg)
+        assert model.gate_controller is not None
+        route_stats = {
+            "selected_path_index": torch.tensor([3], dtype=torch.long),
+            "emitter_top_idx": torch.tensor([[[1, 7]]], dtype=torch.long),
+            "learned_residency_top_tiles": torch.tensor([[4, 5]], dtype=torch.long),
+            "learned_residency_confidence": torch.tensor([0.91]),
+            "signature_agreement": torch.tensor(0.92),
+            "avg_entropy": torch.tensor(0.25),
+        }
+        plan = model.gate_controller.plan(
+            input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+            signature_family_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            route_stats=route_stats,
+            path_index=3,
+            position_index=0,
+        )
+        self.assertIn(4, plan.emitter_tile_ids)
+        self.assertIn(5, plan.emitter_tile_ids)
+        self.assertGreaterEqual(plan.confidence, 0.91)
+
+    def test_gatetrain_planner_selects_expected_tiles(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_gatetrain=True, use_hmote=True)
+        model = PrismalWaveModel(cfg)
+        self.assertIsNotNone(model.gatetrain_controller)
+        assert model.gatetrain_controller is not None
+
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        signature_family_ids = torch.tensor([[2, 3]], dtype=torch.long)
+        route_stats = {
+            "selected_path_index": torch.tensor([5], dtype=torch.long),
+            "emitter_top_idx": torch.tensor([[[2, 9]]], dtype=torch.long),
+            "signature_agreement": torch.tensor(0.88),
+            "avg_entropy": torch.tensor(0.33),
+        }
+
+        plan = model.gatetrain_controller.plan(
+            input_ids=input_ids,
+            signature_family_ids=signature_family_ids,
+            route_stats=route_stats,
+            path_index=5,
+            position_index=0,
+        )
+        record = model.gatetrain_controller.record(route_stats, plan=plan)
+        expert_count = len(getattr(getattr(model, "token_hierarchy", None), "experts", [])) or 1
+
+        self.assertEqual(plan.family_ids, (2, 3))
+        self.assertEqual(plan.expert_ids, (5 % expert_count,))
+        self.assertEqual(plan.emitter_tile_ids, (2, 3, 1, 4))
+        self.assertIn("gatetrain_predicted_tiles", record)
+        self.assertIn("gatetrain_batch_hit", record)
+        self.assertIn("gatetrain_batch_miss", record)
+
+    def test_learned_residency_training_option_a(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_gatetrain=True, use_learned_residency_head=True, use_hmote=True)
+        model = PrismalWaveModel(cfg)
+        model.train()
+        bundle = tokenizer.encode_hierarchy_bundle("Training gate residency smoke.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        labels = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+
+        loss, output = model.compute_loss(
+            input_ids,
+            labels,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+            signature_family_ids=signature_family_ids,
+            loss_mask=loss_mask,
+        )
+
+        self.assertTrue(torch.is_tensor(loss))
+        self.assertIn("learned_residency_loss", output.route_stats)
+        self.assertIn("learned_residency_top_tiles", output.route_stats)
+        self.assertEqual(float(output.route_stats["learned_residency_mode"].item()), 0.0)
+        self.assertGreaterEqual(float(output.route_stats["learned_residency_loss"].item()), 0.0)
+
+    def test_learned_residency_training_option_b(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(
+            tokenizer,
+            use_gate=False,
+            use_gatetrain=True,
+            use_learned_residency_head=True,
+            use_residency_with_reinforcement=True,
+            use_hmote=True,
+        )
+        model = PrismalWaveModel(cfg)
+        model.train()
+        bundle = tokenizer.encode_hierarchy_bundle("Training gate residency smoke.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        labels = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+
+        loss, output = model.compute_loss(
+            input_ids,
+            labels,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+            signature_family_ids=signature_family_ids,
+            loss_mask=loss_mask,
+        )
+
+        self.assertTrue(torch.is_tensor(loss))
+        self.assertEqual(float(output.route_stats["learned_residency_mode"].item()), 1.0)
+        self.assertIn("learned_residency_reward", output.route_stats)
+        self.assertIn("learned_residency_loss", output.route_stats)
+
+    def test_full_gatetrain_planner_residents_all_routed_banks(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_gatetrain=True, use_fullgatetrain=True, use_hmote=True)
+        model = PrismalWaveModel(cfg)
+        assert model.gatetrain_controller is not None
+        controller = model.gatetrain_controller
+        plan = controller.plan(
+            input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+            signature_family_ids=torch.tensor([[2, 3]], dtype=torch.long),
+            route_stats={
+                "selected_path_index": torch.tensor([5], dtype=torch.long),
+                "emitter_top_idx": torch.tensor([[[2, 9]]], dtype=torch.long),
+                "signature_agreement": torch.tensor(0.88),
+                "avg_entropy": torch.tensor(0.33),
+            },
+            path_index=5,
+            position_index=0,
+        )
+        record = controller.record(
+            {
+                "selected_path_index": torch.tensor([5], dtype=torch.long),
+                "emitter_top_idx": torch.tensor([[[2, 9]]], dtype=torch.long),
+                "signature_agreement": torch.tensor(0.88),
+                "avg_entropy": torch.tensor(0.33),
+            },
+            plan=plan,
+        )
+        family_count = len(getattr(model, "family_specialists", []))
+        expert_count = len(getattr(getattr(model, "token_hierarchy", None), "experts", []))
+        self.assertTrue(plan.full_scope)
+        self.assertEqual(plan.family_ids, tuple(range(family_count)))
+        self.assertEqual(plan.expert_ids, tuple(range(expert_count)))
+        self.assertIn("gatetrain_full_scope", record)
+        self.assertIn("gatetrain_router_hot", record)
+        self.assertIn("gatetrain_torus_hot", record)
+
+    def test_full_gatetrain_planner_counts_tiles_without_router(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(
+            tokenizer,
+            use_gate=False,
+            use_gatetrain=True,
+            use_fullgatetrain=True,
+            use_hmote=True,
+            use_torus_core=True,
+        )
+        cfg.Torus_SHARC_Router = False
+        model = PrismalWaveModel(cfg)
+        assert model.gatetrain_controller is not None
+        controller = model.gatetrain_controller
+
+        plan = controller.plan(
+            input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+            signature_family_ids=torch.tensor([[2, 3]], dtype=torch.long),
+            route_stats={
+                "selected_path_index": torch.tensor([5], dtype=torch.long),
+                "emitter_top_idx": torch.tensor([[[2, 9]]], dtype=torch.long),
+                "signature_agreement": torch.tensor(0.88),
+                "avg_entropy": torch.tensor(0.33),
+            },
+            path_index=5,
+            position_index=0,
+        )
+        record = controller.record(
+            {
+                "selected_path_index": torch.tensor([5], dtype=torch.long),
+                "emitter_top_idx": torch.tensor([[[2, 9]]], dtype=torch.long),
+                "signature_agreement": torch.tensor(0.88),
+                "avg_entropy": torch.tensor(0.33),
+            },
+            plan=plan,
+        )
+
+        self.assertTrue(plan.full_scope)
+        self.assertGreater(plan.predicted_tiles, 0)
+        self.assertGreater(float(record["gatetrain_predicted_tiles"].item()), 0.0)
+        self.assertEqual(float(record["gatetrain_hit_count"].item()), 1.0)
+        self.assertEqual(float(record["gatetrain_batch_hit"].item()), 1.0)
+        self.assertEqual(float(record["gatetrain_batch_miss"].item()), 0.0)
+
+    def test_full_gatetrain_planner_counts_tiles_with_torus_router(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(
+            tokenizer,
+            use_gate=False,
+            use_gatetrain=True,
+            use_fullgatetrain=True,
+            use_hmote=True,
+            use_torus_core=True,
+        )
+        model = PrismalWaveModel(cfg)
+        assert model.gatetrain_controller is not None
+        self.assertIsNotNone(model.router)
+        controller = model.gatetrain_controller
+
+        plan = controller.plan(
+            input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+            signature_family_ids=torch.tensor([[2, 3]], dtype=torch.long),
+            route_stats={
+                "selected_path_index": torch.tensor([5], dtype=torch.long),
+                "emitter_top_idx": torch.tensor([[[2, 9]]], dtype=torch.long),
+                "signature_agreement": torch.tensor(0.88),
+                "avg_entropy": torch.tensor(0.33),
+            },
+            path_index=5,
+            position_index=0,
+        )
+        record = controller.record(
+            {
+                "selected_path_index": torch.tensor([5], dtype=torch.long),
+                "emitter_top_idx": torch.tensor([[[2, 9]]], dtype=torch.long),
+                "signature_agreement": torch.tensor(0.88),
+                "avg_entropy": torch.tensor(0.33),
+            },
+            plan=plan,
+        )
+
+        self.assertTrue(plan.full_scope)
+        self.assertGreater(plan.predicted_tiles, 0)
+        self.assertGreater(float(record["gatetrain_predicted_tiles"].item()), 0.0)
+        self.assertEqual(float(record["gatetrain_hit_count"].item()), 1.0)
+        self.assertEqual(float(record["gatetrain_batch_hit"].item()), 1.0)
+        self.assertEqual(float(record["gatetrain_batch_miss"].item()), 0.0)
+
+    def test_gatetrain_training_records_residency_metrics(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False, use_gatetrain=True)
+        model = PrismalWaveModel(cfg)
+        model.train()
+        bundle = tokenizer.encode_hierarchy_bundle("Training gate residency smoke.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        labels = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+
+        loss, output = model.compute_loss(
+            input_ids,
+            labels,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+            signature_family_ids=signature_family_ids,
+            loss_mask=loss_mask,
+        )
+
+        self.assertTrue(torch.is_tensor(loss))
+        self.assertIn("gatetrain_predicted_tiles", output.route_stats)
+        self.assertIn("gatetrain_batch_hit", output.route_stats)
+        self.assertIn("gatetrain_batch_miss", output.route_stats)
+        self.assertGreaterEqual(float(output.route_stats["gatetrain_predicted_tiles"].item()), 0.0)
+        self.assertGreaterEqual(float(output.route_stats["gatetrain_confidence"].item()), 0.0)
+
+    def test_gatetrain_train_model_surfaces_metrics(self) -> None:
+        class DummyDataset(torch.utils.data.Dataset):
+            def __len__(self) -> int:
+                return 4
+
+            def __getitem__(self, index: int):
+                value = torch.tensor([index], dtype=torch.long)
+                mask = torch.tensor([1.0], dtype=torch.float32)
+                return value, value, value, value, value, value, value, mask
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+                self.cfg = PrismalWaveConfig(use_gatetrain=True)
+                self.cfg.use_fullgatetrain = True
+                self.cfg.use_gradient_accumulation = True
+                self.cfg.gradient_accumulation_steps = 2
+                self.precision_policy = None
+                self.use_turbo_quantization = False
+
+            def set_capacity_growth_locked(self, locked: bool) -> None:
+                return None
+
+            def configure_precision(self, *args, **kwargs) -> None:
+                return None
+
+            def compute_loss(self, *args, **kwargs):
+                loss = (self.weight - 2.0).pow(2)
+                value = self.weight.detach().new_tensor(0.5)
+                route_stats = {
+                    "signature_agreement": value.unsqueeze(0),
+                    "avg_entropy": value,
+                    "avg_active_emitters": value,
+                    "avg_emitter_cell_soft_occupancy": value,
+                    "emitter_cell_breadth": value,
+                    "avg_emitter_cell_soft_breadth": value,
+                    "family_specialist_active_count": value,
+                    "family_specialist_unique_families": value,
+                    "family_specialist_bank_size": value,
+                    "family_specialist_capacity": value,
+                    "family_specialist_budget": value,
+                    "family_specialist_hit_rate": value,
+                    "family_specialist_gate_mean": value,
+                    "avg_emitter_topk_effective_count": value,
+                    "torus_coverage_loss": value,
+                    "emitter_usage_entropy": value,
+                    "emitter_usage_concentration": value,
+                    "gatetrain_hit_count": value,
+                    "gatetrain_miss_count": value,
+                    "gatetrain_tile_churn": value,
+                    "gatetrain_predicted_tiles": value,
+                    "gatetrain_confidence": value,
+                    "gatetrain_latency_saved_ms": value,
+                    "gatetrain_plan_time_ms": value,
+                    "gatetrain_lead_time_ms": value,
+                    "gatetrain_full_scope": value,
+                    "gatetrain_batch_hit": value,
+                    "gatetrain_batch_miss": value.new_tensor(0.0),
+                }
+                return loss, SimpleNamespace(ce_loss=loss.detach(), aux_loss=value, route_stats=route_stats)
+
+        dataset = DummyDataset()
+        loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+        model = DummyModel()
+
+        metrics = train_model(
+            model,
+            loader,
+            torch.device("cpu"),
+            cfg=model.cfg,
+            optimizer_name="adamw",
+            epochs=1,
+            steps=0,
+            lr=1e-3,
+            grad_clip=0.0,
+            progress=False,
+            val_loader=None,
+            diagnostic_interval=999,
+            use_amp=False,
+        )
+
+        self.assertIn("avg_gatetrain_confidence", metrics)
+        self.assertIn("avg_gatetrain_predicted_tiles", metrics)
+        self.assertIn("gatetrain_hit_rate", metrics)
+        self.assertIn("avg_gatetrain_full_scope", metrics)
+
     def test_emitter_router_respects_hierarchy_ids(self) -> None:
         tokenizer = PrismalTokenizer()
         cfg = PrismalWaveConfig()
@@ -129,6 +1070,7 @@ class SmokeTests(unittest.TestCase):
         cfg.use_factorized_embedding = True
         cfg.factorized_embedding_dim = 8
         cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
         cfg.use_hmote = False
         cfg.use_recursive_hmoe = False
         cfg.use_signature_lattice_attention = False
@@ -246,6 +1188,7 @@ class SmokeTests(unittest.TestCase):
         cfg.use_factorized_embedding = True
         cfg.factorized_embedding_dim = 8
         cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
         cfg.use_hmote = False
         cfg.use_recursive_hmoe = False
         cfg.use_signature_lattice_attention = False
@@ -300,6 +1243,7 @@ class SmokeTests(unittest.TestCase):
         cfg.use_factorized_embedding = True
         cfg.factorized_embedding_dim = 8
         cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
         cfg.use_hmote = False
         cfg.use_recursive_hmoe = False
         cfg.use_signature_lattice_attention = False
@@ -654,6 +1598,7 @@ class SmokeTests(unittest.TestCase):
         cfg.use_factorized_embedding = True
         cfg.factorized_embedding_dim = 16
         cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
         cfg.use_hmote = False
         cfg.use_recursive_hmoe = False
         cfg.hierarchical_nest_depth = 2
@@ -690,6 +1635,7 @@ class SmokeTests(unittest.TestCase):
         cfg.use_factorized_embedding = True
         cfg.factorized_embedding_dim = 16
         cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
         cfg.use_hmote = False
         cfg.use_recursive_hmoe = False
         cfg.use_signature_lattice_attention = False
@@ -820,6 +1766,161 @@ class SmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(step_calls["count"], 2)
+
+    def test_per_group_gradient_clipping_uses_group_caps(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        muon_param = torch.nn.Parameter(torch.ones(2, 2))
+        scalar_param = torch.nn.Parameter(torch.ones(4))
+        rowwise_param = torch.nn.Parameter(torch.ones(2, 3))
+        optimizer = torch.optim.SGD(
+            [
+                {"params": [muon_param], "use_muon": True, "parameter_role": "matrix", "update_rule": "muon", "lr": 1.0},
+                {"params": [scalar_param], "parameter_role": "scalar", "update_rule": "adamw", "lr": 1.0},
+                {"params": [rowwise_param], "parameter_role": "table", "update_rule": "rowwise", "lr": 1.0},
+            ],
+            lr=1.0,
+        )
+        muon_param.grad = torch.full_like(muon_param, 10.0)
+        scalar_param.grad = torch.full_like(scalar_param, 10.0)
+        rowwise_param.grad = torch.full_like(rowwise_param, 10.0)
+
+        clipped_groups, total_norm = _clip_optimizer_group_gradients(optimizer, cfg, fallback_grad_clip=0.0)
+
+        self.assertEqual(clipped_groups, 3)
+        self.assertTrue(math.isfinite(total_norm))
+        self.assertLessEqual(float(muon_param.grad.norm().item()), cfg.grad_clip_muon + 1e-5)
+        self.assertLessEqual(float(scalar_param.grad.norm().item()), cfg.grad_clip_scalar + 1e-5)
+        self.assertLessEqual(float(rowwise_param.grad.norm().item()), cfg.grad_clip_rowwise + 1e-5)
+
+    def test_train_model_skips_nan_loss_batch_and_recovers(self) -> None:
+        class DummyDataset(torch.utils.data.Dataset):
+            def __len__(self) -> int:
+                return 2
+
+            def __getitem__(self, index: int):
+                value = torch.tensor([index], dtype=torch.long)
+                mask = torch.tensor([1.0], dtype=torch.float32)
+                return value, value, value, value, value, value, value, mask
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+                self.cfg = PrismalWaveConfig()
+                self.cfg.use_gradient_accumulation = True
+                self.cfg.gradient_accumulation_steps = 2
+                self.cfg.training_finite_guard_enabled = True
+                self.cfg.inference_finite_guard_enabled = True
+                self.precision_policy = None
+                self.use_turbo_quantization = False
+                self._calls = 0
+
+            def set_capacity_growth_locked(self, locked: bool) -> None:
+                return None
+
+            def configure_precision(self, *args, **kwargs) -> None:
+                return None
+
+            def compute_loss(self, *args, **kwargs):
+                self._calls += 1
+                value = self.weight.detach().new_tensor(0.5)
+                if self._calls == 1:
+                    loss = self.weight * torch.tensor(float("nan"), device=self.weight.device)
+                else:
+                    loss = (self.weight - 2.0).pow(2)
+                route_stats = {
+                    "signature_agreement": value.unsqueeze(0),
+                    "avg_entropy": value,
+                    "avg_active_emitters": value,
+                    "avg_emitter_cell_soft_occupancy": value,
+                    "emitter_cell_breadth": value,
+                    "avg_emitter_cell_soft_breadth": value,
+                    "family_specialist_active_count": value,
+                    "family_specialist_unique_families": value,
+                    "family_specialist_bank_size": value,
+                    "family_specialist_capacity": value,
+                    "family_specialist_budget": value,
+                    "family_specialist_hit_rate": value,
+                    "family_specialist_gate_mean": value,
+                    "avg_emitter_topk_effective_count": value,
+                    "torus_coverage_loss": value,
+                    "emitter_usage_entropy": value,
+                    "emitter_usage_concentration": value,
+                    "stability_nonfinite_repair_count": value.new_tensor(0.0),
+                }
+                return loss, SimpleNamespace(ce_loss=loss.detach(), aux_loss=value, route_stats=route_stats)
+
+        dataset = DummyDataset()
+        loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+        model = DummyModel()
+
+        metrics = train_model(
+            model,
+            loader,
+            torch.device("cpu"),
+            cfg=model.cfg,
+            optimizer_name="adamw",
+            epochs=1,
+            steps=0,
+            lr=1e-3,
+            grad_clip=0.0,
+            progress=False,
+            val_loader=None,
+            diagnostic_interval=999,
+            use_amp=False,
+        )
+
+        self.assertEqual(metrics["stability_nonfinite_loss_batches"], 1.0)
+        self.assertGreaterEqual(metrics["stability_skipped_optimizer_steps"], 1.0)
+        self.assertTrue(math.isfinite(model.weight.item()))
+        self.assertNotEqual(model.weight.item(), 1.0)
+
+    def test_generation_guard_recovers_from_nan_logits(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        model = PrismalWaveModel(cfg)
+        model.eval()
+        bundle = tokenizer.encode_hierarchy_bundle("Guard the decoder.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+
+        original_forward = model.forward
+
+        def noisy_forward(*args, **kwargs):
+            output = original_forward(*args, **kwargs)
+            output.logits = torch.full_like(output.logits, float("nan"))
+            return output
+
+        model.forward = noisy_forward  # type: ignore[assignment]
+        generated = model.generate(
+            input_ids,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+            max_new_tokens=2,
+            min_new_tokens=1,
+            top_k=0,
+            top_p=1.0,
+            temperature=1.0,
+            repetition_penalty=1.0,
+            beam_size=1,
+            use_speculative_decoding=False,
+            token_signature_lookup=tokenizer.signature_lookup_by_token_id(),
+            token_family_lookup=tokenizer.signature_family_lookup_by_token_id(),
+            token_level_lookup=tokenizer.signature_level_lookup_by_token_id(),
+            token_relation_lookup=tokenizer.signature_relation_lookup_by_token_id(),
+            suppressed_token_ids=tokenizer.generation_suppressed_token_ids(),
+        )
+
+        self.assertGreater(generated.size(1), input_ids.size(1))
+        self.assertTrue(torch.isfinite(generated.float()).all())
 
 
 if __name__ == "__main__":

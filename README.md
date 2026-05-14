@@ -1,6 +1,27 @@
-# EPIC-SHARC MOHTE v0.1.2 - Updated resuable emitter branch at https://github.com/DjDevilCloud/EPIC-SHARC-MOHTE/tree/ESM-v0.1.2
+# EPIC-SHARC MOHTE v0.2.1 
 
-Emitter Prismal Instructional Core with Signature-Hierarchy Attention Routing Cache + Mixture of Hierarchical Toroidal Experts.
+v0.2.1 Update added:
+
+EPIC-SHARC MOHTE GATE
+
+Guided Activations Through Emitters
+A predictive parameter residency controller that uses:
+
+Signature state
+Family/level/relation hierarchy
+Path/lane routing state
+Recent emitter usage
+Lattice cache contents
+
+to predict which parameter tiles should be present on GPU for the next token, next chunk, or next path segment.
+
+Not single weights.
+Not even single emitter rows at first.
+Tiles.
+
+## Definition
+
+Emitter Prismal Instructional Core with Signature-Hierarchy Attention Routing Cache + Mixture of Hierarchical Toroidal Experts + Guided Activations Through Emitters.
 
 This repository contains the EPIC-SHARC MOHTE standalone implementation of the routing, memory, and toroidal expert components.
 A tiny demo corpus is bundled at [`demo/corpus/tiny_example.txt`](./demo/corpus/tiny_example.txt) so the quickstart runs out of the box. For real work, choose your own text, JSONL, Parquet, or Markdown corpus in the UI or pass it on the command line.
@@ -65,6 +86,7 @@ Key defaults:
 - `use_factorized_embedding = true`
 - `use_turbo_quantization = false`
 - `use_torus_core = true`
+- `Torus_SHARC_Router = true`
 - `use_hmote = true`
 - `use_recursive_hmoe = true`
 - `use_signature_lattice_attention = true`
@@ -113,6 +135,18 @@ python cli.py infer --checkpoint checkpoints/tiny/model.pt --prompt "Explain the
 ```
 
 Expected result: a short training log, a saved checkpoint under `checkpoints/tiny/`, and a brief generated response from the prompt.
+
+## Tiny Matrix Runs
+
+For quick routing-stability tests, use [`tiny_training_matrix.py`](./tiny_training_matrix.py):
+
+```bash
+python tiny_training_matrix.py screen
+python tiny_training_matrix.py confirm --from-summary checkpoints/tiny_training_matrix/<timestamp>/screen_summary.json --top 2
+python tiny_training_matrix.py followup --checkpoints checkpoints/tiny_training_matrix/<timestamp>/confirm/<dataset>/<variant> --benchmark-data pretokenized/DictWords_synthetic_sentences
+```
+
+The script keeps the optimizer and precision stack fixed, varies only the torus/routing knobs, and writes per-run summaries with validation loss plus routing metrics.
 
 ## Input Format
 
