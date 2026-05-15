@@ -3,6 +3,8 @@ import unittest
 import tempfile
 import math
 import sys
+import re
+from collections import Counter
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
@@ -16,10 +18,11 @@ if str(ROOT) not in sys.path:
 
 from config import PrismalWaveConfig
 from config import load_config
-from cli import build_parser, _resolve_tokenizer_bootstrap
-from data import PrismalTokenizer
-from model import PrismalWaveModel
-from train import build_train_val_dataloaders, load_model_from_checkpoint, save_checkpoint, train_model, _clip_optimizer_group_gradients, _token_superposition_phase_active
+from cli import build_parser, _build_config, _resolve_tokenizer_bootstrap
+from data import PrismalTokenizer, iter_text_corpus
+from model import PrismalTorusCore, PrismalWaveModel
+from muon_optim import PrecisionAdaptiveHierarchicalOptimizer
+from train import build_train_val_dataloaders, generate_text, load_model_from_checkpoint, save_checkpoint, train_model, _clip_optimizer_group_gradients, _token_superposition_phase_active
 
 
 class SmokeTests(unittest.TestCase):
@@ -305,6 +308,87 @@ class SmokeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PrismalWaveModel(cfg)
 
+    def test_torus_patch_linear_indices_match_legacy_gather_and_scatter(self) -> None:
+        cfg = PrismalWaveConfig()
+        cfg.d_model = 8
+        cfg.n_paths = 1
+        cfg.torus_depth = 4
+        cfg.torus_height = 5
+        cfg.torus_width = 6
+        cfg.torus_local_field_radius = 1
+        cfg.torus_scout_read_radius = 1
+        cfg.torus_relay_write_radius = 1
+        cfg.torus_transport_interval = 3
+        core = PrismalTorusCore(cfg)
+
+        batch_size = 2
+        field_dim = 4
+        field = torch.randn(batch_size, core.depth, core.height, core.width, field_dim)
+        center_z = torch.tensor([0, core.depth - 1], dtype=torch.long)
+        center_y = torch.tensor([1, 0], dtype=torch.long)
+        center_x = torch.tensor([2, core.width - 1], dtype=torch.long)
+        patch_idx = core._patch_linear_indices(center_z, center_y, center_x, core.local_offsets)
+
+        gathered_linear = core._gather_patch_from_linear_idx(field, patch_idx)
+        gathered_legacy = core._gather_patch(field, center_z, center_y, center_x, core.local_field_radius)
+        self.assertTrue(torch.allclose(gathered_linear, gathered_legacy))
+
+        update = torch.randn(batch_size, patch_idx.size(1), field_dim)
+        linear_field = field.clone().reshape(batch_size, -1, field_dim)
+        linear_field.scatter_add_(1, patch_idx.unsqueeze(-1).expand(-1, -1, field_dim), update)
+        linear_field = linear_field.view(batch_size, core.depth, core.height, core.width, field_dim)
+
+        offsets = core.local_offsets.to(field.device)
+        zz = torch.remainder(center_z.unsqueeze(1) + offsets[:, 0].view(1, -1), core.depth)
+        yy = torch.remainder(center_y.unsqueeze(1) + offsets[:, 1].view(1, -1), core.height)
+        xx = torch.remainder(center_x.unsqueeze(1) + offsets[:, 2].view(1, -1), core.width)
+        legacy_idx = (zz * (core.height * core.width) + yy * core.width + xx).unsqueeze(-1)
+        legacy_field = field.clone().reshape(batch_size, -1, field_dim)
+        legacy_field.scatter_add_(1, legacy_idx.expand(-1, -1, field_dim), update)
+        legacy_field = legacy_field.view(batch_size, core.depth, core.height, core.width, field_dim)
+
+        self.assertTrue(torch.allclose(linear_field, legacy_field))
+
+    def test_torus_chunked_step_returns_direct_stats_for_single_step_chunk(self) -> None:
+        cfg = PrismalWaveConfig()
+        cfg.d_model = 8
+        cfg.n_paths = 1
+        cfg.torus_depth = 4
+        cfg.torus_height = 5
+        cfg.torus_width = 6
+        cfg.torus_local_field_radius = 1
+        cfg.torus_scout_read_radius = 1
+        cfg.torus_relay_write_radius = 1
+        cfg.torus_transport_interval = 3
+        core = PrismalTorusCore(cfg)
+
+        hidden_chunk = torch.randn(1, 2, cfg.d_model)
+        field_state = torch.zeros(1, core.depth, core.height, core.width, cfg.d_model)
+        step_output = torch.randn(1, cfg.d_model)
+        step_stats = {
+            "torus_entropy": torch.tensor(1.25),
+            "recursive_depth": torch.tensor(3.0),
+            "recursive_aux_loss": torch.tensor(0.5),
+            "recursive_child_count": torch.tensor(2.0),
+        }
+
+        def fake_step(step_hidden: torch.Tensor, current_state: torch.Tensor, **kwargs):
+            return step_output, current_state, step_stats
+
+        with mock.patch.object(core, "step", side_effect=fake_step) as patched_step:
+            chunk_output, next_state, chunk_stats = core.chunked_step(hidden_chunk, field_state)
+
+        expected_output = hidden_chunk + (step_output - hidden_chunk[:, 0, :]).unsqueeze(1)
+        self.assertTrue(torch.allclose(chunk_output, expected_output))
+        self.assertEqual(patched_step.call_count, 1)
+        self.assertIsNot(chunk_stats, step_stats)
+        self.assertEqual(set(chunk_stats.keys()), set(step_stats.keys()))
+        self.assertTrue(torch.equal(chunk_stats["recursive_depth"], step_stats["recursive_depth"]))
+        self.assertTrue(torch.equal(chunk_stats["recursive_aux_loss"], step_stats["recursive_aux_loss"]))
+        self.assertTrue(torch.equal(chunk_stats["recursive_child_count"], step_stats["recursive_child_count"]))
+        self.assertTrue(torch.equal(chunk_stats["torus_entropy"], step_stats["torus_entropy"]))
+        self.assertIsNotNone(next_state)
+
     def test_learned_residency_config_roundtrip(self) -> None:
         tokenizer = PrismalTokenizer()
         cfg = self._build_gate_cfg(
@@ -438,6 +522,26 @@ class SmokeTests(unittest.TestCase):
         self.assertTrue(args.use_contrastive_routing)
         self.assertTrue(args.use_contrastive_routing_temporal)
         self.assertTrue(args.use_contrastive_routing_cross_view)
+
+    def test_nested_learning_cli_flags_parse(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "train",
+            "--data",
+            "demo/corpus",
+            "--save-dir",
+            "tmp/run",
+            "--use-nested-learning",
+            "--nested-learning-global-interval",
+            "6",
+            "--nested-learning-mid-ema-beta",
+            "0.91",
+        ])
+        cfg = _build_config(args)
+        self.assertTrue(args.use_nested_learning)
+        self.assertTrue(cfg.use_nested_learning)
+        self.assertEqual(cfg.nested_learning_global_interval, 6)
+        self.assertAlmostEqual(cfg.nested_learning_mid_ema_beta, 0.91)
 
     def test_token_superposition_config_roundtrip_and_checkpoint_persistence(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -1168,6 +1272,70 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(top_b, 1)
         self.assertNotEqual(top_a, top_b)
 
+    def test_emitter_router_casts_slot_cache_to_query_dtype(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 8
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 4
+        cfg.n_slots = 4
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 1
+        cfg.top_k_slots = 1
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 8
+        cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
+        cfg.use_hmote = False
+        cfg.use_recursive_hmoe = False
+        cfg.use_signature_lattice_attention = False
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 32
+        cfg.torus_weight = 0.0
+        cfg.frequency_weight = 0.0
+        cfg.emitter_neighbor_weight = 0.0
+
+        model = PrismalWaveModel(cfg)
+        router = model.router
+        self.assertIsNotNone(router)
+        assert router is not None
+        router.eval()
+
+        class _CastToBf16(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x.to(torch.bfloat16)
+
+        router.slot_query = _CastToBf16()
+        hidden = torch.zeros(1, 1, cfg.d_model)
+        slots = torch.zeros(1, cfg.n_slots, cfg.d_model, dtype=torch.float32)
+        shared_ids = torch.zeros(1, 1, dtype=torch.long)
+
+        _, updated_slots, stats = router.route(
+            hidden,
+            slots,
+            signature_family_ids=shared_ids,
+            signature_ids=shared_ids,
+            signature_level_ids=shared_ids,
+            signature_relation_ids=shared_ids,
+            parent_signature_ids=shared_ids,
+            path_index=0,
+            layer_index=0,
+        )
+
+        self.assertEqual(updated_slots.dtype, hidden.dtype)
+        self.assertTrue(torch.isfinite(stats["emitter_entropy"]))
+
     def test_hierarchy_growth_is_blocked_during_training(self) -> None:
         tokenizer = PrismalTokenizer()
         cfg = PrismalWaveConfig()
@@ -1290,6 +1458,8 @@ class SmokeTests(unittest.TestCase):
         cfg.use_hmote = False
         cfg.use_recursive_hmoe = False
         cfg.use_signature_lattice_attention = False
+        self.assertFalse(cfg.use_path_logits)
+        cfg.use_path_logits = True
         cfg.use_token_memory_cross_attention = True
         cfg.use_token_memory_generation_cache = True
         cfg.token_memory_window = 6
@@ -1361,6 +1531,66 @@ class SmokeTests(unittest.TestCase):
         )
         self.assertEqual(step_output[0].shape[-1], cfg.vocab_size)
         self.assertIsNotNone(step_output[2].token_memory_state)
+
+    def test_torus_single_path_fast_path_matches_explicit_path_index(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 32
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 8
+        cfg.n_slots = 8
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 2
+        cfg.top_k_slots = 2
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 16
+        cfg.use_torus_core = True
+        cfg.use_hmote = False
+        cfg.use_recursive_hmoe = False
+        cfg.use_signature_lattice_attention = False
+        self.assertFalse(cfg.use_path_logits)
+        cfg.use_path_logits = True
+        cfg.use_token_memory_cross_attention = True
+        cfg.use_token_memory_generation_cache = True
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 32
+        cfg.profile_runtime = True
+
+        model = PrismalWaveModel(cfg)
+        model.eval()
+
+        bundle = tokenizer.encode_hierarchy_bundle("single path fast path check", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+
+        default_output = model(
+            input_ids,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
+        self.assertEqual(default_output.path_logits.shape[1], 1)
+        self.assertEqual(default_output.route_stats["path_weights"].shape[-1], 1)
+        torch.testing.assert_close(default_output.route_stats["selected_path_index"], torch.zeros(1, dtype=torch.long))
+        self.assertIn("timing_path_aggregate_ms", default_output.route_stats)
+        self.assertTrue(torch.isfinite(default_output.route_stats["timing_path_aggregate_ms"]))
 
     def test_anchor_rail_forces_literal_copy_through_beam_search(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -1687,6 +1917,185 @@ class SmokeTests(unittest.TestCase):
 
         self.assertFalse(isinstance(getattr(train_loader, "dataset", None), torch.utils.data.IterableDataset))
         self.assertFalse(isinstance(getattr(val_loader, "dataset", None), torch.utils.data.IterableDataset))
+
+    def test_mini_overfit_fixture_loads(self) -> None:
+        fixture = ROOT / "BaseData" / "mini_overfit" / "mini_overfit.jsonl"
+        texts = list(iter_text_corpus(fixture))
+        self.assertGreaterEqual(len(texts), 8)
+        self.assertTrue(any("cat" in text.lower() for text in texts))
+
+    def test_mini_overfit_training_can_memorize_fixture(self) -> None:
+        fixture = ROOT / "BaseData" / "mini_overfit" / "mini_overfit.jsonl"
+        tokenizer = PrismalTokenizer()
+        train_loader, val_loader = build_train_val_dataloaders(
+            fixture,
+            tokenizer,
+            seq_len=128,
+            batch_size=1,
+            max_samples=0,
+            val_fraction=0.1,
+            seed=7,
+            streaming=False,
+        )
+
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 32
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 8
+        cfg.n_slots = 8
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 2
+        cfg.top_k_slots = 2
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 16
+        cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
+        cfg.use_hmote = False
+        cfg.use_recursive_hmoe = False
+        cfg.use_signature_lattice_attention = False
+        cfg.use_gate = False
+        cfg.use_gatetrain = False
+        cfg.use_fullgatetrain = False
+        cfg.use_learned_residency_head = False
+        cfg.use_residency_with_reinforcement = False
+        cfg.use_token_memory_cross_attention = False
+        cfg.use_token_copy_cross_attention = False
+        cfg.use_contrastive_routing = False
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.use_gradient_accumulation = False
+        cfg.gradient_accumulation_steps = 1
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 32
+        cfg.routing_entropy_weight = 0.0
+        cfg.diversity_weight = 0.0
+        cfg.torus_active_balance_weight = 0.0
+        cfg.emitter_balance_weight = 0.0
+        cfg.emitter_mixture_weight = 0.0
+        cfg.signature_loss_weight = 0.0
+        cfg.signature_level_loss_weight = 0.0
+        cfg.signature_relation_loss_weight = 0.0
+        cfg.signature_contrastive_weight = 0.0
+        cfg.contrastive_routing_weight = 0.0
+        cfg.recursive_hmoe_balance_weight = 0.0
+        cfg.recursive_hmoe_child_mixture_weight = 0.0
+        cfg.recursive_hmoe_agreement_weight = 0.0
+        cfg.recursive_aux_weight = 0.0
+        cfg.recursive_hidden_mix_scale = 0.0
+        cfg.recursive_field_mix_scale = 0.0
+        cfg.path_entropy_penalty = 0.0
+
+        model = PrismalWaveModel(cfg)
+        metrics = train_model(
+            model,
+            train_loader,
+            torch.device("cpu"),
+            cfg=cfg,
+            optimizer_name="adamw",
+            epochs=0,
+            steps=1000,
+            lr=2e-3,
+            grad_clip=0.0,
+            progress=False,
+            val_loader=val_loader,
+            diagnostic_interval=999,
+            use_amp=False,
+        )
+
+        self.assertLess(metrics["final_ce_loss"], 0.5)
+        self.assertLess(metrics["val_total_loss"], 3.0)
+
+        prompt = "What is a cat?"
+        generated = generate_text(
+            model,
+            tokenizer,
+            prompt,
+            torch.device("cpu"),
+            max_new_tokens=48,
+            min_new_tokens=1,
+            top_k=0,
+            top_p=1.0,
+            temperature=0.0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+            beam_size=2,
+            use_speculative_decoding=False,
+            template_prompt=False,
+        )
+        continuation = generated.split("\n\n", 1)[-1].split("\nPrompt token IDs:", 1)[0].strip().lower()
+        expected = "A cat is a small furry animal that says meow and likes to chase laser pointers."
+        expected_tokens = re.findall(r"[a-z0-9']+", expected.lower())
+        generated_tokens = re.findall(r"[a-z0-9']+", continuation)
+        overlap = sum(min(Counter(expected_tokens)[tok], Counter(generated_tokens)[tok]) for tok in set(expected_tokens))
+        f1 = (2 * overlap) / max(len(expected_tokens) + len(generated_tokens), 1)
+        self.assertGreaterEqual(f1, 0.35)
+        self.assertIn("meow", continuation)
+
+    def test_nested_learning_optimizer_cadence_and_state_roundtrip(self) -> None:
+        param = torch.nn.Parameter(torch.tensor([1.0]))
+        group = {
+            "params": [param],
+            "update_rule": "adamw",
+            "parameter_role": "scalar",
+            "hierarchy_tier": "global",
+            "state_dtype": torch.float32,
+            "lr": 0.1,
+            "weight_decay": 0.0,
+            "betas": (0.0, 0.0),
+            "eps": 1e-8,
+            "nested_learning_enabled": True,
+            "nested_update_interval": 2,
+            "nested_update_ema_beta": 0.5,
+        }
+        optimizer = PrecisionAdaptiveHierarchicalOptimizer([group])
+
+        param.grad = torch.tensor([1.0])
+        optimizer.step()
+        self.assertAlmostEqual(float(param.item()), 1.0, places=6)
+        state = optimizer.state[param]
+        self.assertEqual(int(state["nested_window_count"]), 1)
+        self.assertTrue(torch.allclose(state["nested_grad_buffer"], torch.tensor([1.0])))
+
+        saved_state = optimizer.state_dict()
+        restored_param = torch.nn.Parameter(torch.tensor([1.0]))
+        restored = PrecisionAdaptiveHierarchicalOptimizer(
+            [
+                {
+                    "params": [restored_param],
+                    "update_rule": "adamw",
+                    "parameter_role": "scalar",
+                    "hierarchy_tier": "global",
+                    "state_dtype": torch.float32,
+                    "lr": 0.1,
+                    "weight_decay": 0.0,
+                    "betas": (0.0, 0.0),
+                    "eps": 1e-8,
+                    "nested_learning_enabled": True,
+                    "nested_update_interval": 2,
+                    "nested_update_ema_beta": 0.5,
+                }
+            ]
+        )
+        restored.load_state_dict(saved_state)
+        restored_state = restored.state[restored_param]
+        self.assertEqual(int(restored.param_groups[0]["_nested_group_step"]), 1)
+        self.assertEqual(int(restored_state["nested_window_count"]), 1)
+        self.assertTrue(torch.allclose(restored_state["nested_grad_buffer"], torch.tensor([1.0])))
+
+        param.grad = torch.tensor([1.0])
+        optimizer.step()
+        self.assertLess(float(param.item()), 1.0)
+        self.assertEqual(int(state["nested_window_count"]), 0)
+        self.assertTrue(torch.allclose(state["nested_grad_buffer"], torch.zeros_like(state["nested_grad_buffer"])))
 
     def test_gradient_accumulation_defers_optimizer_step(self) -> None:
         class DummyDataset(torch.utils.data.Dataset):

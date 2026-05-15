@@ -1327,7 +1327,7 @@ def evaluate_model(
     usage_entropy = []
     usage_concentration = []
     try:
-        for input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, loss_mask in dataloader:
+        for input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask in dataloader:
             input_ids = input_ids.to(device)
             labels = labels.to(device)
             signature_ids = signature_ids.to(device)
@@ -1335,6 +1335,7 @@ def evaluate_model(
             signature_relation_ids = signature_relation_ids.to(device)
             parent_signature_ids = parent_signature_ids.to(device)
             signature_family_ids = signature_family_ids.to(device)
+            hierarchy_vectors = hierarchy_vectors.to(device)
             loss_mask = loss_mask.to(device)
             context = _precision_context(precision_policy, device, use_amp=bool(use_amp))
             with context:
@@ -1346,6 +1347,7 @@ def evaluate_model(
                     signature_relation_ids=signature_relation_ids,
                     parent_signature_ids=parent_signature_ids,
                     signature_family_ids=signature_family_ids,
+                    hierarchy_vectors=hierarchy_vectors,
                     loss_mask=loss_mask,
                 )
             losses.append(float(loss.item()))
@@ -1734,6 +1736,7 @@ def train_model(
         signature_relation_ids: torch.Tensor,
         parent_signature_ids: torch.Tensor,
         signature_family_ids: torch.Tensor,
+        hierarchy_vectors: torch.Tensor,
         loss_mask: torch.Tensor,
         *,
         epoch_idx: int,
@@ -1762,6 +1765,7 @@ def train_model(
         signature_relation_ids = signature_relation_ids.to(device)
         parent_signature_ids = parent_signature_ids.to(device)
         signature_family_ids = signature_family_ids.to(device)
+        hierarchy_vectors = hierarchy_vectors.to(device)
         loss_mask = loss_mask.to(device)
         token_superposition_bag_size = 1
         if _token_superposition_phase_active(
@@ -1792,6 +1796,7 @@ def train_model(
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
                 signature_family_ids=signature_family_ids,
+                hierarchy_vectors=hierarchy_vectors,
                 loss_mask=loss_mask,
                 superposition_bag_size=token_superposition_bag_size,
                 collect_telemetry=should_collect,
@@ -1948,6 +1953,7 @@ def train_model(
                 signature_relation_ids,
                 parent_signature_ids,
                 signature_family_ids,
+                hierarchy_vectors,
                 loss_mask,
             ) in enumerate(iterator, start=1):
                 if limit_seconds is not None and step > 0 and (time.perf_counter() - start) >= limit_seconds:
@@ -1962,6 +1968,7 @@ def train_model(
                     signature_relation_ids,
                     parent_signature_ids,
                     signature_family_ids,
+                    hierarchy_vectors,
                     loss_mask,
                     epoch_idx=epoch_idx,
                     batch_idx=batch_idx,
@@ -1981,10 +1988,10 @@ def train_model(
                 break
 
             try:
-                input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, loss_mask = next(iterator)
+                input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
             except StopIteration:
                 iterator = iter(dataloader)
-                input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, loss_mask = next(iterator)
+                input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
 
             batch_idx = (batch_idx % batches_per_epoch) + 1
             epoch_idx = min(epoch_count if epoch_count > 0 else 1, ((step // batches_per_epoch) + 1))
@@ -1996,6 +2003,7 @@ def train_model(
                 signature_relation_ids,
                 parent_signature_ids,
                 signature_family_ids,
+                hierarchy_vectors,
                 loss_mask,
                 epoch_idx=epoch_idx,
                 batch_idx=batch_idx,
@@ -2131,10 +2139,10 @@ def run_benchmark(
 
     for _ in range(max(1, steps)):
         try:
-            input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, loss_mask = next(iterator)
+            input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
         except StopIteration:
             iterator = iter(dataloader)
-            input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, loss_mask = next(iterator)
+            input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
         input_ids = input_ids.to(device)
         labels = labels.to(device)
         signature_ids = signature_ids.to(device)
@@ -2142,6 +2150,7 @@ def run_benchmark(
         signature_relation_ids = signature_relation_ids.to(device)
         parent_signature_ids = parent_signature_ids.to(device)
         signature_family_ids = signature_family_ids.to(device)
+        hierarchy_vectors = hierarchy_vectors.to(device)
         loss_mask = loss_mask.to(device)
         loss, output = model.compute_loss(
             input_ids,
@@ -2151,6 +2160,7 @@ def run_benchmark(
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
             signature_family_ids=signature_family_ids,
+            hierarchy_vectors=hierarchy_vectors,
             loss_mask=loss_mask,
         )
         losses.append(float(loss.item()))
@@ -2230,6 +2240,7 @@ def generate_text(
         prompt_parent_signature_ids,
         prompt_signature_family_ids,
     ) = prompt_bundle.as_tuple()
+    prompt_hierarchy_vectors = torch.tensor(prompt_bundle.hierarchy_vectors, dtype=torch.float32, device=device)
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     signature_ids = torch.tensor([prompt_signature_ids], dtype=torch.long, device=device)
     signature_level_ids = torch.tensor([prompt_signature_level_ids], dtype=torch.long, device=device)
@@ -2243,6 +2254,7 @@ def generate_text(
         signature_level_ids=signature_level_ids,
         signature_relation_ids=signature_relation_ids,
         parent_signature_ids=parent_signature_ids,
+        hierarchy_vectors=prompt_hierarchy_vectors.unsqueeze(0),
         max_new_tokens=max_new_tokens,
         min_new_tokens=min_new_tokens,
         top_k=top_k,

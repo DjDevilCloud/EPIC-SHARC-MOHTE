@@ -218,6 +218,27 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--hierarchical-torus-depth-scale", type=float, default=default_cfg.hierarchical_torus_depth_scale)
         p.add_argument("--hierarchical-recursive-depth-scale", type=float, default=default_cfg.hierarchical_recursive_depth_scale)
         p.add_argument("--hierarchical-fixed-point-scale", type=float, default=default_cfg.hierarchical_fixed_point_scale)
+        p.add_argument(
+            "--use-learned-hierarchy-embeddings",
+            dest="use_learned_hierarchy_embeddings",
+            action="store_true",
+        )
+        p.add_argument(
+            "--no-use-learned-hierarchy-embeddings",
+            dest="use_learned_hierarchy_embeddings",
+            action="store_false",
+        )
+        p.set_defaults(use_learned_hierarchy_embeddings=default_cfg.use_learned_hierarchy_embeddings)
+        p.add_argument(
+            "--learned-hierarchy-vector-dim",
+            type=int,
+            default=default_cfg.learned_hierarchy_vector_dim,
+        )
+        p.add_argument(
+            "--learned-hierarchy-vector-scale",
+            type=float,
+            default=default_cfg.learned_hierarchy_vector_scale,
+        )
         p.add_argument("--hierarchical-tier-char-weight", type=float, default=default_cfg.hierarchical_tier_char_weight)
         p.add_argument("--hierarchical-tier-piece-weight", type=float, default=default_cfg.hierarchical_tier_piece_weight)
         p.add_argument("--hierarchical-tier-word-weight", type=float, default=default_cfg.hierarchical_tier_word_weight)
@@ -671,6 +692,9 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         hierarchical_torus_depth_scale=getattr(args, "hierarchical_torus_depth_scale", default_cfg.hierarchical_torus_depth_scale),
         hierarchical_recursive_depth_scale=getattr(args, "hierarchical_recursive_depth_scale", default_cfg.hierarchical_recursive_depth_scale),
         hierarchical_fixed_point_scale=getattr(args, "hierarchical_fixed_point_scale", default_cfg.hierarchical_fixed_point_scale),
+        use_learned_hierarchy_embeddings=getattr(args, "use_learned_hierarchy_embeddings", default_cfg.use_learned_hierarchy_embeddings),
+        learned_hierarchy_vector_dim=getattr(args, "learned_hierarchy_vector_dim", default_cfg.learned_hierarchy_vector_dim),
+        learned_hierarchy_vector_scale=getattr(args, "learned_hierarchy_vector_scale", default_cfg.learned_hierarchy_vector_scale),
         hierarchical_tier_char_weight=getattr(args, "hierarchical_tier_char_weight", default_cfg.hierarchical_tier_char_weight),
         hierarchical_tier_piece_weight=getattr(args, "hierarchical_tier_piece_weight", default_cfg.hierarchical_tier_piece_weight),
         hierarchical_tier_word_weight=getattr(args, "hierarchical_tier_word_weight", default_cfg.hierarchical_tier_word_weight),

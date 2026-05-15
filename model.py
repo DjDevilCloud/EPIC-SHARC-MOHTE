@@ -18,12 +18,12 @@ from torch.utils.checkpoint import checkpoint
 
 try:
     from .config import PrismalWaveConfig
-    from .data import SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS
+    from .data import DEFAULT_HIERARCHY_VECTOR_DIM, SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS, _build_hierarchy_vector_tensor
     from .hierarchical_precision import HierarchicalPrecisionPolicy, HierarchicalPrecisionSpec, attach_precision_policy, current_precision_spec, dtype_name
     from .quantization import QuantizationConfig, create_quantized_embedding, create_quantized_linear
 except ImportError:  # pragma: no cover - supports direct script launching.
     from config import PrismalWaveConfig
-    from data import SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS
+    from data import DEFAULT_HIERARCHY_VECTOR_DIM, SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS, _build_hierarchy_vector_tensor
     from hierarchical_precision import HierarchicalPrecisionPolicy, HierarchicalPrecisionSpec, attach_precision_policy, current_precision_spec, dtype_name
     from quantization import QuantizationConfig, create_quantized_embedding, create_quantized_linear
 
@@ -115,6 +115,7 @@ def _validate_aligned_signature_tensors(
     signature_level_ids: Optional[torch.Tensor] = None,
     signature_relation_ids: Optional[torch.Tensor] = None,
     parent_signature_ids: Optional[torch.Tensor] = None,
+    hierarchy_vectors: Optional[torch.Tensor] = None,
     loss_mask: Optional[torch.Tensor] = None,
     context: str,
 ) -> None:
@@ -136,6 +137,15 @@ def _validate_aligned_signature_tensors(
             raise ValueError(
                 f"{context}: {name} must match input_ids shape {expected_shape}, got {tuple(tensor.shape)}"
             )
+    if hierarchy_vectors is not None and hierarchy_vectors.dim() != input_ids.dim() + 1:
+        raise ValueError(
+            f"{context}: hierarchy_vectors must be 1 rank deeper than input_ids, got shape {tuple(hierarchy_vectors.shape)}"
+        )
+    if hierarchy_vectors is not None and tuple(hierarchy_vectors.shape[: input_ids.dim()]) != expected_shape:
+        raise ValueError(
+            f"{context}: hierarchy_vectors leading dimensions must match input_ids shape {expected_shape}, "
+            f"got {tuple(hierarchy_vectors.shape)}"
+        )
 
 
 @dataclass
@@ -163,6 +173,7 @@ class SuperpositionBatch:
     signature_level_ids: Optional[torch.Tensor]
     signature_relation_ids: Optional[torch.Tensor]
     parent_signature_ids: Optional[torch.Tensor]
+    hierarchy_vectors: Optional[torch.Tensor]
     forward_loss_mask: Optional[torch.Tensor]
     target_ids: torch.Tensor
     target_mask: torch.Tensor
@@ -3615,6 +3626,9 @@ class PrismalRecursiveTorusCore(PrismalTorusCore):
         self.recursive_balance_weight = float(getattr(cfg, "recursive_hmoe_balance_weight", 0.0))
         self.recursive_child_mixture_weight = float(getattr(cfg, "recursive_hmoe_child_mixture_weight", 0.0))
         self.recursive_agreement_weight = float(getattr(cfg, "recursive_hmoe_agreement_weight", 0.0))
+        self.recursive_aux_weight = float(getattr(cfg, "recursive_aux_weight", 1.0))
+        self.recursive_hidden_mix_scale = float(getattr(cfg, "recursive_hidden_mix_scale", 0.5))
+        self.recursive_field_mix_scale = float(getattr(cfg, "recursive_field_mix_scale", 0.05))
         self.recursive_enabled = bool(getattr(cfg, "use_recursive_hmoe", False)) and self.recursive_depth > 1
         d = cfg.d_model
         coarse_context_dim = d * 6
@@ -3834,8 +3848,10 @@ class PrismalRecursiveTorusCore(PrismalTorusCore):
             + self.recursive_child_mixture_weight * child_mixture_loss
             + self.recursive_agreement_weight * agreement_loss
         )
-        final_hidden = base_hidden + 0.5 * child_weighted_hidden
-        final_field = base_state.field + 0.05 * child_weighted_field.view(child_weighted_field.size(0), 1, 1, 1, -1)
+        final_hidden = base_hidden + self.recursive_hidden_mix_scale * child_weighted_hidden
+        final_field = base_state.field + self.recursive_field_mix_scale * child_weighted_field.view(
+            child_weighted_field.size(0), 1, 1, 1, -1
+        )
         final_state = PrismalTorusState(field=final_field, bus=base_state.bus)
         merged_stats[f"{child_prefix}agreement_loss"] = agreement_loss.detach()
         merged_stats[f"{child_prefix}child_mixture_loss"] = child_mixture_loss.detach()
@@ -5272,6 +5288,12 @@ class PrismalWaveModel(nn.Module):
         if bucket_vocab <= 0:
             bucket_vocab = max(8, self.registry.family_vocab_size)
         self.signature_bucket_vocab_size = bucket_vocab
+        self.use_learned_hierarchy_embeddings = bool(getattr(cfg, "use_learned_hierarchy_embeddings", True))
+        self.learned_hierarchy_vector_dim = max(
+            4,
+            int(getattr(cfg, "learned_hierarchy_vector_dim", DEFAULT_HIERARCHY_VECTOR_DIM) or DEFAULT_HIERARCHY_VECTOR_DIM),
+        )
+        self.learned_hierarchy_vector_scale = max(0.0, float(getattr(cfg, "learned_hierarchy_vector_scale", 0.25)))
         if cfg.use_factorized_embedding:
             self.construction_embedding = FactorizedEmbedding(
                 resolved_vocab_size,
@@ -5289,6 +5311,16 @@ class PrismalWaveModel(nn.Module):
             int(getattr(cfg, "position_embedding_init_size", 256)),
             cfg.d_model,
             quantization_config=qcfg,
+        )
+        self.hierarchy_vector_projection = (
+            create_quantized_linear(
+                self.learned_hierarchy_vector_dim,
+                cfg.d_model,
+                bias=False,
+                quantization_config=qcfg,
+            )
+            if self.use_learned_hierarchy_embeddings
+            else None
         )
         self.token_hierarchy = (
             HierarchicalParameterNest(cfg, shared_embedding=self.construction_embedding, quantization_config=qcfg)
@@ -5492,6 +5524,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         bag_size: int,
     ) -> SuperpositionBatch:
@@ -5530,15 +5563,35 @@ class PrismalWaveModel(nn.Module):
         def _reduce_track(track: Optional[torch.Tensor], *, pad_value: int) -> Optional[torch.Tensor]:
             if track is None:
                 return None
-            padded = _pad_tensor(track, pad_value=pad_value).view(batch_size, bag_count, bag_size)
-            reduced = torch.full((batch_size, bag_count), pad_value, dtype=track.dtype, device=track.device)
+            if track.dim() == 2:
+                padded = _pad_tensor(track, pad_value=pad_value).view(batch_size, bag_count, bag_size)
+                reduced = torch.full((batch_size, bag_count), pad_value, dtype=track.dtype, device=track.device)
+            elif track.dim() == 3:
+                if track.size(0) != batch_size or track.size(1) != seq_len:
+                    raise ValueError(
+                        "hierarchy_vectors must align with input_ids when building superposition batches; "
+                        f"got {tuple(track.shape)} expected {(batch_size, seq_len, track.size(-1))}"
+                    )
+                pad_len = (bag_size - (track.size(1) % bag_size)) % bag_size
+                if pad_len > 0:
+                    pad = track.new_zeros((batch_size, pad_len, track.size(2)))
+                    padded = torch.cat([track, pad], dim=1)
+                else:
+                    padded = track
+                padded = padded.view(batch_size, bag_count, bag_size, track.size(-1))
+                reduced = torch.zeros((batch_size, bag_count, track.size(-1)), dtype=track.dtype, device=track.device)
+            else:
+                raise ValueError(f"Unsupported track rank for superposition batching: {track.dim()}")
             for batch_idx in range(batch_size):
                 for bag_idx in range(bag_count):
                     representative_idx = self._select_superposition_representative(
                         padded_family_ids[batch_idx, bag_idx],
                         valid_groups[batch_idx, bag_idx],
                     )
-                    reduced[batch_idx, bag_idx] = padded[batch_idx, bag_idx, representative_idx]
+                    if track.dim() == 3:
+                        reduced[batch_idx, bag_idx] = padded[batch_idx, bag_idx, representative_idx]
+                    else:
+                        reduced[batch_idx, bag_idx] = padded[batch_idx, bag_idx, representative_idx]
             return reduced
 
         reduced_signature_family_ids = _reduce_track(signature_family_ids, pad_value=0)
@@ -5546,6 +5599,7 @@ class PrismalWaveModel(nn.Module):
         reduced_signature_level_ids = _reduce_track(signature_level_ids, pad_value=SIGNATURE_LEVEL_IDS["pad"])
         reduced_signature_relation_ids = _reduce_track(signature_relation_ids, pad_value=SIGNATURE_RELATION_IDS["pad"])
         reduced_parent_signature_ids = _reduce_track(parent_signature_ids, pad_value=0)
+        reduced_hierarchy_vectors = _reduce_track(hierarchy_vectors, pad_value=0)
 
         for batch_idx in range(batch_size):
             for bag_idx in range(bag_count):
@@ -5603,6 +5657,7 @@ class PrismalWaveModel(nn.Module):
             signature_level_ids=reduced_signature_level_ids,
             signature_relation_ids=reduced_signature_relation_ids,
             parent_signature_ids=reduced_parent_signature_ids,
+            hierarchy_vectors=reduced_hierarchy_vectors,
             forward_loss_mask=forward_loss_mask,
             target_ids=target_ids,
             target_mask=target_mask,
@@ -6240,6 +6295,76 @@ class PrismalWaveModel(nn.Module):
         guided_hidden = hidden + gate * neighborhood_context
         return guided_hidden, neighborhood_logits
 
+    def _fit_hierarchy_vector_width(self, hierarchy_vectors: torch.Tensor) -> torch.Tensor:
+        target_dim = int(self.learned_hierarchy_vector_dim)
+        if hierarchy_vectors.size(-1) == target_dim:
+            return hierarchy_vectors
+        if hierarchy_vectors.size(-1) > target_dim:
+            return hierarchy_vectors[..., :target_dim]
+        pad_width = target_dim - hierarchy_vectors.size(-1)
+        if pad_width <= 0:
+            return hierarchy_vectors
+        padding = torch.zeros(*hierarchy_vectors.shape[:-1], pad_width, device=hierarchy_vectors.device, dtype=hierarchy_vectors.dtype)
+        return torch.cat([hierarchy_vectors, padding], dim=-1)
+
+    def _hierarchy_embedding_context(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        signature_ids: Optional[torch.Tensor] = None,
+        signature_level_ids: Optional[torch.Tensor] = None,
+        signature_relation_ids: Optional[torch.Tensor] = None,
+        parent_signature_ids: Optional[torch.Tensor] = None,
+        signature_family_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_learned_hierarchy_embeddings or self.hierarchy_vector_projection is None:
+            return None
+
+        if hierarchy_vectors is not None:
+            if hierarchy_vectors.dim() != input_ids.dim() + 1:
+                raise ValueError(
+                    "hierarchy_vectors must be one rank deeper than input_ids when provided; "
+                    f"got shape {tuple(hierarchy_vectors.shape)}"
+                )
+            if tuple(hierarchy_vectors.shape[: input_ids.dim()]) != tuple(input_ids.shape):
+                raise ValueError(
+                    "hierarchy_vectors leading dimensions must match input_ids when provided; "
+                    f"got shape {tuple(hierarchy_vectors.shape)} expected {tuple(input_ids.shape)}"
+                )
+            hierarchy_vectors = hierarchy_vectors.to(device=input_ids.device, dtype=torch.float32)
+            hierarchy_vectors = self._fit_hierarchy_vector_width(hierarchy_vectors)
+            return self.hierarchy_vector_projection(hierarchy_vectors)
+
+        if signature_ids is None:
+            signature_ids = torch.zeros_like(input_ids)
+        if signature_level_ids is None:
+            signature_level_ids = torch.full_like(input_ids, self.signature_level_to_id["char"])
+        if signature_relation_ids is None:
+            signature_relation_ids = torch.full_like(input_ids, self.signature_relation_to_id["continuation"])
+        if parent_signature_ids is None:
+            parent_signature_ids = signature_ids
+        if signature_family_ids is None:
+            signature_family_ids = torch.zeros_like(input_ids)
+
+        hierarchy_vectors = _build_hierarchy_vector_tensor(
+            input_ids,
+            signature_ids,
+            signature_level_ids,
+            signature_relation_ids,
+            parent_signature_ids,
+            signature_family_ids,
+            token_vocab_size=max(self.vocab_size, 1),
+            signature_vocab_size=max(self.signature_vocab_size, 1),
+            level_vocab_size=max(self.signature_level_vocab_size, 1),
+            relation_vocab_size=max(self.signature_relation_vocab_size, 1),
+            family_vocab_size=max(int(signature_family_ids.max().item()) + 1 if signature_family_ids.numel() > 0 else 1, 1),
+        )
+        hierarchy_vectors = self._fit_hierarchy_vector_width(hierarchy_vectors).to(device=input_ids.device)
+        if not torch.is_floating_point(hierarchy_vectors):
+            hierarchy_vectors = hierarchy_vectors.float()
+        return self.hierarchy_vector_projection(hierarchy_vectors)
+
     def _construction_logits_from_guided(self, guided_hidden: torch.Tensor) -> torch.Tensor:
         return self.construction_head(guided_hidden)
 
@@ -6474,6 +6599,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         position_offset: int = 0,
         timings: Optional[Dict[str, float]] = None,
         superposition_token_groups: Optional[torch.Tensor] = None,
@@ -6539,6 +6665,17 @@ class PrismalWaveModel(nn.Module):
                 )
             else:
                 hidden = self.construction_embedding(input_ids) + self.position_embedding(pos)
+        hierarchy_context = self._hierarchy_embedding_context(
+            input_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+            signature_family_ids=signature_family_ids,
+            hierarchy_vectors=hierarchy_vectors,
+        )
+        if hierarchy_context is not None:
+            hidden = hidden + self.learned_hierarchy_vector_scale * hierarchy_context
         if hasattr(self.torus_core, "condition_hidden"):
             if timings is not None:
                 condition_hidden = _profile_stage(
@@ -6608,6 +6745,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch = input_ids.size(0)
         if self.cfg.max_seq_len > 0:
@@ -6617,6 +6755,17 @@ class PrismalWaveModel(nn.Module):
             self._ensure_position_embedding_capacity(position_index + 1)
         pos = torch.full((batch, 1), position_index, device=input_ids.device, dtype=torch.long)
         hidden = self.construction_embedding(input_ids[:, :1]) + self.position_embedding(pos)
+        hierarchy_context = self._hierarchy_embedding_context(
+            input_ids[:, :1],
+            signature_ids=signature_ids[:, :1] if signature_ids is not None else None,
+            signature_level_ids=signature_level_ids[:, :1] if signature_level_ids is not None else None,
+            signature_relation_ids=signature_relation_ids[:, :1] if signature_relation_ids is not None else None,
+            parent_signature_ids=parent_signature_ids[:, :1] if parent_signature_ids is not None else None,
+            signature_family_ids=signature_family_ids[:, :1] if signature_family_ids is not None else None,
+            hierarchy_vectors=hierarchy_vectors[:, :1] if hierarchy_vectors is not None else None,
+        )
+        if hierarchy_context is not None:
+            hidden = hidden + self.learned_hierarchy_vector_scale * hierarchy_context
         if hasattr(self.torus_core, "condition_hidden"):
             hidden = hidden + 0.25 * self.torus_core.condition_hidden(
                 hidden,
@@ -6653,6 +6802,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         signature_lattice_state: Optional[SignatureLatticeState] = None,
         token_memory_state: Optional[TokenMemoryState] = None,
         position_offset: int = 0,
@@ -6672,6 +6822,7 @@ class PrismalWaveModel(nn.Module):
                 signature_level_ids=signature_level_ids,
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
+                hierarchy_vectors=hierarchy_vectors,
                 position_offset=position_offset,
                 timings=prep_timings if profile_enabled else None,
             ),
@@ -6688,6 +6839,8 @@ class PrismalWaveModel(nn.Module):
             signature_relation_ids = signature_relation_ids[:, :seq_len]
         if parent_signature_ids is not None:
             parent_signature_ids = parent_signature_ids[:, :seq_len]
+        if hierarchy_vectors is not None:
+            hierarchy_vectors = hierarchy_vectors[:, :seq_len]
 
         next_signature_lattice_state: Optional[SignatureLatticeState] = signature_lattice_state
         lattice_stats: Dict[str, torch.Tensor] = {
@@ -7176,7 +7329,7 @@ class PrismalWaveModel(nn.Module):
         family_budget = torch.stack(family_budget_terms).mean() if family_budget_terms else torch.tensor(0.0, device=input_ids.device)
         family_hit_rate = torch.stack(family_hit_rate_terms).mean() if family_hit_rate_terms else torch.tensor(0.0, device=input_ids.device)
         family_gate_mean = torch.stack(family_gate_terms).mean() if family_gate_terms else torch.tensor(0.0, device=input_ids.device)
-        path_score = agreement - 0.15 * route_entropy
+        path_score = agreement - float(getattr(self.cfg, "path_entropy_penalty", 0.15)) * route_entropy
         if self.use_race_lanes:
             lane_norm = float(path_index % max(self.lane_count, 1)) / max(self.lane_count - 1, 1)
             path_score = path_score + (1.0 - lane_norm) * 0.015 - lane_norm * 0.015 * route_entropy
@@ -7254,6 +7407,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         slot_state: Optional[torch.Tensor] = None,
         signature_lattice_state: Optional[SignatureLatticeState] = None,
@@ -7308,6 +7462,7 @@ class PrismalWaveModel(nn.Module):
             signature_level_ids=signature_level_ids,
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
+            hierarchy_vectors=hierarchy_vectors,
             signature_lattice_state=signature_lattice_state,
             token_memory_state=token_memory_state,
             position_offset=position_offset,
@@ -7834,6 +7989,7 @@ class PrismalWaveModel(nn.Module):
             * avg_mixture_loss
             + float(getattr(self.cfg, "torus_active_balance_weight", 0.0))
             * avg_coverage_loss
+            + float(getattr(self.cfg, "recursive_aux_weight", 1.0)) * avg_recursive_aux_loss
             - self.cfg.diversity_weight * pairwise_diversity
             + self.learned_residency_weight * learned_residency_loss
         )
@@ -7950,6 +8106,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         slot_state: Optional[torch.Tensor] = None,
         signature_lattice_state: Optional[SignatureLatticeState] = None,
@@ -7968,6 +8125,7 @@ class PrismalWaveModel(nn.Module):
             signature_level_ids=signature_level_ids,
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
+            hierarchy_vectors=hierarchy_vectors,
             loss_mask=loss_mask,
             context="forward",
         )
@@ -7985,6 +8143,7 @@ class PrismalWaveModel(nn.Module):
                 signature_level_ids=signature_level_ids,
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
+                hierarchy_vectors=hierarchy_vectors,
                 loss_mask=loss_mask,
                 slot_state=slot_state,
                 signature_lattice_state=signature_lattice_state,
@@ -8001,6 +8160,7 @@ class PrismalWaveModel(nn.Module):
             signature_level_ids=signature_level_ids,
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
+            hierarchy_vectors=hierarchy_vectors,
             position_offset=position_index,
             superposition_token_groups=superposition_token_groups,
             superposition_bag_size=superposition_bag_size,
@@ -8097,7 +8257,7 @@ class PrismalWaveModel(nn.Module):
             output_signature = F.normalize(self.signature_head(path_hidden_state.mean(dim=1)), dim=-1)
             agreement = F.cosine_similarity(input_signature, output_signature, dim=-1)
             route_entropy = torch.stack(entropy_terms).mean()
-            validator_score = agreement - 0.15 * route_entropy
+            validator_score = agreement - float(getattr(self.cfg, "path_entropy_penalty", 0.15)) * route_entropy
             path_hidden.append(path_hidden_state)
             if self.use_path_logits:
                 path_logits.append(logits)
@@ -8379,6 +8539,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         slot_state: Optional[torch.Tensor] = None,
         signature_lattice_state: Optional[SignatureLatticeState] = None,
         token_memory_state: Optional[TokenMemoryState] = None,
@@ -8392,6 +8553,7 @@ class PrismalWaveModel(nn.Module):
             signature_level_ids=signature_level_ids,
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
+            hierarchy_vectors=hierarchy_vectors,
             slot_state=slot_state,
             signature_lattice_state=signature_lattice_state,
             token_memory_state=token_memory_state,
@@ -9368,6 +9530,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         superposition_bag_size: int = 1,
         collect_telemetry: bool = True,
@@ -9386,6 +9549,7 @@ class PrismalWaveModel(nn.Module):
                 signature_level_ids=signature_level_ids,
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
+                hierarchy_vectors=hierarchy_vectors,
                 loss_mask=loss_mask,
                 bag_size=superposition_bag_size,
             )
@@ -9396,6 +9560,7 @@ class PrismalWaveModel(nn.Module):
                 signature_level_ids=superposition.signature_level_ids,
                 signature_relation_ids=superposition.signature_relation_ids,
                 parent_signature_ids=superposition.parent_signature_ids,
+                hierarchy_vectors=superposition.hierarchy_vectors,
                 loss_mask=superposition.forward_loss_mask,
                 superposition_token_groups=superposition.token_groups,
                 superposition_bag_size=superposition.bag_size,
@@ -9425,6 +9590,7 @@ class PrismalWaveModel(nn.Module):
                 signature_level_ids=signature_level_ids,
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
+                hierarchy_vectors=hierarchy_vectors,
                 loss_mask=loss_mask,
                 collect_telemetry=collect_telemetry,
             )
@@ -9468,6 +9634,7 @@ class PrismalWaveModel(nn.Module):
         signature_level_ids: Optional[torch.Tensor] = None,
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
+        hierarchy_vectors: Optional[torch.Tensor] = None,
         slot_state: Optional[torch.Tensor] = None,
         max_new_tokens: int = 64,
         min_new_tokens: int = 24,
@@ -9497,6 +9664,7 @@ class PrismalWaveModel(nn.Module):
             signature_level_ids=signature_level_ids,
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
+            hierarchy_vectors=hierarchy_vectors,
             context="generate",
         )
         beam_size = max(1, int(beam_size))
@@ -9518,6 +9686,7 @@ class PrismalWaveModel(nn.Module):
                 signature_level_ids=signature_level_ids,
                 signature_relation_ids=signature_relation_ids,
                 parent_signature_ids=parent_signature_ids,
+                hierarchy_vectors=hierarchy_vectors,
                 slot_state=slot_state,
                 max_new_tokens=max_new_tokens,
                 min_new_tokens=min_new_tokens,
@@ -9738,6 +9907,7 @@ class PrismalWaveModel(nn.Module):
             signature_level_ids=generated_levels,
             signature_relation_ids=generated_relations,
             parent_signature_ids=generated_parents,
+            hierarchy_vectors=hierarchy_vectors,
             slot_state=carried_slots,
             signature_lattice_state=carried_lattice_state,
             token_memory_state=carried_token_memory_state,

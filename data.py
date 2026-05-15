@@ -7,7 +7,7 @@ from collections import Counter
 import concurrent.futures
 import itertools
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import hashlib
 import json
 import re
@@ -129,6 +129,76 @@ SIGNATURE_RELATION_IDS: Dict[str, int] = {
     "special": 7,
 }
 
+DEFAULT_HIERARCHY_VECTOR_DIM = 12
+
+
+def _build_hierarchy_vector_tensor(
+    token_ids: torch.Tensor,
+    signature_ids: torch.Tensor,
+    signature_level_ids: torch.Tensor,
+    signature_relation_ids: torch.Tensor,
+    parent_signature_ids: torch.Tensor,
+    signature_family_ids: torch.Tensor,
+    *,
+    token_vocab_size: int,
+    signature_vocab_size: int,
+    level_vocab_size: int,
+    relation_vocab_size: int,
+    family_vocab_size: int,
+) -> torch.Tensor:
+    token_ids = token_ids.to(dtype=torch.float32)
+    signature_ids = signature_ids.to(dtype=torch.float32)
+    signature_level_ids = signature_level_ids.to(dtype=torch.float32)
+    signature_relation_ids = signature_relation_ids.to(dtype=torch.float32)
+    parent_signature_ids = parent_signature_ids.to(dtype=torch.float32)
+    signature_family_ids = signature_family_ids.to(dtype=torch.float32)
+
+    def _norm(values: torch.Tensor, denom: int) -> torch.Tensor:
+        return values / max(float(denom), 1.0)
+
+    token_norm = _norm(token_ids, token_vocab_size)
+    signature_norm = _norm(signature_ids, signature_vocab_size)
+    family_norm = _norm(signature_family_ids, family_vocab_size)
+    level_norm = _norm(signature_level_ids, level_vocab_size)
+    relation_norm = _norm(signature_relation_ids, relation_vocab_size)
+    parent_norm = _norm(parent_signature_ids, signature_vocab_size)
+    delta_norm = _norm(signature_ids - parent_signature_ids, signature_vocab_size)
+    special_flag = (
+        (signature_level_ids.eq(float(SIGNATURE_LEVEL_IDS["special"])))
+        | (signature_relation_ids.eq(float(SIGNATURE_RELATION_IDS["special"])))
+    ).to(dtype=torch.float32)
+    line_flag = signature_level_ids.eq(float(SIGNATURE_LEVEL_IDS["line"])).to(dtype=torch.float32)
+    word_flag = (
+        signature_level_ids.eq(float(SIGNATURE_LEVEL_IDS["word"]))
+        | signature_level_ids.eq(float(SIGNATURE_LEVEL_IDS["phrase"]))
+    ).to(dtype=torch.float32)
+    piece_flag = (
+        signature_level_ids.eq(float(SIGNATURE_LEVEL_IDS["piece"]))
+        | signature_level_ids.eq(float(SIGNATURE_LEVEL_IDS["char"]))
+    ).to(dtype=torch.float32)
+    structural_flag = (
+        signature_relation_ids.eq(float(SIGNATURE_RELATION_IDS["adjacency"]))
+        | signature_relation_ids.eq(float(SIGNATURE_RELATION_IDS["containment"]))
+    ).to(dtype=torch.float32)
+
+    return torch.stack(
+        [
+            token_norm,
+            signature_norm,
+            family_norm,
+            level_norm,
+            relation_norm,
+            parent_norm,
+            delta_norm,
+            special_flag,
+            line_flag,
+            word_flag,
+            piece_flag,
+            structural_flag,
+        ],
+        dim=-1,
+    )
+
 
 @dataclass
 class DynamicToken:
@@ -173,6 +243,7 @@ class HierarchyEncoding:
     signature_relation_ids: List[int]
     parent_signature_ids: List[int]
     signature_family_ids: List[int]
+    hierarchy_vectors: List[List[float]] = field(default_factory=list)
 
     def validate(self, *, context: str = "hierarchy") -> None:
         lengths = {
@@ -190,6 +261,15 @@ class HierarchyEncoding:
                 f"level={len(self.signature_level_ids)}, relation={len(self.signature_relation_ids)}, "
                 f"parent={len(self.parent_signature_ids)}, family={len(self.signature_family_ids)}"
             )
+        if self.hierarchy_vectors:
+            if len(self.hierarchy_vectors) != len(self.token_ids):
+                raise ValueError(
+                    f"{context} hierarchy vectors must align with tokens; got "
+                    f"vectors={len(self.hierarchy_vectors)} token={len(self.token_ids)}"
+                )
+            vector_lengths = {len(vector) for vector in self.hierarchy_vectors}
+            if len(vector_lengths) != 1:
+                raise ValueError(f"{context} hierarchy vectors must all share the same width; got {sorted(vector_lengths)}")
 
     def as_tuple(self) -> tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
         self.validate()
@@ -202,6 +282,10 @@ class HierarchyEncoding:
             self.signature_family_ids,
         )
 
+    def compact_tuple(self) -> tuple[List[int], List[List[float]]]:
+        self.validate()
+        return self.token_ids, self.hierarchy_vectors
+
     def prepend(
         self,
         *,
@@ -212,6 +296,7 @@ class HierarchyEncoding:
         parent_id: int,
         family_id: int,
     ) -> "HierarchyEncoding":
+        vector_width = len(self.hierarchy_vectors[0]) if self.hierarchy_vectors else DEFAULT_HIERARCHY_VECTOR_DIM
         return HierarchyEncoding(
             token_ids=[token_id] + self.token_ids,
             signature_ids=[signature_id] + self.signature_ids,
@@ -219,6 +304,7 @@ class HierarchyEncoding:
             signature_relation_ids=[relation_id] + self.signature_relation_ids,
             parent_signature_ids=[parent_id] + self.parent_signature_ids,
             signature_family_ids=[family_id] + self.signature_family_ids,
+            hierarchy_vectors=[[0.0] * vector_width] + self.hierarchy_vectors,
         )
 
     def trim_trailing_tokens(self, token_ids: set[int]) -> "HierarchyEncoding":
@@ -236,6 +322,7 @@ class HierarchyEncoding:
             signature_relation_ids=self.signature_relation_ids[:trim_len],
             parent_signature_ids=self.parent_signature_ids[:trim_len],
             signature_family_ids=self.signature_family_ids[:trim_len],
+            hierarchy_vectors=self.hierarchy_vectors[:trim_len],
         )
 
 
@@ -1675,6 +1762,19 @@ class PrismalTokenizer:
             parent_signature_ids.append(self.signature_eos_id)
             signature_family_ids.append(self.signature_family_to_id["special"])
 
+        hierarchy_vectors = _build_hierarchy_vector_tensor(
+            torch.tensor(token_ids, dtype=torch.long),
+            torch.tensor(signature_ids, dtype=torch.long),
+            torch.tensor(signature_level_ids, dtype=torch.long),
+            torch.tensor(signature_relation_ids, dtype=torch.long),
+            torch.tensor(parent_signature_ids, dtype=torch.long),
+            torch.tensor(signature_family_ids, dtype=torch.long),
+            token_vocab_size=max(self.vocab_size, 1),
+            signature_vocab_size=max(self.signature_vocab_size, 1),
+            level_vocab_size=max(self.signature_level_vocab_size, 1),
+            relation_vocab_size=max(self.signature_relation_vocab_size, 1),
+            family_vocab_size=max(self.signature_family_vocab_size, 1),
+        ).tolist()
         bundle = HierarchyEncoding(
             token_ids=token_ids,
             signature_ids=signature_ids,
@@ -1682,6 +1782,7 @@ class PrismalTokenizer:
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
             signature_family_ids=signature_family_ids,
+            hierarchy_vectors=hierarchy_vectors,
         )
         bundle.validate(context="encode_hierarchy")
         return bundle
@@ -1726,6 +1827,19 @@ class PrismalTokenizer:
         signature_relation_ids.append(self.signature_relation_to_id["special"])
         parent_signature_ids.append(self.signature_boo_id)
         signature_family_ids.append(self.signature_family_to_id["boundary"])
+        hierarchy_vectors = _build_hierarchy_vector_tensor(
+            torch.tensor(token_ids, dtype=torch.long),
+            torch.tensor(signature_ids, dtype=torch.long),
+            torch.tensor(signature_level_ids, dtype=torch.long),
+            torch.tensor(signature_relation_ids, dtype=torch.long),
+            torch.tensor(parent_signature_ids, dtype=torch.long),
+            torch.tensor(signature_family_ids, dtype=torch.long),
+            token_vocab_size=max(self.vocab_size, 1),
+            signature_vocab_size=max(self.signature_vocab_size, 1),
+            level_vocab_size=max(self.signature_level_vocab_size, 1),
+            relation_vocab_size=max(self.signature_relation_vocab_size, 1),
+            family_vocab_size=max(self.signature_family_vocab_size, 1),
+        ).tolist()
         prompt_bundle = HierarchyEncoding(
             token_ids=token_ids,
             signature_ids=signature_ids,
@@ -1733,6 +1847,7 @@ class PrismalTokenizer:
             signature_relation_ids=signature_relation_ids,
             parent_signature_ids=parent_signature_ids,
             signature_family_ids=signature_family_ids,
+            hierarchy_vectors=hierarchy_vectors,
         )
         prompt_bundle.validate(context="generation prompt")
         return prompt_bundle
@@ -1740,6 +1855,12 @@ class PrismalTokenizer:
     def encode_with_signatures(self, text: str, add_special_tokens: bool = True) -> tuple[List[int], List[int]]:
         token_ids, signature_ids, _, _, _, _ = self.encode_hierarchy(text, add_special_tokens=add_special_tokens)
         return token_ids, signature_ids
+
+    def encode_with_hierarchy_vectors(
+        self, text: str, add_special_tokens: bool = True, span_role: str = "input"
+    ) -> tuple[List[int], List[List[float]]]:
+        bundle = self.encode_hierarchy_bundle(text, add_special_tokens=add_special_tokens, span_role=span_role)
+        return bundle.token_ids, bundle.hierarchy_vectors
 
     def add_token(self, text: str, *, kind: str = "word", frequency: int = 1, signature: str = "") -> int:
         normalized = re.sub(r"\s+", " ", text.strip())
@@ -2524,6 +2645,31 @@ class PrismalTokenizer:
             lookup[blo_id] = self.signature_family_to_id["line"]
         return lookup
 
+    def hierarchy_vector_lookup_by_token_id(self) -> Dict[int, List[float]]:
+        lookup: Dict[int, List[float]] = {}
+        signature_lookup = self.signature_lookup_by_token_id()
+        level_lookup = self.signature_level_lookup_by_token_id()
+        relation_lookup = self.signature_relation_lookup_by_token_id()
+        family_lookup = self.signature_family_lookup_by_token_id()
+        for token_id, signature_id in signature_lookup.items():
+            level_id = level_lookup.get(token_id, self.signature_level_to_id["char"])
+            relation_id = relation_lookup.get(token_id, self.signature_relation_to_id["continuation"])
+            family_id = family_lookup.get(token_id, self.signature_family_to_id["fallback"])
+            lookup[token_id] = _build_hierarchy_vector_tensor(
+                torch.tensor([token_id], dtype=torch.long),
+                torch.tensor([signature_id], dtype=torch.long),
+                torch.tensor([level_id], dtype=torch.long),
+                torch.tensor([relation_id], dtype=torch.long),
+                torch.tensor([signature_id], dtype=torch.long),
+                torch.tensor([family_id], dtype=torch.long),
+                token_vocab_size=max(self.vocab_size, 1),
+                signature_vocab_size=max(self.signature_vocab_size, 1),
+                level_vocab_size=max(self.signature_level_vocab_size, 1),
+                relation_vocab_size=max(self.signature_relation_vocab_size, 1),
+                family_vocab_size=max(self.signature_family_vocab_size, 1),
+            )[0].tolist()
+        return lookup
+
     def generation_suppressed_token_ids(self) -> List[int]:
         suppressed = [self.pad_id, self.bos_id]
         allowed_punct = {".", ",", "?", "!", ":", ";", "'", '"', "-", "_", "(", ")"}
@@ -2550,26 +2696,38 @@ class WindowSample:
     signature_relation_ids: torch.Tensor
     parent_signature_ids: torch.Tensor
     signature_family_ids: torch.Tensor
+    hierarchy_vectors: torch.Tensor
     loss_mask: torch.Tensor
 
     def __post_init__(self) -> None:
-        lengths = {
-            int(self.input_ids.numel()),
-            int(self.labels.numel()),
-            int(self.signature_ids.numel()),
-            int(self.signature_level_ids.numel()),
-            int(self.signature_relation_ids.numel()),
-            int(self.parent_signature_ids.numel()),
-            int(self.signature_family_ids.numel()),
-            int(self.loss_mask.numel()),
+        seq_lengths = {
+            int(self.input_ids.shape[0]),
+            int(self.labels.shape[0]),
+            int(self.signature_ids.shape[0]),
+            int(self.signature_level_ids.shape[0]),
+            int(self.signature_relation_ids.shape[0]),
+            int(self.parent_signature_ids.shape[0]),
+            int(self.signature_family_ids.shape[0]),
+            int(self.hierarchy_vectors.shape[0]),
+            int(self.loss_mask.shape[0]),
         }
+        lengths = seq_lengths
         if len(lengths) != 1:
             raise ValueError(
                 "WindowSample tensors must stay aligned; got lengths "
-                f"input={self.input_ids.numel()}, labels={self.labels.numel()}, "
-                f"signature={self.signature_ids.numel()}, level={self.signature_level_ids.numel()}, "
-                f"relation={self.signature_relation_ids.numel()}, parent={self.parent_signature_ids.numel()}, "
-                f"family={self.signature_family_ids.numel()}, mask={self.loss_mask.numel()}"
+                f"input={self.input_ids.shape[0]}, labels={self.labels.shape[0]}, "
+                f"signature={self.signature_ids.shape[0]}, level={self.signature_level_ids.shape[0]}, "
+                f"relation={self.signature_relation_ids.shape[0]}, parent={self.parent_signature_ids.shape[0]}, "
+                f"family={self.signature_family_ids.shape[0]}, hierarchy={self.hierarchy_vectors.shape[0]}, "
+                f"mask={self.loss_mask.shape[0]}"
+            )
+        if self.hierarchy_vectors.dim() != 2:
+            raise ValueError(
+                f"WindowSample hierarchy_vectors must be 2D, got shape {tuple(self.hierarchy_vectors.shape)}"
+            )
+        if int(self.hierarchy_vectors.shape[1]) <= 0:
+            raise ValueError(
+                f"WindowSample hierarchy_vectors must have a positive width, got shape {tuple(self.hierarchy_vectors.shape)}"
             )
 
 
@@ -2661,6 +2819,20 @@ def _build_window_samples_from_text(
     if len(encoded) < 2:
         return samples
 
+    hierarchy_vectors = _build_hierarchy_vector_tensor(
+        torch.tensor(encoded, dtype=torch.long),
+        torch.tensor(encoded_signatures, dtype=torch.long),
+        torch.tensor(encoded_levels, dtype=torch.long),
+        torch.tensor(encoded_relations, dtype=torch.long),
+        torch.tensor(encoded_parents, dtype=torch.long),
+        torch.tensor(encoded_families, dtype=torch.long),
+        token_vocab_size=max(tokenizer.vocab_size, 1),
+        signature_vocab_size=max(tokenizer.signature_vocab_size, 1),
+        level_vocab_size=max(tokenizer.signature_level_vocab_size, 1),
+        relation_vocab_size=max(tokenizer.signature_relation_vocab_size, 1),
+        family_vocab_size=max(tokenizer.signature_family_vocab_size, 1),
+    )
+
     token_loss_mask = _build_loss_mask(tokenizer, merged, encoded)
     unsupervised_token_ids = {
         tokenizer.special_tokens.get("<BOI>"),
@@ -2701,6 +2873,19 @@ def _build_window_samples_from_text(
         family_ids = [tokenizer.signature_family_to_id["special"]] + family_chunk + [tokenizer.signature_family_to_id["special"]]
         eos_loss = 1.0 if start + len(chunk) >= len(encoded) else 0.0
         loss_mask = [0.0] + mask_chunk + [eos_loss]
+        hierarchy_vectors = _build_hierarchy_vector_tensor(
+            torch.tensor(ids, dtype=torch.long),
+            torch.tensor(sig_ids, dtype=torch.long),
+            torch.tensor(lvl_ids, dtype=torch.long),
+            torch.tensor(rel_ids, dtype=torch.long),
+            torch.tensor(parent_ids, dtype=torch.long),
+            torch.tensor(family_ids, dtype=torch.long),
+            token_vocab_size=max(tokenizer.vocab_size, 1),
+            signature_vocab_size=max(tokenizer.signature_vocab_size, 1),
+            level_vocab_size=max(tokenizer.signature_level_vocab_size, 1),
+            relation_vocab_size=max(tokenizer.signature_relation_vocab_size, 1),
+            family_vocab_size=max(tokenizer.signature_family_vocab_size, 1),
+        )
         samples.append(
             WindowSample(
                 input_ids=torch.tensor(ids[:-1], dtype=torch.long),
@@ -2710,6 +2895,7 @@ def _build_window_samples_from_text(
                 signature_relation_ids=torch.tensor(rel_ids[:-1], dtype=torch.long),
                 parent_signature_ids=torch.tensor(parent_ids[:-1], dtype=torch.long),
                 signature_family_ids=torch.tensor(family_ids[:-1], dtype=torch.long),
+                hierarchy_vectors=hierarchy_vectors[:-1].to(dtype=torch.float32),
                 loss_mask=torch.tensor(loss_mask[1:], dtype=torch.float32),
             )
         )
@@ -2943,6 +3129,7 @@ def _window_sample_field_names() -> List[str]:
         "signature_relation_ids",
         "parent_signature_ids",
         "signature_family_ids",
+        "hierarchy_vectors",
         "loss_mask",
     ]
 
@@ -2974,11 +3161,12 @@ def stream_pretokenized_windows(
 ) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    samples_iter, samples_for_write = itertools.tee(samples)
 
     if num_samples is None:
         sample_count = 0
         total_tokens = 0
-        for sample in samples:
+        for sample in samples_iter:
             sample_count += 1
             total_tokens += int(sample.input_ids.numel())
         if sample_count == 0:
@@ -2989,11 +3177,17 @@ def stream_pretokenized_windows(
         if num_samples == 0:
             raise ValueError("Cannot save an empty pretokenized dataset.")
         total_tokens = 0
-        for sample in samples:
+        for sample in samples_iter:
             total_tokens += int(sample.input_ids.numel())
 
     offsets = np.zeros(num_samples, dtype=np.int64)
     lengths = np.zeros(num_samples, dtype=np.int64)
+    hierarchy_vector_dim = DEFAULT_HIERARCHY_VECTOR_DIM
+    if num_samples > 0:
+        preview_iter, samples_for_write = itertools.tee(samples_for_write)
+        first_sample = next(preview_iter, None)
+        if first_sample is not None:
+            hierarchy_vector_dim = int(first_sample.hierarchy_vectors.shape[-1])
     field_dtypes = {
         "input_ids": np.int64,
         "labels": np.int64,
@@ -3002,6 +3196,7 @@ def stream_pretokenized_windows(
         "signature_relation_ids": np.int64,
         "parent_signature_ids": np.int64,
         "signature_family_ids": np.int64,
+        "hierarchy_vectors": np.float32,
         "loss_mask": np.float32,
     }
     field_memmaps: Dict[str, np.ndarray] = {
@@ -3009,26 +3204,35 @@ def stream_pretokenized_windows(
             output_path / f"{field_name}.npy",
             mode="w+",
             dtype=dtype,
-            shape=(total_tokens,),
+            shape=(total_tokens, hierarchy_vector_dim) if field_name == "hierarchy_vectors" else (total_tokens,),
         )
         for field_name, dtype in field_dtypes.items()
     }
 
     cursor = 0
     written = 0
-    for sample in samples:
+    for sample in samples_for_write:
         if written >= num_samples:
             break
         sample_len = int(sample.input_ids.numel())
         offsets[written] = cursor
         lengths[written] = sample_len
         for field_name in _window_sample_field_names():
-            array = _window_sample_numpy(sample, field_name).reshape(-1)
-            if field_name != "loss_mask" and array.dtype != np.int64:
-                array = array.astype(np.int64, copy=False)
-            if field_name == "loss_mask" and array.dtype != np.float32:
-                array = array.astype(np.float32, copy=False)
-            field_memmaps[field_name][cursor : cursor + sample_len] = array
+            array = _window_sample_numpy(sample, field_name)
+            if field_name == "hierarchy_vectors":
+                if array.shape != (sample_len, hierarchy_vector_dim):
+                    raise ValueError(
+                        "hierarchy_vectors must match sample length and shared width; "
+                        f"got {tuple(array.shape)} expected {(sample_len, hierarchy_vector_dim)}"
+                    )
+                field_memmaps[field_name][cursor : cursor + sample_len, :] = array.astype(np.float32, copy=False)
+                continue
+            flat = array.reshape(-1)
+            if field_name != "loss_mask" and flat.dtype != np.int64:
+                flat = flat.astype(np.int64, copy=False)
+            if field_name == "loss_mask" and flat.dtype != np.float32:
+                flat = flat.astype(np.float32, copy=False)
+            field_memmaps[field_name][cursor : cursor + sample_len] = flat
         cursor += sample_len
         written += 1
 
@@ -3046,6 +3250,7 @@ def stream_pretokenized_windows(
         "seq_len": int(seq_len),
         "num_samples": int(written),
         "field_names": _window_sample_field_names(),
+        "hierarchy_vector_dim": int(hierarchy_vector_dim),
     }
     if metadata:
         payload.update(metadata)
@@ -3088,6 +3293,9 @@ class MemmapTokenDataset(Dataset):
             "signature_relation_ids": np.load(self.root_dir / "signature_relation_ids.npy", mmap_mode="r"),
             "parent_signature_ids": np.load(self.root_dir / "parent_signature_ids.npy", mmap_mode="r"),
             "signature_family_ids": np.load(self.root_dir / "signature_family_ids.npy", mmap_mode="r"),
+            "hierarchy_vectors": np.load(self.root_dir / "hierarchy_vectors.npy", mmap_mode="r")
+            if (self.root_dir / "hierarchy_vectors.npy").exists()
+            else None,
             "loss_mask": np.load(self.root_dir / "loss_mask.npy", mmap_mode="r"),
         }
         self.indices = self._build_indices()
@@ -3129,6 +3337,29 @@ class MemmapTokenDataset(Dataset):
         start = int(self.offsets[sample_index])
         length = int(self.lengths[sample_index])
         end = start + length
+        hierarchy_vectors_field = self.fields.get("hierarchy_vectors")
+        if hierarchy_vectors_field is not None:
+            hierarchy_vectors = torch.from_numpy(np.asarray(hierarchy_vectors_field[start:end]).copy()).to(dtype=torch.float32)
+        else:
+            input_ids = self._slice_field("input_ids", start, end, dtype=torch.long)
+            signature_ids = self._slice_field("signature_ids", start, end, dtype=torch.long)
+            signature_level_ids = self._slice_field("signature_level_ids", start, end, dtype=torch.long)
+            signature_relation_ids = self._slice_field("signature_relation_ids", start, end, dtype=torch.long)
+            parent_signature_ids = self._slice_field("parent_signature_ids", start, end, dtype=torch.long)
+            signature_family_ids = self._slice_field("signature_family_ids", start, end, dtype=torch.long)
+            hierarchy_vectors = _build_hierarchy_vector_tensor(
+                input_ids,
+                signature_ids,
+                signature_level_ids,
+                signature_relation_ids,
+                parent_signature_ids,
+                signature_family_ids,
+                token_vocab_size=max(int(self.meta.get("token_vocab_size", int(input_ids.max().item()) + 1 if input_ids.numel() > 0 else 1)), 1),
+                signature_vocab_size=max(int(self.meta.get("signature_vocab_size", int(signature_ids.max().item()) + 1 if signature_ids.numel() > 0 else 1)), 1),
+                level_vocab_size=max(int(self.meta.get("signature_level_vocab_size", int(signature_level_ids.max().item()) + 1 if signature_level_ids.numel() > 0 else 1)), 1),
+                relation_vocab_size=max(int(self.meta.get("signature_relation_vocab_size", int(signature_relation_ids.max().item()) + 1 if signature_relation_ids.numel() > 0 else 1)), 1),
+                family_vocab_size=max(int(self.meta.get("signature_family_vocab_size", int(signature_family_ids.max().item()) + 1 if signature_family_ids.numel() > 0 else 1)), 1),
+            )
         return WindowSample(
             input_ids=self._slice_field("input_ids", start, end, dtype=torch.long),
             labels=self._slice_field("labels", start, end, dtype=torch.long),
@@ -3137,6 +3368,7 @@ class MemmapTokenDataset(Dataset):
             signature_relation_ids=self._slice_field("signature_relation_ids", start, end, dtype=torch.long),
             parent_signature_ids=self._slice_field("parent_signature_ids", start, end, dtype=torch.long),
             signature_family_ids=self._slice_field("signature_family_ids", start, end, dtype=torch.long),
+            hierarchy_vectors=hierarchy_vectors,
             loss_mask=self._slice_field("loss_mask", start, end, dtype=torch.float32),
         )
 
@@ -3163,14 +3395,15 @@ def split_text_window_dataset(
 def build_collate_fn(
     pad_id: int,
     signature_pad_id: int = 0,
-    ) -> Callable[
+) -> Callable[
     [Sequence[WindowSample]],
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]:
     def collate(
         batch: Sequence[WindowSample],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         max_len = max(sample.input_ids.numel() for sample in batch)
+        hierarchy_dim = max(sample.hierarchy_vectors.size(-1) for sample in batch)
         inputs = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
         labels = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
         signatures = torch.full((len(batch), max_len), signature_pad_id, dtype=torch.long)
@@ -3178,6 +3411,7 @@ def build_collate_fn(
         signature_relations = torch.full((len(batch), max_len), SIGNATURE_RELATION_IDS["pad"], dtype=torch.long)
         parent_signatures = torch.full((len(batch), max_len), signature_pad_id, dtype=torch.long)
         signature_families = torch.full((len(batch), max_len), 0, dtype=torch.long)
+        hierarchy_vectors = torch.zeros((len(batch), max_len, hierarchy_dim), dtype=torch.float32)
         loss_masks = torch.zeros((len(batch), max_len), dtype=torch.float32)
         for i, sample in enumerate(batch):
             n = sample.input_ids.numel()
@@ -3188,8 +3422,9 @@ def build_collate_fn(
             signature_relations[i, : sample.signature_relation_ids.numel()] = sample.signature_relation_ids
             parent_signatures[i, : sample.parent_signature_ids.numel()] = sample.parent_signature_ids
             signature_families[i, : sample.signature_family_ids.numel()] = sample.signature_family_ids
+            hierarchy_vectors[i, : sample.hierarchy_vectors.size(0), : sample.hierarchy_vectors.size(1)] = sample.hierarchy_vectors
             loss_masks[i, : sample.loss_mask.numel()] = sample.loss_mask
-        return inputs, labels, signatures, signature_levels, signature_relations, parent_signatures, signature_families, loss_masks
+        return inputs, labels, signatures, signature_levels, signature_relations, parent_signatures, signature_families, hierarchy_vectors, loss_masks
 
     return collate
 
