@@ -81,6 +81,50 @@ def _scalar_stat_tensor(value: torch.Tensor | float | int, *, device: torch.devi
     return torch.tensor(float(value), device=device)
 
 
+def _aux_term_loss_breakdown(
+    *,
+    signature_loss: torch.Tensor,
+    signature_level_loss: torch.Tensor,
+    signature_relation_loss: torch.Tensor,
+    signature_contrastive_weight: float,
+    contrastive_loss: torch.Tensor,
+    contrastive_routing_weight: float,
+    contrastive_routing_loss: torch.Tensor,
+    routing_entropy_weight: float,
+    avg_entropy: torch.Tensor,
+    emitter_balance_weight: float,
+    balance_loss: torch.Tensor,
+    emitter_mixture_weight: float,
+    mixture_loss: torch.Tensor,
+    torus_active_balance_weight: float,
+    coverage_loss: torch.Tensor,
+    recursive_aux_weight: float,
+    recursive_aux_loss: torch.Tensor,
+    diversity_weight: float,
+    pairwise_diversity: torch.Tensor,
+    learned_residency_weight: float,
+    learned_residency_loss: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    components: Dict[str, torch.Tensor] = {
+        "aux_signature_loss_term": signature_loss,
+        "aux_signature_level_loss_term": signature_level_loss,
+        "aux_signature_relation_loss_term": signature_relation_loss,
+        "aux_signature_contrastive_term": signature_contrastive_weight * contrastive_loss,
+        "aux_contrastive_routing_term": contrastive_routing_weight * contrastive_routing_loss,
+        "aux_routing_entropy_term": -routing_entropy_weight * avg_entropy,
+        "aux_emitter_balance_term": emitter_balance_weight * balance_loss,
+        "aux_emitter_mixture_term": emitter_mixture_weight * mixture_loss,
+        "aux_torus_active_balance_term": torus_active_balance_weight * coverage_loss,
+        "aux_recursive_term": recursive_aux_weight * recursive_aux_loss,
+        "aux_diversity_term": -diversity_weight * pairwise_diversity,
+        "aux_learned_residency_term": learned_residency_weight * learned_residency_loss,
+    }
+    total = torch.zeros_like(signature_loss)
+    for component in components.values():
+        total = total + component
+    return total, components
+
+
 def _repair_finite_tensor(
     tensor: torch.Tensor,
     *,
@@ -5267,8 +5311,8 @@ class PrismalWaveModel(nn.Module):
             bits=int(getattr(cfg, "turbo_quantization_bits", 3)),
             method=str(getattr(cfg, "turbo_quantization_method", "turbo")),
             use_bitsandbytes_leaf_precision=bool(getattr(cfg, "use_bitsandbytes_leaf_precision", False)),
-            bitsandbytes_leaf_precision_mode=str(getattr(cfg, "bitsandbytes_leaf_precision_mode", "int4")),
-            bitsandbytes_leaf_quant_type=str(getattr(cfg, "bitsandbytes_leaf_quant_type", "nf4")),
+            bitsandbytes_leaf_precision_mode=str(getattr(cfg, "bitsandbytes_leaf_precision_mode", "fp4")),
+            bitsandbytes_leaf_quant_type=str(getattr(cfg, "bitsandbytes_leaf_quant_type", "fp4")),
             bitsandbytes_leaf_compute_dtype=str(getattr(cfg, "bitsandbytes_leaf_compute_dtype", "bfloat16")),
         )
         self.quantization_config = qcfg
@@ -7976,23 +8020,33 @@ class PrismalWaveModel(nn.Module):
         if profile_enabled:
             route_stats.update({key: torch.tensor(value, device=input_ids.device).detach() for key, value in timings.items()})
 
-        aux_loss = (
-            self.cfg.signature_loss_weight * signature_loss
-            + getattr(self.cfg, "signature_level_loss_weight", self.cfg.signature_loss_weight) * signature_level_loss
-            + getattr(self.cfg, "signature_relation_loss_weight", self.cfg.signature_loss_weight) * signature_relation_loss
-            + self.cfg.signature_contrastive_weight * contrastive_loss
-            + self.contrastive_routing_weight * contrastive_routing_loss
-            - self.cfg.routing_entropy_weight * avg_entropy
-            + float(getattr(self.cfg, "emitter_balance_weight", 0.0))
-            * route_stats.get("emitter_balance_loss", torch.tensor(0.0, device=input_ids.device))
-            + float(getattr(self.cfg, "emitter_mixture_weight", 0.0))
-            * avg_mixture_loss
-            + float(getattr(self.cfg, "torus_active_balance_weight", 0.0))
-            * avg_coverage_loss
-            + float(getattr(self.cfg, "recursive_aux_weight", 1.0)) * avg_recursive_aux_loss
-            - self.cfg.diversity_weight * pairwise_diversity
-            + self.learned_residency_weight * learned_residency_loss
+        aux_loss, aux_breakdown = _aux_term_loss_breakdown(
+            signature_loss=self.cfg.signature_loss_weight * signature_loss,
+            signature_level_loss=getattr(self.cfg, "signature_level_loss_weight", self.cfg.signature_loss_weight)
+            * signature_level_loss,
+            signature_relation_loss=getattr(self.cfg, "signature_relation_loss_weight", self.cfg.signature_loss_weight)
+            * signature_relation_loss,
+            signature_contrastive_weight=self.cfg.signature_contrastive_weight,
+            contrastive_loss=contrastive_loss,
+            contrastive_routing_weight=self.contrastive_routing_weight,
+            contrastive_routing_loss=contrastive_routing_loss,
+            routing_entropy_weight=self.cfg.routing_entropy_weight,
+            avg_entropy=avg_entropy,
+            emitter_balance_weight=float(getattr(self.cfg, "emitter_balance_weight", 0.0)),
+            balance_loss=route_stats.get("emitter_balance_loss", torch.tensor(0.0, device=input_ids.device)),
+            emitter_mixture_weight=float(getattr(self.cfg, "emitter_mixture_weight", 0.0)),
+            mixture_loss=avg_mixture_loss,
+            torus_active_balance_weight=float(getattr(self.cfg, "torus_active_balance_weight", 0.0)),
+            coverage_loss=avg_coverage_loss,
+            recursive_aux_weight=float(getattr(self.cfg, "recursive_aux_weight", 1.0)),
+            recursive_aux_loss=avg_recursive_aux_loss,
+            diversity_weight=self.cfg.diversity_weight,
+            pairwise_diversity=pairwise_diversity,
+            learned_residency_weight=self.learned_residency_weight,
+            learned_residency_loss=learned_residency_loss,
         )
+        route_stats.update({key: value.detach() for key, value in aux_breakdown.items()})
+        route_stats["aux_loss_total"] = aux_loss.detach()
 
         return PrismalWaveOutput(
             logits=final_logits,
@@ -8485,23 +8539,33 @@ class PrismalWaveModel(nn.Module):
         route_stats.update(contrastive_routing_stats)
         route_stats, route_repairs = self._sanitize_route_stats(route_stats, device=input_ids.device)
 
-        aux_loss = (
-            self.cfg.signature_loss_weight * signature_loss
-            + getattr(self.cfg, "signature_level_loss_weight", self.cfg.signature_loss_weight) * signature_level_loss
-            + getattr(self.cfg, "signature_relation_loss_weight", self.cfg.signature_loss_weight) * signature_relation_loss
-            + self.cfg.signature_contrastive_weight * contrastive_loss
-            + self.contrastive_routing_weight * contrastive_routing_loss
-            - self.cfg.routing_entropy_weight * avg_entropy
-            + float(getattr(self.cfg, "emitter_balance_weight", 0.0))
-            * avg_balance_loss
-            + float(getattr(self.cfg, "emitter_mixture_weight", 0.0))
-            * avg_mixture_loss
-            + float(getattr(self.cfg, "torus_active_balance_weight", 0.0))
-            * route_stats.get("torus_coverage_loss", torch.tensor(0.0, device=input_ids.device))
-            + avg_recursive_aux_loss
-            - self.cfg.diversity_weight * pairwise_diversity
-            + self.learned_residency_weight * learned_residency_loss
+        aux_loss, aux_breakdown = _aux_term_loss_breakdown(
+            signature_loss=self.cfg.signature_loss_weight * signature_loss,
+            signature_level_loss=getattr(self.cfg, "signature_level_loss_weight", self.cfg.signature_loss_weight)
+            * signature_level_loss,
+            signature_relation_loss=getattr(self.cfg, "signature_relation_loss_weight", self.cfg.signature_loss_weight)
+            * signature_relation_loss,
+            signature_contrastive_weight=self.cfg.signature_contrastive_weight,
+            contrastive_loss=contrastive_loss,
+            contrastive_routing_weight=self.contrastive_routing_weight,
+            contrastive_routing_loss=contrastive_routing_loss,
+            routing_entropy_weight=self.cfg.routing_entropy_weight,
+            avg_entropy=avg_entropy,
+            emitter_balance_weight=float(getattr(self.cfg, "emitter_balance_weight", 0.0)),
+            balance_loss=avg_balance_loss,
+            emitter_mixture_weight=float(getattr(self.cfg, "emitter_mixture_weight", 0.0)),
+            mixture_loss=avg_mixture_loss,
+            torus_active_balance_weight=float(getattr(self.cfg, "torus_active_balance_weight", 0.0)),
+            coverage_loss=route_stats.get("torus_coverage_loss", torch.tensor(0.0, device=input_ids.device)),
+            recursive_aux_weight=float(getattr(self.cfg, "recursive_aux_weight", 1.0)),
+            recursive_aux_loss=avg_recursive_aux_loss,
+            diversity_weight=self.cfg.diversity_weight,
+            pairwise_diversity=pairwise_diversity,
+            learned_residency_weight=self.learned_residency_weight,
+            learned_residency_loss=learned_residency_loss,
         )
+        route_stats.update({key: value.detach() for key, value in aux_breakdown.items()})
+        route_stats["aux_loss_total"] = aux_loss.detach()
         final_logits, logits_repairs = self._sanitize_tensor(final_logits, fallback=torch.zeros_like(final_logits))
         final_output_signature, signature_repairs = self._sanitize_tensor(
             final_output_signature,

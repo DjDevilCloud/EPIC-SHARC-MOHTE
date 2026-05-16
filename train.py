@@ -249,6 +249,7 @@ class ProgressTracker:
         usage_entropy: float | None = None,
         usage_concentration: float | None = None,
         torus_coverage: float | None = None,
+        aux_terms: Optional[Dict[str, float]] = None,
         stability_text: str = "",
         timings: Optional[Dict[str, float]] = None,
         force: bool = False,
@@ -279,13 +280,14 @@ class ProgressTracker:
             usage_text += f" eff_count={effective_emitters:.2f}"
         if emitter_cell_coverage is not None:
             usage_text += f" cell_cov={emitter_cell_coverage:.4f}"
+        aux_text = _format_aux_top_terms(aux_terms or {})
         stability_suffix = f" {stability_text}" if stability_text else ""
         if self.streaming_mode:
             print(
                 f"[Prismal] stream epoch {epoch_idx} "
                 f"batches_seen={done_batches} total={total_loss:.4f} ce={ce_loss:.4f} aux={aux_loss:.4f} "
                 f"sig={signature_agreement:.4f} entropy={entropy:.4f} raw={raw_active_emitters:.2f} "
-                f"rate={rate:.2f} batches/s{usage_text}{stability_suffix}{timing_text}",
+                f"rate={rate:.2f} batches/s{usage_text}{aux_text}{stability_suffix}{timing_text}",
                 flush=True,
             )
             self.last_print_time = now
@@ -295,7 +297,7 @@ class ProgressTracker:
             f"batch {batch_idx}/{self.batches_per_epoch} "
             f"({100.0 * done_batches / max(self.total_batches, 1):.1f}%) total={total_loss:.4f} ce={ce_loss:.4f} aux={aux_loss:.4f} "
             f"sig={signature_agreement:.4f} entropy={entropy:.4f} raw={raw_active_emitters:.2f} "
-            f"rate={rate:.2f} batches/s eta={max(self.total_batches - done_batches, 0) / max(rate, 1e-6) / 60.0:.1f}m{usage_text}{stability_suffix}{timing_text}",
+            f"rate={rate:.2f} batches/s eta={max(self.total_batches - done_batches, 0) / max(rate, 1e-6) / 60.0:.1f}m{usage_text}{aux_text}{stability_suffix}{timing_text}",
             flush=True,
         )
         self.last_print_time = now
@@ -917,6 +919,39 @@ def _stat_value(route_stats: Dict[str, torch.Tensor], *keys: str, default: float
     return float(default)
 
 
+AUX_BREAKDOWN_KEYS: tuple[str, ...] = (
+    "aux_signature_loss_term",
+    "aux_signature_level_loss_term",
+    "aux_signature_relation_loss_term",
+    "aux_signature_contrastive_term",
+    "aux_contrastive_routing_term",
+    "aux_routing_entropy_term",
+    "aux_emitter_balance_term",
+    "aux_emitter_mixture_term",
+    "aux_torus_active_balance_term",
+    "aux_recursive_term",
+    "aux_diversity_term",
+    "aux_learned_residency_term",
+    "aux_loss_total",
+)
+
+
+def _aux_breakdown_values(route_stats: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    return {key: _stat_value(route_stats, key) for key in AUX_BREAKDOWN_KEYS}
+
+
+def _format_aux_top_terms(aux_terms: Dict[str, float], top_n: int = 3) -> str:
+    items = [(key, float(value)) for key, value in aux_terms.items() if key != "aux_loss_total" and math.isfinite(float(value))]
+    if not items:
+        return ""
+    items.sort(key=lambda item: abs(item[1]), reverse=True)
+    parts = []
+    for key, value in items[:top_n]:
+        label = key.removeprefix("aux_").removesuffix("_term")
+        parts.append(f"{label}={value:+.4f}")
+    return " aux_top=[" + ", ".join(parts) + "]"
+
+
 def _checkpoint_mismatch_is_tolerable(missing: Sequence[str], unexpected: Sequence[str]) -> bool:
     tolerated_missing_exact = {
         "signature_embedding.weight",
@@ -1326,6 +1361,7 @@ def evaluate_model(
     cell_coverage = []
     usage_entropy = []
     usage_concentration = []
+    aux_breakdown_sums = {key: 0.0 for key in AUX_BREAKDOWN_KEYS}
     try:
         for input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask in dataloader:
             input_ids = input_ids.to(device)
@@ -1370,6 +1406,9 @@ def evaluate_model(
             cell_coverage.append(_stat_value(output.route_stats, "emitter_cell_coverage_loss", "torus_coverage_loss"))
             usage_entropy.append(_stat_value(output.route_stats, "emitter_usage_entropy"))
             usage_concentration.append(_stat_value(output.route_stats, "emitter_usage_concentration"))
+            aux_values = _aux_breakdown_values(output.route_stats)
+            for key, value in aux_values.items():
+                aux_breakdown_sums[key] += value
         return {
             "loss": sum(losses) / max(len(losses), 1),
             "ce_loss": sum(ce_losses) / max(len(ce_losses), 1),
@@ -1392,6 +1431,7 @@ def evaluate_model(
             "avg_emitter_cell_coverage_loss": sum(cell_coverage) / max(len(cell_coverage), 1),
             "avg_emitter_usage_entropy": sum(usage_entropy) / max(len(usage_entropy), 1),
             "avg_emitter_usage_concentration": sum(usage_concentration) / max(len(usage_concentration), 1),
+            **{key: aux_breakdown_sums[key] / max(len(losses), 1) for key in AUX_BREAKDOWN_KEYS},
         }
     finally:
         _set_force_aux_stats(model, force_aux_stats)
@@ -1520,10 +1560,12 @@ def train_model(
     loss_sum: Optional[float] = None
     ce_loss_sum: Optional[float] = None
     aux_loss_sum: Optional[float] = None
+    aux_component_sum = {key: None for key in AUX_BREAKDOWN_KEYS}
     best_loss_tensor: Optional[float] = None
     last_loss_tensor: Optional[float] = None
     last_ce_loss_tensor: Optional[float] = None
     last_aux_loss_tensor: Optional[float] = None
+    last_aux_component_values: Dict[str, float] = {key: float("nan") for key in AUX_BREAKDOWN_KEYS}
     route_agreement_sum: Optional[float] = None
     route_entropy_sum: Optional[float] = None
     route_active_sum: Optional[float] = None
@@ -1843,6 +1885,10 @@ def train_model(
         loss_sum = loss_value if loss_sum is None else loss_sum + loss_value
         ce_loss_sum = ce_value if ce_loss_sum is None else ce_loss_sum + ce_value
         aux_loss_sum = aux_value if aux_loss_sum is None else aux_loss_sum + aux_value
+        aux_values = _aux_breakdown_values(output.route_stats)
+        for key, value in aux_values.items():
+            last_aux_component_values[key] = value
+            aux_component_sum[key] = value if aux_component_sum[key] is None else aux_component_sum[key] + value
         best_loss_tensor = loss_value if best_loss_tensor is None else min(best_loss_tensor, loss_value)
 
         if should_collect:
@@ -1932,6 +1978,7 @@ def train_model(
                 usage_entropy=usage_entropy,
                 usage_concentration=usage_concentration,
                 torus_coverage=torus_coverage,
+                aux_terms=aux_values,
                 stability_text=last_stability_text,
                 timings=batch_timings,
             )
@@ -2063,6 +2110,18 @@ def train_model(
         "val_total_loss": float(val_losses[-1]) if val_losses else float("nan"),
         "val_ce_loss": float(last_val_metrics["ce_loss"]) if last_val_metrics is not None else float("nan"),
         "val_aux_loss": float(last_val_metrics["aux_loss"]) if last_val_metrics is not None else float("nan"),
+        **{
+            f"final_{key}": _tensor_float(last_aux_component_values.get(key))
+            for key in AUX_BREAKDOWN_KEYS
+        },
+        **{
+            f"avg_{key}": safe_step_avg(aux_component_sum.get(key))
+            for key in AUX_BREAKDOWN_KEYS
+        },
+        **{
+            f"val_{key}": float(last_val_metrics[key]) if last_val_metrics is not None and key in last_val_metrics else float("nan")
+            for key in AUX_BREAKDOWN_KEYS
+        },
         "best_val_loss": float(min(val_losses)) if val_losses else float("nan"),
         "final_loss": _tensor_float(last_loss_tensor),
         "best_loss": _tensor_float(best_loss_tensor),

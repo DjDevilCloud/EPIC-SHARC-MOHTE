@@ -46,7 +46,7 @@ class QuantizationConfig:
     adapter_alpha: float = 16.0  # Adapter scaling factor
     adapter_dropout: float = 0.0  # Optional adapter dropout
     use_bitsandbytes_leaf_precision: bool = True
-    bitsandbytes_leaf_precision_mode: str = "int4"
+    bitsandbytes_leaf_precision_mode: str = "fp4"
     bitsandbytes_leaf_quant_type: str = "nf4"
     bitsandbytes_leaf_compute_dtype: str = "bfloat16"
 
@@ -481,8 +481,8 @@ class BitsAndBytesLeafLinear(nn.Module):
         self.compute_dtype = _resolve_compute_dtype_name(getattr(self.config, "bitsandbytes_leaf_compute_dtype", "bfloat16"))
         quant_type = str(getattr(self.config, "bitsandbytes_leaf_quant_type", "nf4")).strip().lower()
         self.quant_type = quant_type if quant_type in {"fp4", "nf4"} else "nf4"
-        precision_mode = str(getattr(self.config, "bitsandbytes_leaf_precision_mode", "int4")).strip().lower()
-        self.precision_mode = precision_mode if precision_mode in {"int4"} else "int4"
+        precision_mode = str(getattr(self.config, "bitsandbytes_leaf_precision_mode", "fp4")).strip().lower()
+        self.precision_mode = precision_mode if precision_mode in {"int4", "fp4"} else "fp4"
         # Leaf modules stay 4-bit whenever bitsandbytes is available, even if the
         # rest of the model is running the non-quantized path.
         self._use_bnb = bool(_bitsandbytes_ready() and getattr(self.config, "use_bitsandbytes_leaf_precision", False))
