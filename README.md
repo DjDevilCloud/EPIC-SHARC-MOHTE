@@ -1,5 +1,7 @@
 # EPIC-SHARC MOHTE v0.2.1 
 
+NOTE: YOU WILL WANT TO ADJUST THE CONFIG FOR YOUR MACHINE/GPU! Many GPUs do not accept all precisions, so ensure to adjust it to fit your hardware properly. You will also want to scale the model dim/torus based on your VRAM maximum.
+
 v0.2.1 Update added:
 
 EPIC-SHARC MOHTE GATE
