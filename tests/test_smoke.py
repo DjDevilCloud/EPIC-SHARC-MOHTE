@@ -22,6 +22,7 @@ from cli import build_parser, _build_config, _resolve_tokenizer_bootstrap
 from data import PrismalTokenizer, iter_text_corpus
 from model import PrismalTorusCore, PrismalWaveModel
 from muon_optim import PrecisionAdaptiveHierarchicalOptimizer
+from quantization import QuantizationConfig
 from train import build_train_val_dataloaders, generate_text, load_model_from_checkpoint, save_checkpoint, train_model, _clip_optimizer_group_gradients, _token_superposition_phase_active
 
 
@@ -496,6 +497,10 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("contrastive_routing_residency_loss", output.route_stats)
         self.assertIn("contrastive_routing_cross_view_loss", output.route_stats)
         self.assertIn("contrastive_routing_self_contrast_loss", output.route_stats)
+        self.assertIn("aux_signature_loss_term", output.route_stats)
+        self.assertIn("aux_routing_entropy_term", output.route_stats)
+        self.assertIn("aux_loss_total", output.route_stats)
+        self.assertTrue(torch.isclose(output.route_stats["aux_loss_total"], output.aux_loss.detach(), atol=1e-6).item())
         self.assertTrue(torch.isfinite(output.route_stats["contrastive_routing_loss"]))
 
     def test_contrastive_routing_cli_flags_parse(self) -> None:
@@ -695,6 +700,16 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(saved_cfg.grad_clip_muon, cfg.grad_clip_muon)
         self.assertEqual(saved_cfg.grad_clip_scalar, cfg.grad_clip_scalar)
         self.assertEqual(saved_cfg.grad_clip_rowwise, cfg.grad_clip_rowwise)
+
+    def test_leaf_precision_mode_preserves_fp4(self) -> None:
+        cfg = PrismalWaveConfig()
+        self.assertEqual(cfg.bitsandbytes_leaf_precision_mode, "fp4")
+        self.assertEqual(cfg.bitsandbytes_leaf_quant_type, "fp4")
+        self.assertEqual(cfg.bitsandbytes_leaf_compute_dtype, "bfloat16")
+
+        quant_cfg = QuantizationConfig(bitsandbytes_leaf_precision_mode="fp4", bitsandbytes_leaf_quant_type="fp4")
+        self.assertEqual(quant_cfg.bitsandbytes_leaf_precision_mode, "fp4")
+        self.assertEqual(quant_cfg.bitsandbytes_leaf_quant_type, "fp4")
 
     def test_torus_checkpoint_without_router_weights_loads(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -1468,6 +1483,7 @@ class SmokeTests(unittest.TestCase):
         cfg.token_memory_copy_bias = 1.0
         cfg.token_memory_rare_token_cutoff = 2
         cfg.profile_runtime = True
+        cfg.profile_vram = True
         cfg.use_turbo_quantization = False
         cfg.use_bitsandbytes_leaf_precision = False
         cfg.use_speculative_decoding = False
@@ -1511,6 +1527,12 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("timing_token_memory_total_ms", output.route_stats)
         self.assertIn("timing_token_memory_query_ms", output.route_stats)
         self.assertIn("timing_encode_embed_ms", output.route_stats)
+        self.assertIn("vram_profile_enabled", output.route_stats)
+        self.assertIn("vram_encode_alloc_delta_mb", output.route_stats)
+        self.assertIn("vram_token_memory_alloc_delta_mb", output.route_stats)
+        self.assertIn("vram_path_core_alloc_delta_mb", output.route_stats)
+        self.assertGreaterEqual(float(output.route_stats["vram_encode_alloc_delta_mb"].item()), 0.0)
+        self.assertGreaterEqual(float(output.route_stats["vram_token_memory_alloc_delta_mb"].item()), 0.0)
         copy_logits = output.route_stats["token_memory_copy_logits"]
         self.assertEqual(copy_logits.shape[-1], cfg.vocab_size)
         repeated_score = float(copy_logits[0, repeated_token_id].item())
