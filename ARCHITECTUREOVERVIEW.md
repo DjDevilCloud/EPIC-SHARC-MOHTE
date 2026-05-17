@@ -154,6 +154,7 @@ It includes:
 - root, mid, and leaf dtype controls
 - BF16 and float8-style execution paths where supported
 - bitsandbytes leaf precision support
+- Transformer Engine NVFP4 support for Blackwell-class GPUs when the backend is available and the explicit `nvfp4` recipe is selected
 - quantization-aware training scheduling
 - cached quantized modules and cache refresh hooks
 
@@ -230,6 +231,7 @@ Some of the most important families of knobs are:
 - recursive hierarchy: `hierarchical_nest_depth`, `recursive_hmoe_depth`, `recursive_hmoe_branching`
 - signature lattice: `signature_lattice_dim`, `signature_lattice_buckets`, `signature_lattice_candidates`
 - precision and quantization: `hierarchical_precision_*`, `use_bitsandbytes_leaf_precision`, `use_turbo_quantization`
+- Blackwell-specific leaf precision: `use_transformer_engine_leaf_precision`, `transformer_engine_leaf_recipe`, `transformer_engine_leaf_params_dtype`
 - generation behavior: `use_speculative_decoding`, `speculative_draft_tokens`, `speculative_temperature`
 - boundary handling: span-role logic in `data.py`, `use_pronunciation_signatures`, `signature_lattice_chunk_len`
 

@@ -70,6 +70,9 @@ except ImportError:  # pragma: no cover - supports direct script launching.
     from quantization import refresh_quantized_caches
 
 
+_VRAM_BYTES_PER_MIB = float(1024.0 * 1024.0)
+
+
 def _supervised_tokenizer_texts(texts: Iterable[str]) -> Iterable[str]:
     for text in texts:
         if not isinstance(text, str):
@@ -252,6 +255,8 @@ class ProgressTracker:
         aux_terms: Optional[Dict[str, float]] = None,
         stability_text: str = "",
         timings: Optional[Dict[str, float]] = None,
+        vram: Optional[Dict[str, float]] = None,
+        precision_text: str = "",
         force: bool = False,
     ) -> None:
         if not self.should_print(epoch_idx, batch_idx, force=force):
@@ -261,6 +266,8 @@ class ProgressTracker:
         elapsed = max(now - self.start_time, 1e-6)
         rate = done_batches / elapsed
         timing_text = _format_timing_breakdown(timings or {})
+        vram_text = _format_vram_breakdown(vram or {})
+        precision_suffix = f"{precision_text}" if precision_text else ""
         usage_text = ""
         if usage_entropy is not None:
             usage_text = f" usage={usage_entropy:.4f}"
@@ -287,7 +294,7 @@ class ProgressTracker:
                 f"[Prismal] stream epoch {epoch_idx} "
                 f"batches_seen={done_batches} total={total_loss:.4f} ce={ce_loss:.4f} aux={aux_loss:.4f} "
                 f"sig={signature_agreement:.4f} entropy={entropy:.4f} raw={raw_active_emitters:.2f} "
-                f"rate={rate:.2f} batches/s{usage_text}{aux_text}{stability_suffix}{timing_text}",
+                f"rate={rate:.2f} batches/s{usage_text}{aux_text}{stability_suffix}{precision_suffix}{timing_text}{vram_text}",
                 flush=True,
             )
             self.last_print_time = now
@@ -297,7 +304,7 @@ class ProgressTracker:
             f"batch {batch_idx}/{self.batches_per_epoch} "
             f"({100.0 * done_batches / max(self.total_batches, 1):.1f}%) total={total_loss:.4f} ce={ce_loss:.4f} aux={aux_loss:.4f} "
             f"sig={signature_agreement:.4f} entropy={entropy:.4f} raw={raw_active_emitters:.2f} "
-            f"rate={rate:.2f} batches/s eta={max(self.total_batches - done_batches, 0) / max(rate, 1e-6) / 60.0:.1f}m{usage_text}{aux_text}{stability_suffix}{timing_text}",
+            f"rate={rate:.2f} batches/s eta={max(self.total_batches - done_batches, 0) / max(rate, 1e-6) / 60.0:.1f}m{usage_text}{aux_text}{stability_suffix}{precision_suffix}{timing_text}{vram_text}",
             flush=True,
         )
         self.last_print_time = now
@@ -465,7 +472,7 @@ def build_tokenizer_from_source(
     max_line_tokens: int = 0,
     max_signature_tokens: int = 0,
     max_source_samples: int = 0,
-    supervised_only: bool = True,
+    supervised_only: bool = False,
     use_pronunciation_signatures: bool = True,
     tokenizer_workers: int = 1,
     tokenizer_cache_dir: str | Path | None = None,
@@ -746,6 +753,9 @@ def save_checkpoint(
             "bitsandbytes_leaf_precision_mode",
             "bitsandbytes_leaf_quant_type",
             "bitsandbytes_leaf_compute_dtype",
+            "use_transformer_engine_leaf_precision",
+            "transformer_engine_leaf_recipe",
+            "transformer_engine_leaf_params_dtype",
             "training_finite_guard_enabled",
             "inference_finite_guard_enabled",
             "grad_clip_muon",
@@ -807,6 +817,55 @@ def save_checkpoint(
     return ckpt_path
 
 
+def _module_parameter_breakdown(model: PrismalWaveModel) -> Dict[str, float]:
+    module_names = [
+        "registry",
+        "construction_embedding",
+        "position_embedding",
+        "hierarchy_vector_projection",
+        "token_hierarchy",
+        "signature_lattice_attention",
+        "token_memory_attention",
+        "torus_core",
+        "router",
+        "blocks",
+        "final_norm",
+        "signature_head",
+        "signature_token_head",
+        "signature_neighborhood_embedding",
+        "signature_neighborhood_gate",
+        "construction_head",
+        "learned_residency_head",
+        "gatetrain_controller",
+    ]
+    named_params = list(model.named_parameters())
+    seen: set[int] = set()
+    breakdown: Dict[str, float] = {}
+    for name in module_names:
+        total_bytes = 0.0
+        prefix = f"{name}."
+        for param_name, param in named_params:
+            if param_name == name or param_name.startswith(prefix):
+                ident = id(param)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                total_bytes += float(param.numel() * param.element_size())
+        if total_bytes > 0.0:
+            breakdown[f"param_{name}_mb"] = total_bytes / _VRAM_BYTES_PER_MIB
+    remaining_bytes = 0.0
+    for _, param in named_params:
+        ident = id(param)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        remaining_bytes += float(param.numel() * param.element_size())
+    if remaining_bytes > 0.0:
+        breakdown["param_other_mb"] = remaining_bytes / _VRAM_BYTES_PER_MIB
+    breakdown["param_total_mb"] = float(sum(p.numel() * p.element_size() for p in model.parameters())) / _VRAM_BYTES_PER_MIB
+    return breakdown
+
+
 def _accumulate_timings(bucket: Dict[str, float], route_stats: Dict[str, torch.Tensor]) -> None:
     for key, value in route_stats.items():
         if not key.startswith("timing_") or key.endswith("_total_ms") or key.endswith("_step_ms"):
@@ -827,6 +886,61 @@ def _extract_timings(route_stats: Dict[str, torch.Tensor], *, include_totals: bo
         else:
             timings[key] = float(value)
     return timings
+
+
+def _accumulate_vram(bucket: Dict[str, float], route_stats: Dict[str, torch.Tensor]) -> None:
+    for key, value in route_stats.items():
+        if not key.startswith("vram_") or key == "vram_profile_enabled":
+            continue
+        if torch.is_tensor(value):
+            bucket[key] = bucket.get(key, 0.0) + float(value.detach().mean().item())
+        else:
+            bucket[key] = bucket.get(key, 0.0) + float(value)
+
+
+def _extract_vram(route_stats: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    vram: Dict[str, float] = {}
+    for key, value in route_stats.items():
+        if not key.startswith("vram_") or key == "vram_profile_enabled":
+            continue
+        if torch.is_tensor(value):
+            vram[key] = float(value.detach().mean().item())
+        else:
+            vram[key] = float(value)
+    return vram
+
+
+def _cuda_vram_snapshot(device: torch.device) -> Dict[str, float]:
+    if device.type != "cuda":
+        return {
+            "alloc_mb": 0.0,
+            "reserved_mb": 0.0,
+            "active_mb": 0.0,
+            "inactive_split_mb": 0.0,
+            "peak_alloc_mb": 0.0,
+            "peak_reserved_mb": 0.0,
+        }
+    stats = torch.cuda.memory_stats(device)
+    mib = _VRAM_BYTES_PER_MIB
+    return {
+        "alloc_mb": float(torch.cuda.memory_allocated(device)) / mib,
+        "reserved_mb": float(torch.cuda.memory_reserved(device)) / mib,
+        "active_mb": float(stats.get("active_bytes.all.current", 0.0)) / mib,
+        "inactive_split_mb": float(stats.get("inactive_split_bytes.all.current", 0.0)) / mib,
+        "peak_alloc_mb": float(torch.cuda.max_memory_allocated(device)) / mib,
+        "peak_reserved_mb": float(torch.cuda.max_memory_reserved(device)) / mib,
+    }
+
+
+def _optimizer_state_memory_mb(optimizer: torch.optim.Optimizer) -> float:
+    total_bytes = 0
+    for state in optimizer.state.values():
+        if not isinstance(state, dict):
+            continue
+        for value in state.values():
+            if torch.is_tensor(value):
+                total_bytes += int(value.numel() * value.element_size())
+    return float(total_bytes) / _VRAM_BYTES_PER_MIB
 
 
 def _format_timing_group(label: str, timings: Dict[str, float], keys: Sequence[tuple[str, str]]) -> tuple[str, set[str]]:
@@ -906,6 +1020,104 @@ def _format_timing_breakdown(timings: Dict[str, float]) -> str:
         groups.append(tail)
 
     return " " + " ".join(groups) if groups else ""
+
+
+def _format_vram_breakdown(vram: Dict[str, float]) -> str:
+    if not vram:
+        return ""
+    def _fmt_pair(prefix: str) -> str:
+        alloc = float(vram.get(f"vram_{prefix}_alloc_mb", 0.0))
+        reserved = float(vram.get(f"vram_{prefix}_reserved_mb", 0.0))
+        active = float(vram.get(f"vram_{prefix}_active_mb", 0.0))
+        inactive = float(vram.get(f"vram_{prefix}_inactive_split_mb", 0.0))
+        parts: list[str] = []
+        if alloc > 0.0:
+            parts.append(f"alloc={alloc:.1f}MB")
+        if reserved > 0.0:
+            parts.append(f"reserved={reserved:.1f}MB")
+        if active > 0.0:
+            parts.append(f"active={active:.1f}MB")
+        if inactive > 0.0:
+            parts.append(f"inactive={inactive:.1f}MB")
+        return ", ".join(parts)
+
+    stages = [
+        ("train_start", "vram_train_start"),
+        ("train_forward_peak", "vram_train_forward_peak"),
+        ("train_backward_peak", "vram_train_backward_peak"),
+        ("train_step_peak", "vram_train_step_peak"),
+        ("encode", "vram_encode_alloc_delta_mb"),
+        ("signature_lattice", "vram_signature_lattice_alloc_delta_mb"),
+        ("token_memory", "vram_token_memory_alloc_delta_mb"),
+        ("sharc_router", "vram_sharc_router_alloc_delta_mb"),
+        ("path_core", "vram_path_core_alloc_delta_mb"),
+        ("path_overlay", "vram_path_overlay_alloc_delta_mb"),
+        ("path_finalize", "vram_path_finalize_alloc_delta_mb"),
+        ("path_aggregate", "vram_path_aggregate_alloc_delta_mb"),
+        ("torus_step", "vram_torus_step_alloc_delta_mb"),
+        ("train_end", "vram_train_end"),
+        ("optimizer_state", "vram_optimizer_state_mb"),
+    ]
+    parts = []
+    for label, key in stages:
+        if key.startswith("vram_train_"):
+            prefix = key.removeprefix("vram_")
+            pair_text = _fmt_pair(prefix)
+            if pair_text:
+                parts.append(f"{label}({pair_text})")
+            continue
+        value = float(vram.get(key, 0.0))
+        if value > 0.0:
+            parts.append(f"{label}={value:.1f}MB")
+    if not parts:
+        return ""
+    return " vram(" + " / ".join(parts) + ")"
+
+
+def _format_precision_breakdown(model: PrismalWaveModel) -> str:
+    def _spec_summary(spec: object | None) -> str:
+        if spec is None:
+            return "none"
+        tier = str(getattr(spec, "tier", "unknown"))
+        mode = str(getattr(spec, "mode", "unknown"))
+        requested = str(getattr(spec, "requested_compute_dtype", "unknown"))
+        effective = str(getattr(spec, "effective_compute_dtype", "unknown"))
+        float8_requested = bool(getattr(spec, "float8_requested", False))
+        float8_supported = bool(getattr(spec, "float8_supported", False))
+        support = "float8" if float8_supported else "no-float8" if float8_requested else "n/a"
+        return f"{tier}:requested={requested} effective={effective} backend={support}[{mode}]"
+
+    def _module_spec(module: object | None) -> object | None:
+        if module is None:
+            return None
+        return getattr(module, "precision_spec", None)
+
+    root_spec = _module_spec(model)
+    pieces = [f"root={_spec_summary(root_spec)}"]
+    for label, module in (
+        ("torus", getattr(model, "torus_core", None)),
+        ("router", getattr(model, "router", None)),
+        ("token_hierarchy", getattr(model, "token_hierarchy", None)),
+        ("signature_lattice", getattr(model, "signature_lattice_attention", None)),
+        ("token_memory", getattr(model, "token_memory_attention", None)),
+    ):
+        spec = _module_spec(module)
+        if spec is not None:
+            pieces.append(f"{label}={_spec_summary(spec)}")
+
+    tier_map = getattr(model, "_precision_tier_map", None)
+    if isinstance(tier_map, list) and tier_map:
+        counts: Dict[str, int] = {}
+        for entry in tier_map:
+            if not isinstance(entry, dict):
+                continue
+            tier = str(entry.get("tier", "unknown"))
+            counts[tier] = counts.get(tier, 0) + 1
+        if counts:
+            counts_text = ",".join(f"{tier}:{count}" for tier, count in sorted(counts.items()))
+            pieces.append(f"tiers={counts_text}")
+
+    return " precision(" + " / ".join(pieces) + ")"
 
 
 def _stat_value(route_stats: Dict[str, torch.Tensor], *keys: str, default: float = 0.0) -> float:
@@ -1478,6 +1690,9 @@ def train_model(
         "bitsandbytes_leaf_precision_mode",
         "bitsandbytes_leaf_quant_type",
         "bitsandbytes_leaf_compute_dtype",
+        "use_transformer_engine_leaf_precision",
+        "transformer_engine_leaf_recipe",
+        "transformer_engine_leaf_params_dtype",
         "use_gradient_accumulation",
         "gradient_accumulation_steps",
         "quantization_aware_training",
@@ -1604,6 +1819,7 @@ def train_model(
     val_agreements = []
     last_val_metrics: Optional[Dict[str, float]] = None
     timing_totals: Dict[str, float] = {}
+    vram_totals: Dict[str, float] = {}
     start = time.perf_counter()
     step = 0
     limit_seconds = minutes * 60.0 if minutes is not None else None
@@ -1828,6 +2044,33 @@ def train_model(
             or batch_idx == batches_per_epoch
             or (step_limit > 0 and next_step == step_limit)
         )
+        batch_vram_enabled = bool(getattr(cfg, "profile_vram", False)) and device.type == "cuda"
+        batch_vram: Dict[str, float] = {}
+        if batch_vram_enabled:
+            torch.cuda.reset_peak_memory_stats(device)
+            batch_vram.update(
+                {
+                    "vram_train_start_alloc_mb": float(torch.cuda.memory_allocated(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_start_reserved_mb": float(torch.cuda.memory_reserved(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_start_active_mb": float(torch.cuda.memory_stats(device).get("active_bytes.all.current", 0.0))
+                    / _VRAM_BYTES_PER_MIB,
+                    "vram_train_start_inactive_split_mb": float(
+                        torch.cuda.memory_stats(device).get("inactive_split_bytes.all.current", 0.0)
+                    )
+                    / _VRAM_BYTES_PER_MIB,
+                    "vram_optimizer_state_mb": _optimizer_state_memory_mb(optimizer),
+                }
+            )
+        else:
+            batch_vram.update(
+                {
+                    "vram_train_start_alloc_mb": 0.0,
+                    "vram_train_start_reserved_mb": 0.0,
+                    "vram_train_start_active_mb": 0.0,
+                    "vram_train_start_inactive_split_mb": 0.0,
+                    "vram_optimizer_state_mb": 0.0,
+                }
+            )
         context = _precision_context(precision_policy, device, use_amp=use_amp)
         with context:
             loss, output = model.compute_loss(
@@ -1843,6 +2086,23 @@ def train_model(
                 superposition_bag_size=token_superposition_bag_size,
                 collect_telemetry=should_collect,
             )
+        if batch_vram_enabled:
+            forward_stats = torch.cuda.memory_stats(device)
+            batch_vram.update(
+                {
+                    "vram_train_forward_peak_alloc_mb": float(torch.cuda.max_memory_allocated(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_forward_peak_reserved_mb": float(torch.cuda.max_memory_reserved(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_forward_alloc_mb": float(torch.cuda.memory_allocated(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_forward_reserved_mb": float(torch.cuda.memory_reserved(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_forward_active_mb": float(forward_stats.get("active_bytes.all.current", 0.0))
+                    / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_forward_inactive_split_mb": float(
+                        forward_stats.get("inactive_split_bytes.all.current", 0.0)
+                    )
+                    / _VRAM_BYTES_PER_MIB,
+                }
+            )
+            torch.cuda.reset_peak_memory_stats(device)
         repair_count = 0
         stability_value = output.route_stats.get("stability_nonfinite_repair_count")
         if torch.is_tensor(stability_value):
@@ -1867,6 +2127,23 @@ def train_model(
             scaler.scale(scaled_loss).backward()
         else:
             scaled_loss.backward()
+        if batch_vram_enabled:
+            backward_stats = torch.cuda.memory_stats(device)
+            batch_vram.update(
+                {
+                    "vram_train_backward_peak_alloc_mb": float(torch.cuda.max_memory_allocated(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_backward_peak_reserved_mb": float(torch.cuda.max_memory_reserved(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_backward_alloc_mb": float(torch.cuda.memory_allocated(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_backward_reserved_mb": float(torch.cuda.memory_reserved(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_backward_active_mb": float(backward_stats.get("active_bytes.all.current", 0.0))
+                    / _VRAM_BYTES_PER_MIB,
+                    "vram_train_after_backward_inactive_split_mb": float(
+                        backward_stats.get("inactive_split_bytes.all.current", 0.0)
+                    )
+                    / _VRAM_BYTES_PER_MIB,
+                }
+            )
+            torch.cuda.reset_peak_memory_stats(device)
         accumulation_step += 1
         should_step_scheduler = False
         clipped_groups = 0
@@ -1874,6 +2151,21 @@ def train_model(
             should_step_scheduler, clipped_groups = _finish_optimizer_step()
             if clipped_groups > 0:
                 last_stability_text = f"repairs={repair_count} clip_groups={clipped_groups}"
+        if batch_vram_enabled:
+            step_stats = torch.cuda.memory_stats(device)
+            batch_vram.update(
+                {
+                    "vram_train_step_peak_alloc_mb": float(torch.cuda.max_memory_allocated(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_step_peak_reserved_mb": float(torch.cuda.max_memory_reserved(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_end_alloc_mb": float(torch.cuda.memory_allocated(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_end_reserved_mb": float(torch.cuda.memory_reserved(device)) / _VRAM_BYTES_PER_MIB,
+                    "vram_train_end_active_mb": float(step_stats.get("active_bytes.all.current", 0.0))
+                    / _VRAM_BYTES_PER_MIB,
+                    "vram_train_end_inactive_split_mb": float(step_stats.get("inactive_split_bytes.all.current", 0.0))
+                    / _VRAM_BYTES_PER_MIB,
+                }
+            )
+            output.route_stats.update({key: torch.tensor(value, device=device).detach() for key, value in batch_vram.items()})
 
         step += 1
         loss_value = float(loss.detach().item())
@@ -1944,6 +2236,7 @@ def train_model(
                 gatetrain_full_scope_sum = _stat_value(output.route_stats, "gatetrain_full_scope") if gatetrain_full_scope_sum is None else gatetrain_full_scope_sum + _stat_value(output.route_stats, "gatetrain_full_scope")
             diagnostic_count += 1
             _accumulate_timings(timing_totals, output.route_stats)
+            _accumulate_vram(vram_totals, output.route_stats)
 
         if progress and should_collect:
             sig = float(output.route_stats["signature_agreement"].mean().item())
@@ -1959,6 +2252,7 @@ def train_model(
             balance_loss = float(output.route_stats["emitter_balance_loss"].item()) if "emitter_balance_loss" in output.route_stats else None
             torus_coverage = float(output.route_stats["torus_coverage_loss"].item()) if "torus_coverage_loss" in output.route_stats else None
             batch_timings = _extract_timings(output.route_stats, include_totals=True)
+            batch_vram = _extract_vram(output.route_stats)
             tracker.emit(
                 epoch_idx=epoch_idx,
                 batch_idx=batch_idx,
@@ -1980,7 +2274,9 @@ def train_model(
                 torus_coverage=torus_coverage,
                 aux_terms=aux_values,
                 stability_text=last_stability_text,
+                precision_text=_format_precision_breakdown(runtime_model),
                 timings=batch_timings,
+                vram=batch_vram,
             )
 
     if epoch_count > 0:
@@ -2170,6 +2466,11 @@ def train_model(
         "timing_breakdown_ms_per_step": {
             key: float(value / max(step, 1)) for key, value in sorted(timing_totals.items())
         },
+        "vram_breakdown_mb_total": dict(sorted(vram_totals.items())),
+        "vram_breakdown_mb_per_step": {
+            key: float(value / max(step, 1)) for key, value in sorted(vram_totals.items())
+        },
+        "param_breakdown_mb": dict(sorted(_module_parameter_breakdown(model).items())),
         "param_count": float(sum(p.numel() for p in model.parameters())),
     }
 
@@ -2194,6 +2495,7 @@ def run_benchmark(
     cell_coverage = []
     route_entropy = []
     timing_totals: Dict[str, float] = {}
+    vram_totals: Dict[str, float] = {}
     start = time.perf_counter()
 
     for _ in range(max(1, steps)):
@@ -2232,6 +2534,7 @@ def run_benchmark(
         cell_coverage.append(_stat_value(output.route_stats, "emitter_cell_coverage_loss", "torus_coverage_loss"))
         route_entropy.append(float(output.route_stats["avg_entropy"].item()))
         _accumulate_timings(timing_totals, output.route_stats)
+        _accumulate_vram(vram_totals, output.route_stats)
 
     elapsed = time.perf_counter() - start
     return {
@@ -2251,6 +2554,10 @@ def run_benchmark(
         "timing_breakdown_ms_total": dict(sorted(timing_totals.items())),
         "timing_breakdown_ms_per_step": {
             key: float(value / max(steps, 1)) for key, value in sorted(timing_totals.items())
+        },
+        "vram_breakdown_mb_total": dict(sorted(vram_totals.items())),
+        "vram_breakdown_mb_per_step": {
+            key: float(value / max(steps, 1)) for key, value in sorted(vram_totals.items())
         },
         "param_count": float(sum(p.numel() for p in model.parameters())),
     }

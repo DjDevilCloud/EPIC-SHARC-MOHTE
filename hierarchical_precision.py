@@ -100,13 +100,27 @@ def supports_float8(device: torch.device) -> bool:
     return True
 
 
-def _resolve_autocast_dtype(requested: torch.dtype, device: torch.device, fallback: torch.dtype) -> torch.dtype:
+def _resolve_effective_dtype(requested: torch.dtype, device: torch.device, fallback: torch.dtype) -> torch.dtype:
+    """Resolve the runtime dtype for a tier.
+
+    Float8 is preserved when the backend supports it. Otherwise we fall back to a
+    backend-safe dtype instead of silently rewriting the request to bf16.
+    """
+    if is_float8_dtype(requested):
+        if supports_float8(device):
+            return requested
+        if is_float8_dtype(fallback):
+            return torch.bfloat16 if device.type == "cuda" and supports_bfloat16(device) else torch.float16 if device.type == "cuda" else torch.bfloat16
+        resolved_fallback = _resolve_effective_dtype(fallback, device, torch.float32)
+        if resolved_fallback == torch.float32:
+            if device.type == "cuda":
+                return torch.bfloat16 if supports_bfloat16(device) else torch.float16
+            return torch.bfloat16
+        return resolved_fallback
     if device.type != "cuda":
         if requested == torch.bfloat16:
             return torch.bfloat16
         return torch.float32
-    if is_float8_dtype(requested):
-        return fallback if fallback != torch.float32 else torch.bfloat16 if supports_bfloat16(device) else torch.float16
     if requested == torch.bfloat16:
         return torch.bfloat16 if supports_bfloat16(device) else torch.float16
     if requested == torch.float16:
@@ -280,7 +294,7 @@ class HierarchicalPrecisionPolicy:
         tier = "root" if int(level) <= 0 else "leaf" if bool(is_leaf) else "mid"
         requested_name = self.root_compute_dtype if tier == "root" else self.leaf_compute_dtype if tier == "leaf" else self.mid_compute_dtype
         requested = dtype_from_name(requested_name)
-        fallback = _resolve_autocast_dtype(dtype_from_name(self.fallback_compute_dtype), device, torch.float32)
+        fallback = _resolve_effective_dtype(dtype_from_name(self.fallback_compute_dtype), device, torch.float32)
         accumulator = _resolve_state_dtype(dtype_from_name(self.accumulator_dtype), device)
 
         float8_requested = is_float8_dtype(requested)
@@ -289,12 +303,16 @@ class HierarchicalPrecisionPolicy:
         if module_kind in {"state", "recurrent_state"}:
             effective = accumulator
             mode = "state"
-        elif tier == "leaf" and self.allow_float8_leaf:
-            effective = _resolve_autocast_dtype(dtype_from_name(self.fallback_compute_dtype), device, torch.float32)
-            mode = "leaf-float8" if float8_supported else "leaf-fallback"
         else:
-            effective = _resolve_autocast_dtype(requested, device, fallback)
-            mode = tier
+            if tier == "leaf" and float8_requested and not self.allow_float8_leaf:
+                effective = fallback
+                mode = "leaf-fallback"
+            else:
+                effective = _resolve_effective_dtype(requested, device, fallback)
+                if float8_requested:
+                    mode = "leaf-float8" if tier == "leaf" and self.allow_float8_leaf else "float8" if float8_supported else "fallback"
+                else:
+                    mode = tier
 
         if effective == torch.float32 and device.type == "cuda" and requested == torch.bfloat16 and supports_bfloat16(device):
             effective = torch.bfloat16

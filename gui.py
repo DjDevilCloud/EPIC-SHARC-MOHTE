@@ -124,6 +124,7 @@ class PrismalWaveGUI(tk.Tk):
         self.nested_learning_global_ema_beta_var = tk.StringVar(value=str(DEFAULT_CFG.nested_learning_global_ema_beta))
         self.val_fraction_var = tk.StringVar(value="0.1")
         self.min_token_frequency_var = tk.StringVar(value="2")
+        self.tokenizer_full_text_var = tk.BooleanVar(value=True)
         self.post_prompt_var = tk.StringVar(value="What is a cat?")
         self.post_max_new_tokens_var = tk.StringVar(value="80")
         self.post_min_new_tokens_var = tk.StringVar(value="1")
@@ -256,6 +257,11 @@ class PrismalWaveGUI(tk.Tk):
                 ("Min token freq", self.min_token_frequency_var),
             ],
         )
+        ttk.Checkbutton(
+            params,
+            text="Tokenizer learns from full text",
+            variable=self.tokenizer_full_text_var,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Checkbutton(
             params,
             text="Dataset Streaming",
@@ -574,6 +580,7 @@ class PrismalWaveGUI(tk.Tk):
             self.val_fraction_var.get().strip() or "0.1",
             "--min-token-frequency",
             self.min_token_frequency_var.get().strip() or "2",
+            "--tokenizer-full-text" if self.tokenizer_full_text_var.get() else "--no-tokenizer-full-text",
             "--dataset-streaming" if self.dataset_streaming_var.get() else "--no-dataset-streaming",
             "--post-prompt",
             self.post_prompt_var.get().strip(),

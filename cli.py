@@ -23,6 +23,7 @@ try:
         resolve_device,
         load_bundle_from_checkpoint,
         maybe_compile_model,
+        _module_parameter_breakdown,
         run_benchmark,
         save_checkpoint,
         train_model,
@@ -40,6 +41,7 @@ except ImportError:  # pragma: no cover - supports direct script launching.
         resolve_device,
         load_bundle_from_checkpoint,
         maybe_compile_model,
+        _module_parameter_breakdown,
         run_benchmark,
         save_checkpoint,
         train_model,
@@ -165,18 +167,71 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--grad-clip-rowwise", type=float, default=default_cfg.grad_clip_rowwise)
         p.add_argument("--max-signature-tokens", type=int, default=0)
         p.add_argument("--max-line-tokens", type=int, default=0)
-        p.add_argument("--tokenizer-full-text", action="store_true")
+        tokenizer_text_group = p.add_mutually_exclusive_group()
+        tokenizer_text_group.add_argument("--tokenizer-full-text", dest="tokenizer_full_text", action="store_true")
+        tokenizer_text_group.add_argument("--no-tokenizer-full-text", dest="tokenizer_full_text", action="store_false")
+        p.set_defaults(tokenizer_full_text=True)
         p.add_argument("--use-turbo-quantization", dest="use_turbo_quantization", action="store_true")
         p.add_argument("--no-turbo-quantization", dest="use_turbo_quantization", action="store_false")
         p.set_defaults(use_turbo_quantization=default_cfg.use_turbo_quantization)
         p.add_argument("--turbo-quantization-bits", type=int, default=default_cfg.turbo_quantization_bits)
         p.add_argument("--turbo-quantization-method", type=str, default=default_cfg.turbo_quantization_method)
-        p.add_argument("--use-bitsandbytes-leaf-precision", dest="use_bitsandbytes_leaf_precision", action="store_true")
-        p.add_argument("--no-bitsandbytes-leaf-precision", dest="use_bitsandbytes_leaf_precision", action="store_false")
+        p.add_argument(
+            "--use-bitsandbytes-leaf-precision",
+            dest="use_bitsandbytes_leaf_precision",
+            action="store_true",
+            help="Enable the bitsandbytes leaf backend. Compute dtype stays within float16/bfloat16/float32.",
+        )
+        p.add_argument(
+            "--no-bitsandbytes-leaf-precision",
+            dest="use_bitsandbytes_leaf_precision",
+            action="store_false",
+            help="Disable the bitsandbytes leaf backend.",
+        )
         p.set_defaults(use_bitsandbytes_leaf_precision=default_cfg.use_bitsandbytes_leaf_precision)
-        p.add_argument("--bitsandbytes-leaf-precision-mode", type=str, default=default_cfg.bitsandbytes_leaf_precision_mode)
-        p.add_argument("--bitsandbytes-leaf-quant-type", type=str, default=default_cfg.bitsandbytes_leaf_quant_type)
-        p.add_argument("--bitsandbytes-leaf-compute-dtype", type=str, default=default_cfg.bitsandbytes_leaf_compute_dtype)
+        p.add_argument(
+            "--bitsandbytes-leaf-precision-mode",
+            type=str,
+            default=default_cfg.bitsandbytes_leaf_precision_mode,
+            help="Bitsandbytes leaf mode: int4 or fp4.",
+        )
+        p.add_argument(
+            "--bitsandbytes-leaf-quant-type",
+            type=str,
+            default=default_cfg.bitsandbytes_leaf_quant_type,
+            help="Bitsandbytes 4-bit quant type: fp4 or nf4.",
+        )
+        p.add_argument(
+            "--bitsandbytes-leaf-compute-dtype",
+            type=str,
+            default=default_cfg.bitsandbytes_leaf_compute_dtype,
+            help="Bitsandbytes leaf compute dtype: float16, bfloat16, or float32.",
+        )
+        p.add_argument(
+            "--use-transformer-engine-leaf-precision",
+            dest="use_transformer_engine_leaf_precision",
+            action="store_true",
+            help="Enable the Blackwell-only NVFP4 leaf backend via Transformer Engine.",
+        )
+        p.add_argument(
+            "--no-transformer-engine-leaf-precision",
+            dest="use_transformer_engine_leaf_precision",
+            action="store_false",
+            help="Disable the Transformer Engine leaf backend.",
+        )
+        p.set_defaults(use_transformer_engine_leaf_precision=default_cfg.use_transformer_engine_leaf_precision)
+        p.add_argument(
+            "--transformer-engine-leaf-recipe",
+            type=str,
+            default=default_cfg.transformer_engine_leaf_recipe,
+            help="Transformer Engine leaf recipe. Blackwell NVFP4 uses nvfp4.",
+        )
+        p.add_argument(
+            "--transformer-engine-leaf-params-dtype",
+            type=str,
+            default=default_cfg.transformer_engine_leaf_params_dtype,
+            help="Transformer Engine leaf parameter dtype, usually bfloat16 for NVFP4.",
+        )
         p.add_argument("--quantization-aware-training", dest="quantization_aware_training", action="store_true")
         p.add_argument("--no-quantization-aware-training", dest="quantization_aware_training", action="store_false")
         p.set_defaults(quantization_aware_training=default_cfg.quantization_aware_training)
@@ -499,6 +554,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--profile-runtime", dest="profile_runtime", action="store_true")
         p.add_argument("--no-profile-runtime", dest="profile_runtime", action="store_false")
         p.set_defaults(profile_runtime=default_cfg.profile_runtime)
+        p.add_argument("--profile-vram", dest="profile_vram", action="store_true")
+        p.add_argument("--no-profile-vram", dest="profile_vram", action="store_false")
+        p.set_defaults(profile_vram=default_cfg.profile_vram)
 
     train_p = sub.add_parser("train", help="Train on a text corpus")
     train_p.add_argument(
@@ -663,6 +721,9 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         bitsandbytes_leaf_precision_mode=args.bitsandbytes_leaf_precision_mode,
         bitsandbytes_leaf_quant_type=args.bitsandbytes_leaf_quant_type,
         bitsandbytes_leaf_compute_dtype=args.bitsandbytes_leaf_compute_dtype,
+        use_transformer_engine_leaf_precision=getattr(args, "use_transformer_engine_leaf_precision", default_cfg.use_transformer_engine_leaf_precision),
+        transformer_engine_leaf_recipe=getattr(args, "transformer_engine_leaf_recipe", default_cfg.transformer_engine_leaf_recipe),
+        transformer_engine_leaf_params_dtype=getattr(args, "transformer_engine_leaf_params_dtype", default_cfg.transformer_engine_leaf_params_dtype),
         quantization_aware_training=args.quantization_aware_training,
         qat_start_fraction=args.qat_start_fraction,
         qat_ramp_fraction=args.qat_ramp_fraction,
@@ -880,6 +941,7 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
             default_cfg.use_contrastive_routing_self_contrast,
         ),
         profile_runtime=args.profile_runtime,
+        profile_vram=args.profile_vram,
     )
     return cfg
 
@@ -1011,6 +1073,23 @@ def main(argv: List[str] | None = None) -> int:
                 f"emitters={model.cfg.n_emitters} slots={model.cfg.n_slots} vocab={model.cfg.vocab_size}",
                 flush=True,
             )
+            if getattr(args, "profile_vram", False):
+                breakdown = _module_parameter_breakdown(model)
+                top_items = sorted(
+                    (
+                        (key.removeprefix("param_").removesuffix("_mb"), value)
+                        for key, value in breakdown.items()
+                        if key != "param_total_mb"
+                    ),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:6]
+                print(
+                    "[Prismal] static param memory "
+                    + " / ".join(f"{name}={value:.1f}MB" for name, value in top_items)
+                    + f" / total={breakdown.get('param_total_mb', 0.0):.1f}MB",
+                    flush=True,
+                )
             arch_fields = (
                 "d_model",
                 "n_layers",
@@ -1107,6 +1186,23 @@ def main(argv: List[str] | None = None) -> int:
                 f"emitters={model.cfg.n_emitters} slots={model.cfg.n_slots} vocab={model.cfg.vocab_size}",
                 flush=True,
             )
+            if getattr(args, "profile_vram", False):
+                breakdown = _module_parameter_breakdown(model)
+                top_items = sorted(
+                    (
+                        (key.removeprefix("param_").removesuffix("_mb"), value)
+                        for key, value in breakdown.items()
+                        if key != "param_total_mb"
+                    ),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:6]
+                print(
+                    "[Prismal] static param memory "
+                    + " / ".join(f"{name}={value:.1f}MB" for name, value in top_items)
+                    + f" / total={breakdown.get('param_total_mb', 0.0):.1f}MB",
+                    flush=True,
+                )
             arch_fields = (
                 "d_model",
                 "n_layers",
@@ -1171,7 +1267,24 @@ def main(argv: List[str] | None = None) -> int:
                 f"d={runtime_cfg.d_model} torus={runtime_cfg.torus_depth}x{runtime_cfg.torus_height}x{runtime_cfg.torus_width} "
                 f"emitters={runtime_cfg.n_emitters} slots={runtime_cfg.n_slots} vocab={runtime_cfg.vocab_size}",
                 flush=True,
-        )
+            )
+            if getattr(runtime_cfg, "profile_vram", False):
+                breakdown = _module_parameter_breakdown(model)
+                top_items = sorted(
+                    (
+                        (key.removeprefix("param_").removesuffix("_mb"), value)
+                        for key, value in breakdown.items()
+                        if key != "param_total_mb"
+                    ),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:6]
+                print(
+                    "[Prismal] static param memory "
+                    + " / ".join(f"{name}={value:.1f}MB" for name, value in top_items)
+                    + f" / total={breakdown.get('param_total_mb', 0.0):.1f}MB",
+                    flush=True,
+                )
             print(
                 "[Prismal] family specialists "
                 f"enabled={bool(getattr(runtime_cfg, 'per_family_torus_enabled', True))} "

@@ -1,6 +1,12 @@
-# EPIC-SHARC MOHTE v0.2.1 
+# EPIC-SHARC MOHTE v0.3.4
 
-v0.2.1 Update added:
+v0.3.4 Update Notes
+
+- Added an explicit Blackwell NVFP4 leaf backend through Transformer Engine
+- Kept the Ada float8 path separate from bitsandbytes so supported float8 stays float8
+- Tightened bitsandbytes leaf compute dtype handling to valid compute dtypes only
+- Added CLI flags, README notes, and architecture docs for Ada and Blackwell precision paths
+- Added focused tests for float8 resolution, bitsandbytes limits, and NVFP4 recipe locking
 
 EPIC-SHARC MOHTE GATE
 
@@ -40,7 +46,9 @@ See [LICENSE](./LICENSE), [COMMERCIAL.md](./COMMERCIAL.md), and [LICENSES.md](./
 python -m pip install -r requirements.txt
 ```
 
-The core runtime depends on `numpy` and `torch`. Optional data-path helpers can also use `pandas`, `pyarrow`, or `bitsandbytes` if you install them.
+The core runtime depends on `numpy` and `torch`. Optional data-path helpers can also use `pandas`, `pyarrow`, `bitsandbytes`, or Transformer Engine if you install them.
+
+For Blackwell users who want NVFP4 leaf precision, install Transformer Engine and use the explicit NVFP4 leaf backend flags. That path is optional and requires SM100+ hardware.
 
 ## Overview
 
@@ -94,6 +102,23 @@ Key defaults:
 - `use_torus_race_lanes = true`
 - `use_speculative_decoding = true`
 
+Precision support is backend-specific:
+
+- Ada-class GPUs can use the hierarchical float8 path where supported
+- bitsandbytes leaf precision stays limited to `float16`, `bfloat16`, and `float32` compute
+- Blackwell-class GPUs can opt into Transformer Engine NVFP4 leaf precision, which requires SM100+ and the explicit `nvfp4` recipe
+
+### Blackwell Setup
+
+For Blackwell / SM100+ systems, install Transformer Engine and enable the NVFP4 leaf backend explicitly:
+
+```bash
+python -m pip install transformer-engine
+python cli.py train --use-transformer-engine-leaf-precision --transformer-engine-leaf-recipe nvfp4 --transformer-engine-leaf-params-dtype bfloat16
+```
+
+The NVFP4 path is separate from bitsandbytes leaf precision. Use it only when the hardware and Transformer Engine backend are present.
+
 ## Core Modules
 
 The main code paths are:
@@ -101,7 +126,7 @@ The main code paths are:
 - `./data.py` for hierarchy encoding and loss-mask construction
 - `./model.py` for torus routing, lattice attention, and decoding
 - `./train.py` for training, checkpoint loading, and prompt generation
-- `./quantization.py` for cached TurboQuant wrappers
+- `./quantization.py` for cached TurboQuant wrappers plus Ada/Blackwell precision backends
 
 ## Data Alignment
 

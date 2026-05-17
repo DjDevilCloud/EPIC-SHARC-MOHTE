@@ -4,8 +4,10 @@ torch
 # Optional features used by some data paths and utilities.
 # Install these if you want the broader dataset and precision feature set:
 # - bitsandbytes: leaf precision / quantization paths
+# - transformer-engine: optional NVFP4 leaf precision backend for Blackwell users
 # - pyarrow: parquet corpus support
 # - pandas: parquet fallback and dataset utilities
 # pandas
 # pyarrow
 # bitsandbytes
+# transformer-engine

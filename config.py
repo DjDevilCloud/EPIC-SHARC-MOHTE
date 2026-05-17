@@ -9,6 +9,23 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+def _normalize_dtype_name(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("torch."):
+        text = text.split(".", 1)[1]
+    aliases = {
+        "half": "float16",
+        "fp16": "float16",
+        "bfloat16": "bfloat16",
+        "bf16": "bfloat16",
+        "fp32": "float32",
+        "float32": "float32",
+        "float8": "float8_e4m3fn",
+        "f8": "float8_e4m3fn",
+    }
+    return aliases.get(text, text)
+
+
 @dataclass
 class PrismalWaveConfig:
     base_vocab_size: int = 387
@@ -28,11 +45,11 @@ class PrismalWaveConfig:
     grad_clip_scalar: float = 0.2
     grad_clip_rowwise: float = 0.45
     hierarchical_precision_enabled: bool = True
-    hierarchical_precision_root_dtype: str = "fp4"
-    hierarchical_precision_mid_dtype: str = "fp4"
-    hierarchical_precision_leaf_dtype: str = "fp4"
-    hierarchical_precision_fallback_dtype: str = "fp4"
-    hierarchical_precision_accumulator_dtype: str = "fp4"
+    hierarchical_precision_root_dtype: str = "float8_e4m3fn"
+    hierarchical_precision_mid_dtype: str = "float8_e4m3fn"
+    hierarchical_precision_leaf_dtype: str = "float8_e4m3fn"
+    hierarchical_precision_fallback_dtype: str = "bfloat16"
+    hierarchical_precision_accumulator_dtype: str = "bf16"
     hierarchical_precision_allow_float8_leaf: bool = True
     muon_lr: float = 0.008
     muon_weight_decay: float = 0.01
@@ -48,8 +65,8 @@ class PrismalWaveConfig:
     nested_learning_local_ema_beta: float = 0.90
     nested_learning_mid_ema_beta: float = 0.95
     nested_learning_global_ema_beta: float = 0.99
-    d_model: int = 128
-    n_layers: int = 2
+    d_model: int = 12
+    n_layers: int = 1
     n_emitters: int = 16384
     n_slots: int = 2048
     n_paths: int = 1
@@ -67,7 +84,10 @@ class PrismalWaveConfig:
     use_bitsandbytes_leaf_precision: bool = True
     bitsandbytes_leaf_precision_mode: str = "fp4"
     bitsandbytes_leaf_quant_type: str = "fp4"
-    bitsandbytes_leaf_compute_dtype: str = "fp4"
+    bitsandbytes_leaf_compute_dtype: str = "bfloat16"
+    use_transformer_engine_leaf_precision: bool = False
+    transformer_engine_leaf_recipe: str = "nvfp4"
+    transformer_engine_leaf_params_dtype: str = "bfloat16"
     quantization_aware_training: bool = False
     qat_start_fraction: float = 0.65
     qat_ramp_fraction: float = 0.20
@@ -79,37 +99,37 @@ class PrismalWaveConfig:
     hmote_depth: int = 1
     hmote_branching: int = 1
     hierarchical_nest_depth: int = 1
-    hierarchical_child_torus_scale: float = 1.00
+    hierarchical_child_torus_scale: float = 0.0125
     hierarchical_leaf_torus_size: int = 20
     hierarchical_byte_tier: bool = True
-    hierarchical_d_model_scale: float = 1.0
-    hierarchical_min_d_model: int = 256
+    hierarchical_d_model_scale: float = 0.25
+    hierarchical_min_d_model: int = 64
     hierarchical_level_d_models: str = ""
-    hierarchical_torus_depth_scale: float = 0.75
-    hierarchical_recursive_depth_scale: float = 0.75
-    hierarchical_fixed_point_scale: float = 0.75
+    hierarchical_torus_depth_scale: float = 0.125
+    hierarchical_recursive_depth_scale: float = 0.125
+    hierarchical_fixed_point_scale: float = 0.125
     use_learned_hierarchy_embeddings: bool = True
-    learned_hierarchy_vector_dim: int = 128
-    learned_hierarchy_vector_scale: float = 0.85
+    learned_hierarchy_vector_dim: int = 64
+    learned_hierarchy_vector_scale: float = 0.25
     per_family_torus_enabled: bool = True
-    per_family_torus_scale: float = 0.85
-    family_specialist_d_model: int = 256
+    per_family_torus_scale: float = 0.125
+    family_specialist_d_model: int = 3
     family_specialist_gate_threshold: float = 0.02
     leaf_cell_enabled: bool = True
     leaf_cell_dim: int = 64
     leaf_router_confidence_threshold: float = 0.75
     max_families_per_nest: int = 16
-    family_budget: int = 32
+    family_budget: int = 16
     family_specialist_bank_size: int = 8
     use_mixture_of_torus: bool = True
     mot_num_experts: int = 2
-    mot_expert_scale: float = 0.05
+    mot_expert_scale: float = 0.15
     mot_routing_temperature: float = 0.55
     use_topk_mot: bool = True
     mot_top_k: int = 8
     use_signature_lattice_attention: bool = True
     use_path_logits: bool = False
-    signature_lattice_dim: int = 256
+    signature_lattice_dim: int = 64
     signature_lattice_buckets: int = 16
     signature_lattice_candidates: int = 128
     signature_lattice_weight: float = 0.32
@@ -136,8 +156,8 @@ class PrismalWaveConfig:
     residency_head_layers: int = 1
     residency_head_hidden_dim: int = 64
     learned_residency_weight: float = 0.25
-    use_residency_with_reinforcement: bool = False
-    use_token_memory_cross_attention: bool = False
+    use_residency_with_reinforcement: bool = True
+    use_token_memory_cross_attention: bool = True
     use_token_memory_generation_cache: bool = False
     token_memory_window: int = 96
     token_memory_top_k: int = 4
@@ -145,7 +165,7 @@ class PrismalWaveConfig:
     token_memory_copy_bias: float = 0.75
     token_memory_rare_token_cutoff: int = 2
     token_memory_copy_min_confidence: float = 0.35
-    use_token_copy_cross_attention: bool = False
+    use_token_copy_cross_attention: bool = True
     use_token_copy_generation_cache: bool = False
     token_copy_window: int = 96
     token_copy_top_k: int = 4
@@ -155,10 +175,10 @@ class PrismalWaveConfig:
     token_copy_min_confidence: float = 0.35
     use_pronunciation_signatures: bool = False
     hierarchical_tier_char_weight: float = 1.00
-    hierarchical_tier_piece_weight: float = 0.25
+    hierarchical_tier_piece_weight: float = 0.95
     hierarchical_tier_word_weight: float = 0.85
-    hierarchical_tier_phrase_weight: float = 0.15
-    hierarchical_tier_line_weight: float = 0.05
+    hierarchical_tier_phrase_weight: float = 0.65
+    hierarchical_tier_line_weight: float = 0.45
     hierarchical_tier_special_weight: float = 0.15
     hierarchical_leaf_char_boost: float = 1.05
     hierarchical_leaf_piece_boost: float = 1.05
@@ -179,8 +199,8 @@ class PrismalWaveConfig:
     torus_height: int = 20
     torus_width: int = 20
     torus_local_field_radius: int = 2
-    torus_global_bus_slots: int = 24
-    torus_global_bus_decay: float = 0.92
+    torus_global_bus_slots: int = 12
+    torus_global_bus_decay: float = 0.72
     torus_global_bus_write_scale: float = 0.32
     torus_write_radius: int = 2
     torus_scout_read_radius: int = 2
@@ -207,7 +227,7 @@ class PrismalWaveConfig:
     generation_lap_cap: int = 4
     generation_lap_token_cap: int = 48
     torus_chunk_len: int = 32
-    use_fixed_point_solver: bool = False
+    use_fixed_point_solver: bool = True
     use_chunk_solver_training: bool = False
     chunk_solver_training_iterations: int = 1
     chunk_solver_training_relaxation: float = 1.0
@@ -230,7 +250,8 @@ class PrismalWaveConfig:
     emitter_seed_activity: float = 1.0
     torus_write_family_floor: float = 0.12
     torus_read_family_floor: float = 0.25
-    profile_runtime: bool = False
+    profile_runtime: bool = True
+    profile_vram: bool = True
     router_temperature: float = 1.00
     signature_temperature: float = 0.65
     path_noise: float = 0.015
@@ -240,15 +261,15 @@ class PrismalWaveConfig:
     signature_level_loss_weight: float = 0.35
     signature_relation_loss_weight: float = 0.35
     signature_contrastive_weight: float = 0.15
-    use_contrastive_routing: bool = False
+    use_contrastive_routing: bool = True
     contrastive_routing_weight: float = 0.75
     contrastive_routing_temperature: float = 0.65
-    contrastive_routing_hard_negatives: bool = False
-    use_contrastive_routing_signature_neighborhood: bool = False
-    use_contrastive_routing_temporal: bool = False
-    use_contrastive_routing_residency: bool = False
-    use_contrastive_routing_cross_view: bool = False
-    use_contrastive_routing_self_contrast: bool = False
+    contrastive_routing_hard_negatives: bool = True
+    use_contrastive_routing_signature_neighborhood: bool = True
+    use_contrastive_routing_temporal: bool = True
+    use_contrastive_routing_residency: bool = True
+    use_contrastive_routing_cross_view: bool = True
+    use_contrastive_routing_self_contrast: bool = True
     routing_entropy_weight: float = 0.25
     diversity_weight: float = 0.15
     emitter_neighbor_weight: float = 0.035
@@ -502,7 +523,7 @@ class PrismalWaveConfig:
         self.use_hmote = bool(self.use_hmote)
         self.use_bitsandbytes_leaf_precision = bool(self.use_bitsandbytes_leaf_precision)
         def _normalize_choice(value: object, *, fallback: str, allowed: set[str]) -> str:
-            text = str(value or "").strip().lower()
+            text = _normalize_dtype_name(value)
             if text in allowed:
                 return text
             return fallback
@@ -522,7 +543,18 @@ class PrismalWaveConfig:
         self.bitsandbytes_leaf_compute_dtype = _normalize_choice(
             self.bitsandbytes_leaf_compute_dtype,
             fallback="bfloat16",
-            allowed={"bfloat16", "bf16", "float16", "fp16"},
+            allowed={"bfloat16", "float16", "float32"},
+        )
+        self.use_transformer_engine_leaf_precision = bool(self.use_transformer_engine_leaf_precision)
+        self.transformer_engine_leaf_recipe = _normalize_choice(
+            self.transformer_engine_leaf_recipe,
+            fallback="nvfp4",
+            allowed={"nvfp4"},
+        )
+        self.transformer_engine_leaf_params_dtype = _normalize_choice(
+            self.transformer_engine_leaf_params_dtype,
+            fallback="bfloat16",
+            allowed={"bfloat16", "float16", "float32"},
         )
         if self.use_hmote:
             self.use_recursive_hmoe = True
@@ -531,11 +563,31 @@ class PrismalWaveConfig:
             self.recursive_hmoe_branching = max(1, self.hmote_branching)
             self.mot_num_experts = max(1, self.hmote_branching)
         self.hierarchical_precision_enabled = bool(self.hierarchical_precision_enabled)
-        self.hierarchical_precision_root_dtype = str(self.hierarchical_precision_root_dtype).strip().lower() or "bf16"
-        self.hierarchical_precision_mid_dtype = str(self.hierarchical_precision_mid_dtype).strip().lower() or "fp16"
-        self.hierarchical_precision_leaf_dtype = str(self.hierarchical_precision_leaf_dtype).strip().lower() or "float8_e4m3fn"
-        self.hierarchical_precision_fallback_dtype = str(self.hierarchical_precision_fallback_dtype).strip().lower() or "bf16"
-        self.hierarchical_precision_accumulator_dtype = str(self.hierarchical_precision_accumulator_dtype).strip().lower() or "bf16"
+        self.hierarchical_precision_root_dtype = _normalize_choice(
+            self.hierarchical_precision_root_dtype,
+            fallback="bfloat16",
+            allowed={"bfloat16", "float16", "float32", "float8_e4m3fn", "float8_e5m2"},
+        )
+        self.hierarchical_precision_mid_dtype = _normalize_choice(
+            self.hierarchical_precision_mid_dtype,
+            fallback="float16",
+            allowed={"bfloat16", "float16", "float32", "float8_e4m3fn", "float8_e5m2"},
+        )
+        self.hierarchical_precision_leaf_dtype = _normalize_choice(
+            self.hierarchical_precision_leaf_dtype,
+            fallback="float8_e4m3fn",
+            allowed={"bfloat16", "float16", "float32", "float8_e4m3fn", "float8_e5m2"},
+        )
+        self.hierarchical_precision_fallback_dtype = _normalize_choice(
+            self.hierarchical_precision_fallback_dtype,
+            fallback="bfloat16",
+            allowed={"bfloat16", "float16", "float32", "float8_e4m3fn", "float8_e5m2"},
+        )
+        self.hierarchical_precision_accumulator_dtype = _normalize_choice(
+            self.hierarchical_precision_accumulator_dtype,
+            fallback="bfloat16",
+            allowed={"bfloat16", "float16", "float32"},
+        )
         self.hierarchical_precision_allow_float8_leaf = bool(self.hierarchical_precision_allow_float8_leaf)
         self.use_learned_hierarchy_embeddings = bool(self.use_learned_hierarchy_embeddings)
         self.learned_hierarchy_vector_dim = int(self.learned_hierarchy_vector_dim)

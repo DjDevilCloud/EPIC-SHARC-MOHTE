@@ -42,20 +42,47 @@ def _sync_for_timing(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+_VRAM_BYTES_PER_MIB = float(1024.0 * 1024.0)
+
+
 def _profile_stage(
     enabled: bool,
     device: torch.device,
     timings: Dict[str, float],
     key: str,
     fn,
+    *,
+    vram_enabled: bool = False,
+    vram_stats: Optional[Dict[str, float]] = None,
+    vram_key: Optional[str] = None,
 ):
-    if not enabled:
+    measure_vram = bool(vram_enabled and vram_stats is not None and vram_key)
+    if not enabled and not measure_vram:
         return fn()
-    _sync_for_timing(device)
-    start = time.perf_counter()
+    if enabled or measure_vram:
+        _sync_for_timing(device)
+    start = time.perf_counter() if enabled else 0.0
+    start_alloc = 0.0
+    start_reserved = 0.0
+    if measure_vram and device.type == "cuda":
+        start_alloc = float(torch.cuda.memory_allocated(device))
+        start_reserved = float(torch.cuda.memory_reserved(device))
+        torch.cuda.reset_peak_memory_stats(device)
     result = fn()
-    _sync_for_timing(device)
-    timings[key] = timings.get(key, 0.0) + (time.perf_counter() - start) * 1000.0
+    if enabled or measure_vram:
+        _sync_for_timing(device)
+    if enabled:
+        timings[key] = timings.get(key, 0.0) + (time.perf_counter() - start) * 1000.0
+    if measure_vram and vram_stats is not None and vram_key is not None:
+        prefix = f"vram_{vram_key}"
+        if device.type == "cuda":
+            peak_alloc = float(torch.cuda.max_memory_allocated(device))
+            peak_reserved = float(torch.cuda.max_memory_reserved(device))
+            vram_stats[f"{prefix}_alloc_delta_mb"] = max(0.0, (peak_alloc - start_alloc) / _VRAM_BYTES_PER_MIB)
+            vram_stats[f"{prefix}_reserved_delta_mb"] = max(0.0, (peak_reserved - start_reserved) / _VRAM_BYTES_PER_MIB)
+        else:
+            vram_stats[f"{prefix}_alloc_delta_mb"] = 0.0
+            vram_stats[f"{prefix}_reserved_delta_mb"] = 0.0
     return result
 
 
@@ -3623,21 +3650,32 @@ class PrismalTorusCore(nn.Module):
         collect_telemetry: bool = True,
     ) -> Tuple[torch.Tensor, PrismalTorusState, Dict[str, torch.Tensor]]:
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
+        profile_vram = bool(getattr(self.cfg, "profile_vram", False))
         timing_ms: Dict[str, float] = {}
+        vram_stats: Dict[str, float] = {}
         if profile_enabled:
             _sync_for_timing(hidden.device)
             start_total = time.perf_counter()
-        next_hidden, next_field, stats, _transition_state = self.transition(
-            hidden,
-            field,
-            path_index=path_index,
-            step_index=step_index,
-            relay_mode=relay_mode,
-            registry_context=registry_context,
-            family_context=family_context,
-            level_context=level_context,
-            relation_context=relation_context,
-            parent_context=parent_context,
+        next_hidden, next_field, stats, _transition_state = _profile_stage(
+            profile_enabled,
+            hidden.device,
+            timing_ms,
+            "timing_torus_transition_ms",
+            lambda: self.transition(
+                hidden,
+                field,
+                path_index=path_index,
+                step_index=step_index,
+                relay_mode=relay_mode,
+                registry_context=registry_context,
+                family_context=family_context,
+                level_context=level_context,
+                relation_context=relation_context,
+                parent_context=parent_context,
+            ),
+            vram_enabled=profile_vram,
+            vram_stats=vram_stats,
+            vram_key="torus_step",
         )
         repair_count = 0
         next_hidden, repaired = self._sanitize_tensor(next_hidden, fallback=hidden)
@@ -3655,6 +3693,12 @@ class PrismalTorusCore(nn.Module):
             timing_ms["timing_torus_step_ms"] = (time.perf_counter() - start_total) * 1000.0
             for key, value in timing_ms.items():
                 sanitized_stats[key] = torch.tensor(value, device=hidden.device)
+        if profile_vram:
+            vram_stats.setdefault("vram_torus_step_alloc_delta_mb", 0.0)
+            vram_stats.setdefault("vram_torus_step_reserved_delta_mb", 0.0)
+            for key, value in vram_stats.items():
+                sanitized_stats[key] = torch.tensor(value, device=hidden.device)
+            sanitized_stats["vram_profile_enabled"] = torch.tensor(1.0, device=hidden.device)
         return next_hidden, next_field, sanitized_stats
 
 
@@ -4853,6 +4897,7 @@ class PrismalTorusFrame:
     lattice_stats: Dict[str, torch.Tensor]
     token_memory_stats: Dict[str, torch.Tensor]
     prep_timings: Dict[str, float]
+    prep_vram: Dict[str, float]
     signature_family_ids: Optional[torch.Tensor]
     signature_ids: Optional[torch.Tensor]
     signature_level_ids: Optional[torch.Tensor]
@@ -5314,6 +5359,9 @@ class PrismalWaveModel(nn.Module):
             bitsandbytes_leaf_precision_mode=str(getattr(cfg, "bitsandbytes_leaf_precision_mode", "fp4")),
             bitsandbytes_leaf_quant_type=str(getattr(cfg, "bitsandbytes_leaf_quant_type", "fp4")),
             bitsandbytes_leaf_compute_dtype=str(getattr(cfg, "bitsandbytes_leaf_compute_dtype", "bfloat16")),
+            use_transformer_engine_leaf_precision=bool(getattr(cfg, "use_transformer_engine_leaf_precision", False)),
+            transformer_engine_leaf_recipe=str(getattr(cfg, "transformer_engine_leaf_recipe", "nvfp4")),
+            transformer_engine_leaf_params_dtype=str(getattr(cfg, "transformer_engine_leaf_params_dtype", "bfloat16")),
         )
         self.quantization_config = qcfg
         self.registry = SignatureEmitterRegistry(cfg, quantization_config=qcfg)
@@ -6853,7 +6901,9 @@ class PrismalWaveModel(nn.Module):
         collect_telemetry: bool = True,
     ) -> PrismalTorusFrame:
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
+        profile_vram = bool(getattr(self.cfg, "profile_vram", False))
         prep_timings: Dict[str, float] = {}
+        prep_vram: Dict[str, float] = {}
         hidden = _profile_stage(
             profile_enabled,
             input_ids.device,
@@ -6870,6 +6920,9 @@ class PrismalWaveModel(nn.Module):
                 position_offset=position_offset,
                 timings=prep_timings if profile_enabled else None,
             ),
+            vram_enabled=profile_vram,
+            vram_stats=prep_vram,
+            vram_key="encode",
         )
         batch_size, seq_len = hidden.shape[:2]
         input_ids = input_ids[:, :seq_len]
@@ -6911,6 +6964,9 @@ class PrismalWaveModel(nn.Module):
                     and not self.training,
                     collect_telemetry=collect_telemetry,
                 ),
+                vram_enabled=profile_vram,
+                vram_stats=prep_vram,
+                vram_key="signature_lattice",
             )
         if self.cfg.max_seq_len <= 0:
             self._ensure_position_embedding_capacity(position_offset + seq_len)
@@ -6980,7 +7036,17 @@ class PrismalWaveModel(nn.Module):
                     return_state=not self.training and bool(getattr(self.cfg, "use_token_memory_generation_cache", True)),
                     collect_telemetry=collect_telemetry,
                 ),
+                vram_enabled=profile_vram,
+                    vram_stats=prep_vram,
+                    vram_key="token_memory",
             )
+        if profile_vram:
+            if self.signature_lattice_attention is None:
+                prep_vram.setdefault("vram_signature_lattice_alloc_delta_mb", 0.0)
+                prep_vram.setdefault("vram_signature_lattice_reserved_delta_mb", 0.0)
+            if self.token_memory_attention is None:
+                prep_vram.setdefault("vram_token_memory_alloc_delta_mb", 0.0)
+                prep_vram.setdefault("vram_token_memory_reserved_delta_mb", 0.0)
         if profile_enabled:
             for key, value in token_memory_stats.items():
                 if key.startswith("timing_"):
@@ -6997,6 +7063,7 @@ class PrismalWaveModel(nn.Module):
             lattice_stats=lattice_stats,
             token_memory_stats=token_memory_stats,
             prep_timings=prep_timings,
+            prep_vram=prep_vram,
             signature_family_ids=signature_family_ids,
             signature_ids=signature_ids,
             signature_level_ids=signature_level_ids,
@@ -7032,7 +7099,9 @@ class PrismalWaveModel(nn.Module):
     ]:
         collect_telemetry = bool(collect_telemetry)
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
+        profile_vram = bool(getattr(self.cfg, "profile_vram", False))
         path_timings: Dict[str, float] = dict(frame.prep_timings)
+        path_vram: Dict[str, float] = dict(frame.prep_vram)
         input_ids = frame.input_ids
         hidden = frame.hidden
         input_signature = frame.input_signature
@@ -7114,12 +7183,18 @@ class PrismalWaveModel(nn.Module):
                 path_timings,
                 "timing_sharc_router_ms",
                 _run_sharc_router,
+                vram_enabled=profile_vram,
+                vram_stats=path_vram,
+                vram_key="sharc_router",
             )
             router_aug_stats = {
                 key: value.detach() if torch.is_tensor(value) else value
                 for key, value in router_aug_stats.items()
             }
             hidden = hidden + 0.20 * router_delta
+        elif profile_vram:
+            path_vram.setdefault("vram_sharc_router_alloc_delta_mb", 0.0)
+            path_vram.setdefault("vram_sharc_router_reserved_delta_mb", 0.0)
 
         chunk_len = max(1, int(getattr(self.cfg, "torus_chunk_len", seq_len)))
         num_chunks = (seq_len + chunk_len - 1) // chunk_len
@@ -7186,94 +7261,132 @@ class PrismalWaveModel(nn.Module):
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     start_chunk_core = time.perf_counter()
-                core_output, field_state, core_stats = checkpoint(
-                    _run_chunk_core,
-                    chunk_hidden,
-                    field_state,
-                    chunk_family_context if chunk_family_context is not None else empty_context,
-                    chunk_level_context if chunk_level_context is not None else empty_context,
-                    chunk_relation_context if chunk_relation_context is not None else empty_context,
-                    chunk_parent_context if chunk_parent_context is not None else empty_context,
-                    use_reentrant=False,
+                core_output, field_state, core_stats = _profile_stage(
+                    profile_enabled,
+                    input_ids.device,
+                    path_timings,
+                    "timing_path_core_ms",
+                    lambda: checkpoint(
+                        _run_chunk_core,
+                        chunk_hidden,
+                        field_state,
+                        chunk_family_context if chunk_family_context is not None else empty_context,
+                        chunk_level_context if chunk_level_context is not None else empty_context,
+                        chunk_relation_context if chunk_relation_context is not None else empty_context,
+                        chunk_parent_context if chunk_parent_context is not None else empty_context,
+                        use_reentrant=False,
+                    ),
+                    vram_enabled=profile_vram,
+                    vram_stats=path_vram,
+                    vram_key="path_core",
                 )
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
-                    path_timings["timing_path_core_ms"] = path_timings.get("timing_path_core_ms", 0.0) + (time.perf_counter() - start_chunk_core) * 1000.0
                     start_chunk_overlay = time.perf_counter()
                 if overlay_step_fn is None:
                     chunk_output, field_state, chunk_stats = core_output, field_state, core_stats
                 else:
-                    chunk_output, field_state, chunk_stats = overlay_step_fn(
-                        core_output,
-                        field_state,
-                        core_stats,
-                        signature_family_ids=signature_family_slice,
-                        signature_ids=signature_ids_slice,
-                        signature_level_ids=signature_level_slice,
-                        signature_relation_ids=signature_relation_slice,
-                        parent_signature_ids=parent_signature_slice,
-                        registry_context=None,
-                        family_context=chunk_family_context,
-                        level_context=chunk_level_context,
-                        relation_context=chunk_relation_context,
-                        parent_context=chunk_parent_context,
-                        path_index=path_index,
-                        step_index_offset=chunk_start,
-                        use_solver=use_chunk_solver,
-                        relay_mode=False,
+                    chunk_output, field_state, chunk_stats = _profile_stage(
+                        profile_enabled,
+                        input_ids.device,
+                        path_timings,
+                        "timing_path_overlay_ms",
+                        lambda: overlay_step_fn(
+                            core_output,
+                            field_state,
+                            core_stats,
+                            signature_family_ids=signature_family_slice,
+                            signature_ids=signature_ids_slice,
+                            signature_level_ids=signature_level_slice,
+                            signature_relation_ids=signature_relation_slice,
+                            parent_signature_ids=parent_signature_slice,
+                            registry_context=None,
+                            family_context=chunk_family_context,
+                            level_context=chunk_level_context,
+                            relation_context=chunk_relation_context,
+                            parent_context=chunk_parent_context,
+                            path_index=path_index,
+                            step_index_offset=chunk_start,
+                            use_solver=use_chunk_solver,
+                            relay_mode=False,
+                        ),
+                        vram_enabled=profile_vram,
+                        vram_stats=path_vram,
+                        vram_key="path_overlay",
                     )
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
-                    path_timings["timing_path_overlay_ms"] = path_timings.get("timing_path_overlay_ms", 0.0) + (time.perf_counter() - start_chunk_overlay) * 1000.0
+                if overlay_step_fn is None and profile_vram:
+                    path_vram.setdefault("vram_path_overlay_alloc_delta_mb", 0.0)
+                    path_vram.setdefault("vram_path_overlay_reserved_delta_mb", 0.0)
             else:
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
                     start_chunk_core = time.perf_counter()
-                core_output, field_state, core_stats = core_step_fn(
-                    chunk_hidden,
-                    field_state,
-                    signature_family_ids=signature_family_slice,
-                    signature_ids=signature_ids_slice,
-                    signature_level_ids=signature_level_slice,
-                    signature_relation_ids=signature_relation_slice,
-                    parent_signature_ids=parent_signature_slice,
-                    registry_context=None,
-                    family_context=chunk_family_context if chunk_family_context is not None else empty_context,
-                    level_context=chunk_level_context if chunk_level_context is not None else empty_context,
-                    relation_context=chunk_relation_context if chunk_relation_context is not None else empty_context,
-                    parent_context=chunk_parent_context if chunk_parent_context is not None else empty_context,
-                    path_index=path_index,
-                    step_index_offset=chunk_start,
-                )
-                if profile_enabled:
-                    _sync_for_timing(input_ids.device)
-                    path_timings["timing_path_core_ms"] = path_timings.get("timing_path_core_ms", 0.0) + (time.perf_counter() - start_chunk_core) * 1000.0
-                    start_chunk_overlay = time.perf_counter()
-                if overlay_step_fn is None:
-                    chunk_output, field_state, chunk_stats = core_output, field_state, core_stats
-                else:
-                    chunk_output, field_state, chunk_stats = overlay_step_fn(
-                        core_output,
+                core_output, field_state, core_stats = _profile_stage(
+                    profile_enabled,
+                    input_ids.device,
+                    path_timings,
+                    "timing_path_core_ms",
+                    lambda: core_step_fn(
+                        chunk_hidden,
                         field_state,
-                        core_stats,
                         signature_family_ids=signature_family_slice,
                         signature_ids=signature_ids_slice,
                         signature_level_ids=signature_level_slice,
                         signature_relation_ids=signature_relation_slice,
                         parent_signature_ids=parent_signature_slice,
                         registry_context=None,
-                        family_context=chunk_family_context,
-                        level_context=chunk_level_context,
-                        relation_context=chunk_relation_context,
-                        parent_context=chunk_parent_context,
+                        family_context=chunk_family_context if chunk_family_context is not None else empty_context,
+                        level_context=chunk_level_context if chunk_level_context is not None else empty_context,
+                        relation_context=chunk_relation_context if chunk_relation_context is not None else empty_context,
+                        parent_context=chunk_parent_context if chunk_parent_context is not None else empty_context,
                         path_index=path_index,
                         step_index_offset=chunk_start,
-                        use_solver=use_chunk_solver,
-                        relay_mode=False,
+                    ),
+                    vram_enabled=profile_vram,
+                    vram_stats=path_vram,
+                    vram_key="path_core",
+                )
+                if profile_enabled:
+                    _sync_for_timing(input_ids.device)
+                    start_chunk_overlay = time.perf_counter()
+                if overlay_step_fn is None:
+                    chunk_output, field_state, chunk_stats = core_output, field_state, core_stats
+                else:
+                    chunk_output, field_state, chunk_stats = _profile_stage(
+                        profile_enabled,
+                        input_ids.device,
+                        path_timings,
+                        "timing_path_overlay_ms",
+                        lambda: overlay_step_fn(
+                            core_output,
+                            field_state,
+                            core_stats,
+                            signature_family_ids=signature_family_slice,
+                            signature_ids=signature_ids_slice,
+                            signature_level_ids=signature_level_slice,
+                            signature_relation_ids=signature_relation_slice,
+                            parent_signature_ids=parent_signature_slice,
+                            registry_context=None,
+                            family_context=chunk_family_context,
+                            level_context=chunk_level_context,
+                            relation_context=chunk_relation_context,
+                            parent_context=chunk_parent_context,
+                            path_index=path_index,
+                            step_index_offset=chunk_start,
+                            use_solver=use_chunk_solver,
+                            relay_mode=False,
+                        ),
+                        vram_enabled=profile_vram,
+                        vram_stats=path_vram,
+                        vram_key="path_overlay",
                     )
                 if profile_enabled:
                     _sync_for_timing(input_ids.device)
-                    path_timings["timing_path_overlay_ms"] = path_timings.get("timing_path_overlay_ms", 0.0) + (time.perf_counter() - start_chunk_overlay) * 1000.0
+                if overlay_step_fn is None and profile_vram:
+                    path_vram.setdefault("vram_path_overlay_alloc_delta_mb", 0.0)
+                    path_vram.setdefault("vram_path_overlay_reserved_delta_mb", 0.0)
             outputs.append(chunk_output)
             entropy_terms.append(chunk_stats["torus_entropy"])
             if collect_telemetry:
@@ -7344,6 +7457,9 @@ class PrismalWaveModel(nn.Module):
             path_timings,
             "timing_path_finalize_ms",
             lambda: torch.cat(outputs, dim=1),
+            vram_enabled=profile_vram,
+            vram_stats=path_vram,
+            vram_key="path_finalize",
         )
         path_hidden_state = self.final_norm(path_hidden_state)
         path_hidden_state, neighborhood_logits = self._guide_hidden_from_neighborhood(path_hidden_state)
@@ -7429,6 +7545,20 @@ class PrismalWaveModel(nn.Module):
         for key, values in recursive_stat_terms.items():
             if values:
                 path_stats[key] = torch.stack([v.reshape(()) for v in values]).mean().detach()
+        if profile_vram:
+            if self.signature_lattice_attention is None:
+                path_vram.setdefault("vram_signature_lattice_alloc_delta_mb", 0.0)
+                path_vram.setdefault("vram_signature_lattice_reserved_delta_mb", 0.0)
+            if self.token_memory_attention is None:
+                path_vram.setdefault("vram_token_memory_alloc_delta_mb", 0.0)
+                path_vram.setdefault("vram_token_memory_reserved_delta_mb", 0.0)
+            path_stats.update(
+                {
+                    key: torch.tensor(value, device=input_ids.device).detach()
+                    for key, value in path_vram.items()
+                }
+            )
+            path_stats["vram_profile_enabled"] = torch.tensor(1.0, device=input_ids.device)
         return (
             path_hidden_state,
             logits,
@@ -7463,6 +7593,7 @@ class PrismalWaveModel(nn.Module):
     ) -> PrismalWaveOutput:
         collect_telemetry = bool(collect_telemetry)
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
+        profile_vram = bool(getattr(self.cfg, "profile_vram", False))
         timings: Dict[str, float] = {}
         gate_runtime = gate_runtime or {}
         race_enabled = self.use_race_lanes and not self.training
@@ -7499,6 +7630,8 @@ class PrismalWaveModel(nn.Module):
         path_signature_lattice_enabled: List[torch.Tensor] = []
         path_mot_active_experts: List[torch.Tensor] = []
         recursive_stat_terms: Dict[str, List[torch.Tensor]] = {}
+        path_vram_terms: Dict[str, List[torch.Tensor]] = {}
+        aggregate_vram: Dict[str, float] = {}
         frame = self._prepare_torus_frame(
             input_ids,
             signature_family_ids=signature_family_ids,
@@ -7623,6 +7756,8 @@ class PrismalWaveModel(nn.Module):
             for key, value in path_stats.items():
                 if collect_telemetry and key.startswith("recursive_") and torch.is_tensor(value) and value.numel() == 1:
                     recursive_stat_terms.setdefault(key, []).append(value.detach().float().reshape(()))
+                if profile_vram and key.startswith("vram_") and torch.is_tensor(value) and value.numel() == 1:
+                    path_vram_terms.setdefault(key, []).append(value.detach().float().reshape(()))
             if torch.is_tensor(recursive_aux_loss):
                 path_recursive_aux_loss.append(recursive_aux_loss.float())
             path_slot_states.append(field_state)
@@ -7633,9 +7768,16 @@ class PrismalWaveModel(nn.Module):
                 _sync_for_timing(input_ids.device)
                 timings["timing_path_loop_ms"] = timings.get("timing_path_loop_ms", 0.0) + (time.perf_counter() - start_path) * 1000.0
 
-        if profile_enabled:
+        aggregate_start_alloc = 0.0
+        aggregate_start_reserved = 0.0
+        if profile_enabled or profile_vram:
             _sync_for_timing(input_ids.device)
+        if profile_enabled:
             start_aggregate = time.perf_counter()
+        if profile_vram and input_ids.device.type == "cuda":
+            aggregate_start_alloc = float(torch.cuda.memory_allocated(input_ids.device))
+            aggregate_start_reserved = float(torch.cuda.memory_reserved(input_ids.device))
+            torch.cuda.reset_peak_memory_stats(input_ids.device)
         # Fast path for the common n_paths == 1 case: keep the exact tensor
         # shapes, but skip multi-path reductions that would be no-ops.
         single_path = len(path_hidden) == 1
@@ -7678,6 +7820,21 @@ class PrismalWaveModel(nn.Module):
         if profile_enabled:
             _sync_for_timing(input_ids.device)
             timings["timing_path_aggregate_ms"] = (time.perf_counter() - start_aggregate) * 1000.0
+        if profile_vram:
+            if input_ids.device.type == "cuda":
+                aggregate_vram["vram_path_aggregate_alloc_delta_mb"] = max(
+                    0.0,
+                    (float(torch.cuda.max_memory_allocated(input_ids.device)) - aggregate_start_alloc)
+                    / _VRAM_BYTES_PER_MIB,
+                )
+                aggregate_vram["vram_path_aggregate_reserved_delta_mb"] = max(
+                    0.0,
+                    (float(torch.cuda.max_memory_reserved(input_ids.device)) - aggregate_start_reserved)
+                    / _VRAM_BYTES_PER_MIB,
+                )
+            else:
+                aggregate_vram.setdefault("vram_path_aggregate_alloc_delta_mb", 0.0)
+                aggregate_vram.setdefault("vram_path_aggregate_reserved_delta_mb", 0.0)
 
         input_signature = frame.input_signature
         final_output_signature = F.normalize(self.signature_head(final_hidden.mean(dim=1)), dim=-1)
@@ -7872,6 +8029,13 @@ class PrismalWaveModel(nn.Module):
             "emitter_mixture_loss": avg_mixture_loss.detach(),
             "recursive_aux_loss": avg_recursive_aux_loss.detach(),
         }
+        if profile_vram:
+            for key, values in path_vram_terms.items():
+                if values:
+                    route_stats[key] = torch.stack([v.reshape(()) for v in values]).mean().detach()
+            for key, value in aggregate_vram.items():
+                route_stats[key] = torch.tensor(value, device=input_ids.device).detach()
+            route_stats["vram_profile_enabled"] = torch.tensor(1.0, device=input_ids.device)
         if collect_telemetry:
             route_stats.update(
                 {

@@ -78,6 +78,7 @@ EPIC-SHARC MOHTE exposes more of the execution budget to configuration:
 - hierarchical precision tiers
 - BF16, float8-style, and leaf-level quantization options where supported
 - quantization-aware training controls
+- Blackwell NVFP4 leaf precision through Transformer Engine when the backend and SM100+ hardware are present, using the explicit `nvfp4` recipe
 - sparse routing and selective activation
 
 The practical goal is to budget compute differently across levels of the architecture rather than treat the whole network identically.

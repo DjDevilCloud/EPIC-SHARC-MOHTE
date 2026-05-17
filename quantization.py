@@ -27,6 +27,13 @@ except Exception:  # pragma: no cover - optional dependency
     bnb = None
 
 try:
+    import transformer_engine.pytorch as te  # type: ignore
+    from transformer_engine.common.recipe import NVFP4BlockScaling  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    te = None
+    NVFP4BlockScaling = None
+
+try:
     from .hierarchical_precision import current_precision_spec
 except ImportError:  # pragma: no cover - supports direct script launching.
     from hierarchical_precision import current_precision_spec
@@ -49,17 +56,55 @@ class QuantizationConfig:
     bitsandbytes_leaf_precision_mode: str = "fp4"
     bitsandbytes_leaf_quant_type: str = "nf4"
     bitsandbytes_leaf_compute_dtype: str = "bfloat16"
+    use_transformer_engine_leaf_precision: bool = False
+    transformer_engine_leaf_recipe: str = "nvfp4"
+    transformer_engine_leaf_params_dtype: str = "bfloat16"
 
 
 def _resolve_compute_dtype_name(value: object) -> torch.dtype:
     text = str(value or "").strip().lower()
+    if text.startswith("torch."):
+        text = text.split(".", 1)[1]
     if text in {"float16", "fp16", "half"}:
         return torch.float16
+    if text in {"bfloat16", "bf16"}:
+        return torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
+    if text in {"float32", "fp32"}:
+        return torch.float32
+    if text.startswith("float8"):
+        return torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
     return torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
 
 
 def _bitsandbytes_ready() -> bool:
     return bnb is not None and torch.cuda.is_available() and hasattr(bnb, "nn")
+
+
+def _transformer_engine_ready() -> bool:
+    return te is not None and torch.cuda.is_available()
+
+
+def _supports_blackwell_nvfp4() -> bool:
+    if not _transformer_engine_ready():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    return int(major) >= 10
+
+
+def _resolve_te_params_dtype(value: object) -> torch.dtype:
+    text = str(value or "").strip().lower()
+    if text.startswith("torch."):
+        text = text.split(".", 1)[1]
+    if text in {"bfloat16", "bf16"} and hasattr(torch, "bfloat16"):
+        return torch.bfloat16
+    if text in {"float16", "fp16", "half"}:
+        return torch.float16
+    if text in {"float32", "fp32"}:
+        return torch.float32
+    return torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
 
 
 class PolarQuantizer(nn.Module):
@@ -579,6 +624,116 @@ class BitsAndBytesLeafLinear(nn.Module):
         return base
 
 
+class TransformerEngineLeafLinear(nn.Module):
+    """Leaf-tier low precision linear layer backed by Transformer Engine."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        quantization_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.config = quantization_config or QuantizationConfig()
+        self.recipe_name = str(getattr(self.config, "transformer_engine_leaf_recipe", "nvfp4")).strip().lower()
+        self.params_dtype = _resolve_te_params_dtype(getattr(self.config, "transformer_engine_leaf_params_dtype", "bfloat16"))
+        self._use_te = bool(
+            _transformer_engine_ready()
+            and getattr(self.config, "use_transformer_engine_leaf_precision", False)
+            and self.recipe_name == "nvfp4"
+            and _supports_blackwell_nvfp4()
+            and NVFP4BlockScaling is not None
+        )
+
+        if not self._use_te:
+            self.fallback = (
+                BitsAndBytesLeafLinear(
+                    in_features,
+                    out_features,
+                    bias=bias,
+                    quantization_config=self.config,
+                )
+                if bool(getattr(self.config, "use_bitsandbytes_leaf_precision", False))
+                else QuantizedLinear(
+                    in_features,
+                    out_features,
+                    bias=bias,
+                    quantization_config=self.config,
+                )
+                if self.config.enabled
+                else PrecisionAwareLinear(in_features, out_features, bias=bias)
+            )
+            return
+
+        self.recipe = NVFP4BlockScaling()
+        self.base = te.Linear(in_features, out_features, bias=bias, params_dtype=self.params_dtype)
+        with torch.no_grad():
+            initial_weight = torch.randn(out_features, in_features, device=self.base.weight.device, dtype=self.params_dtype) * 0.02
+            self.base.weight.copy_(initial_weight)
+            if self.base.bias is not None:
+                self.base.bias.zero_()
+
+        adapter_rank = max(0, int(getattr(self.config, "adapter_rank", 0)))
+        if adapter_rank > 0:
+            self.adapter_dropout = nn.Dropout(float(getattr(self.config, "adapter_dropout", 0.0)))
+            self.adapter_down = nn.Linear(in_features, adapter_rank, bias=False)
+            self.adapter_up = nn.Linear(adapter_rank, out_features, bias=False)
+            self.adapter_scale = float(getattr(self.config, "adapter_alpha", 16.0)) / float(max(1, adapter_rank))
+            nn.init.zeros_(self.adapter_up.weight)
+        else:
+            self.adapter_dropout = nn.Identity()
+            self.adapter_down = None
+            self.adapter_up = None
+            self.adapter_scale = 0.0
+
+    def set_base_weight(self, weight: torch.Tensor) -> None:
+        if not self._use_te:
+            if hasattr(self.fallback, "set_base_weight"):
+                self.fallback.set_base_weight(weight)
+            return
+        with torch.no_grad():
+            self.base.weight.copy_(weight.detach().to(dtype=self.params_dtype, device=self.base.weight.device))
+
+    @property
+    def weight(self) -> torch.Tensor:
+        if not self._use_te:
+            return self.fallback.weight
+        return self.base.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        if not self._use_te:
+            return getattr(self.fallback, "bias", None)
+        return self.base.bias
+
+    def refresh_quantization_cache(self) -> None:
+        if not self._use_te:
+            refresh = getattr(self.fallback, "refresh_quantization_cache", None)
+            if callable(refresh):
+                refresh()
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not self._use_te:
+            return self.fallback(input)
+        if input.device.type != "cuda":
+            weight = self.base.weight.to(device=input.device, dtype=input.dtype)
+            bias = self.base.bias.to(device=input.device, dtype=input.dtype) if self.base.bias is not None else None
+            return F.linear(input, weight, bias)
+        base_input = input.to(dtype=self.params_dtype) if input.is_floating_point() and input.dtype != self.params_dtype else input
+        with te.autocast(enabled=True, recipe=self.recipe):
+            base = self.base(base_input)
+        if base.is_floating_point() and base.dtype != input.dtype:
+            base = base.to(dtype=input.dtype)
+        if self.adapter_up is not None and self.adapter_down is not None:
+            adapter_input = input.to(dtype=self.adapter_down.weight.dtype)
+            delta = self.adapter_up(self.adapter_dropout(self.adapter_down(adapter_input)))
+            base = base + self.adapter_scale * delta.to(dtype=base.dtype)
+        return base
+
+
 class QuantizedEmbedding(nn.Module):
     """
     API-compatible wrapper for nn.Embedding with a frozen quantized base and
@@ -910,13 +1065,21 @@ def create_quantized_linear(
     """
     config = quantization_config or QuantizationConfig()
     role = str(module_role or "default").strip().lower()
-    if role == "leaf" and bool(getattr(config, "use_bitsandbytes_leaf_precision", False)) and _bitsandbytes_ready():
-        return BitsAndBytesLeafLinear(
-            in_features,
-            out_features,
-            bias=bias,
-            quantization_config=config,
-        )
+    if role == "leaf":
+        if bool(getattr(config, "use_transformer_engine_leaf_precision", False)):
+            return TransformerEngineLeafLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                quantization_config=config,
+            )
+        if bool(getattr(config, "use_bitsandbytes_leaf_precision", False)) and _bitsandbytes_ready():
+            return BitsAndBytesLeafLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                quantization_config=config,
+            )
     if config.enabled:
         return QuantizedLinear(
             in_features,
