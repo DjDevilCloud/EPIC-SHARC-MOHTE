@@ -40,6 +40,7 @@ try:
     )
     from .hierarchical_precision import HierarchicalPrecisionPolicy
     from .hierarchical_precision import attach_precision_policy
+    from .hierarchical_precision import is_float8_dtype
     from .model import PrismalWaveModel
     from .quantization import refresh_quantized_caches
 except ImportError:  # pragma: no cover - supports direct script launching.
@@ -66,6 +67,7 @@ except ImportError:  # pragma: no cover - supports direct script launching.
     )
     from hierarchical_precision import HierarchicalPrecisionPolicy
     from hierarchical_precision import attach_precision_policy
+    from hierarchical_precision import is_float8_dtype
     from model import PrismalWaveModel
     from quantization import refresh_quantized_caches
 
@@ -350,10 +352,17 @@ def _amp_scaler_enabled(
         return False
     if precision_policy is None or not precision_policy.enabled:
         return True
+    try:
+        spec = precision_policy.resolve_for_level(0, 1, device, is_leaf=False, module_path="root", module_kind="root")
+        autocast_dtype = getattr(spec, "autocast_dtype", getattr(spec, "effective_compute_dtype", None))
+        if autocast_dtype is not None and (autocast_dtype == torch.bfloat16 or autocast_dtype == torch.float32 or is_float8_dtype(autocast_dtype)):
+            return False
+        if autocast_dtype == torch.float16:
+            return True
+    except Exception:
+        pass
     dtype_name = str(getattr(precision_policy, "root_compute_dtype", "")).strip().lower()
-    if dtype_name in {"bf16", "bfloat16"}:
-        return False
-    return True
+    return dtype_name in {"float16", "fp16"}
 
 
 def _apply_nested_optimizer_settings(optimizer: torch.optim.Optimizer, cfg: PrismalWaveConfig) -> None:

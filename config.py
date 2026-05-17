@@ -65,7 +65,7 @@ class PrismalWaveConfig:
     nested_learning_local_ema_beta: float = 0.90
     nested_learning_mid_ema_beta: float = 0.95
     nested_learning_global_ema_beta: float = 0.99
-    d_model: int = 12
+    d_model: int = 256
     n_layers: int = 1
     n_emitters: int = 16384
     n_slots: int = 2048
