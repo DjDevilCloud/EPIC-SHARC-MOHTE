@@ -351,6 +351,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--use-signature-lattice-generation-cache", dest="use_signature_lattice_generation_cache", action="store_true")
         p.add_argument("--no-signature-lattice-generation-cache", dest="use_signature_lattice_generation_cache", action="store_false")
         p.set_defaults(use_signature_lattice_generation_cache=default_cfg.use_signature_lattice_generation_cache)
+        p.add_argument("--use-sparse-emitter-routing", dest="use_sparse_emitter_routing", action="store_true")
+        p.add_argument("--no-sparse-emitter-routing", dest="use_sparse_emitter_routing", action="store_false")
+        p.set_defaults(use_sparse_emitter_routing=default_cfg.use_sparse_emitter_routing)
+        p.add_argument("--router-sparse-candidate-budget", type=int, default=default_cfg.router_sparse_candidate_budget)
         p.add_argument("--use-token-superposition-training", dest="use_token_superposition_training", action="store_true")
         p.add_argument("--no-token-superposition-training", dest="use_token_superposition_training", action="store_false")
         p.set_defaults(use_token_superposition_training=default_cfg.use_token_superposition_training)
@@ -653,6 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--max-samples", type=int, default=default_cfg.max_samples)
     bench_p.add_argument("--max-new-tokens", type=int, default=0)
     bench_p.add_argument("--min-token-frequency", type=int, default=2)
+    bench_p.add_argument("--tokenizer-workers", type=int, default=1)
     bench_p.add_argument(
         "--tokenizer-cache-dir",
         default="",
@@ -795,6 +800,8 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         signature_lattice_decay=getattr(args, "signature_lattice_decay", default_cfg.signature_lattice_decay),
         signature_lattice_chunk_len=getattr(args, "signature_lattice_chunk_len", default_cfg.signature_lattice_chunk_len),
         use_signature_lattice_generation_cache=getattr(args, "use_signature_lattice_generation_cache", default_cfg.use_signature_lattice_generation_cache),
+        use_sparse_emitter_routing=getattr(args, "use_sparse_emitter_routing", default_cfg.use_sparse_emitter_routing),
+        router_sparse_candidate_budget=getattr(args, "router_sparse_candidate_budget", default_cfg.router_sparse_candidate_budget),
         use_token_superposition_training=getattr(
             args,
             "use_token_superposition_training",

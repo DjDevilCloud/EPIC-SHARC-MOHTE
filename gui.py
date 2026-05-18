@@ -151,6 +151,8 @@ class PrismalWaveGUI(tk.Tk):
         self.signature_lattice_weight_var = tk.StringVar(value=str(DEFAULT_CFG.signature_lattice_weight))
         self.signature_lattice_decay_var = tk.StringVar(value=str(DEFAULT_CFG.signature_lattice_decay))
         self.use_signature_lattice_generation_cache_var = tk.BooleanVar(value=DEFAULT_CFG.use_signature_lattice_generation_cache)
+        self.use_sparse_emitter_routing_var = tk.BooleanVar(value=DEFAULT_CFG.use_sparse_emitter_routing)
+        self.router_sparse_candidate_budget_var = tk.StringVar(value=str(DEFAULT_CFG.router_sparse_candidate_budget))
         self.use_topk_mot_var = tk.BooleanVar(value=DEFAULT_CFG.use_topk_mot)
         self.mot_top_k_var = tk.StringVar(value=str(DEFAULT_CFG.mot_top_k))
         self.infer_checkpoint_var = tk.StringVar(value="")
@@ -313,6 +315,11 @@ class PrismalWaveGUI(tk.Tk):
         ).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(
             arch_flags,
+            text="Sparse emitter routing",
+            variable=self.use_sparse_emitter_routing_var,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(
+            arch_flags,
             text="Top-k MoT experts",
             variable=self.use_topk_mot_var,
         ).pack(side="left")
@@ -326,6 +333,7 @@ class PrismalWaveGUI(tk.Tk):
                 ("Candidates", self.signature_lattice_candidates_var),
                 ("Lattice weight", self.signature_lattice_weight_var),
                 ("Lattice decay", self.signature_lattice_decay_var),
+                ("Router cand budget", self.router_sparse_candidate_budget_var),
                 ("MoT top-k", self.mot_top_k_var),
             ],
         )
@@ -612,6 +620,8 @@ class PrismalWaveGUI(tk.Tk):
             self.signature_lattice_weight_var.get().strip() or str(DEFAULT_CFG.signature_lattice_weight),
             "--signature-lattice-decay",
             self.signature_lattice_decay_var.get().strip() or str(DEFAULT_CFG.signature_lattice_decay),
+            "--router-sparse-candidate-budget",
+            self.router_sparse_candidate_budget_var.get().strip() or str(DEFAULT_CFG.router_sparse_candidate_budget),
             "--mot-top-k",
             self.mot_top_k_var.get().strip() or str(DEFAULT_CFG.mot_top_k),
             "--torus-local-field-radius",
@@ -647,6 +657,10 @@ class PrismalWaveGUI(tk.Tk):
             cmd.append("--use-signature-lattice-generation-cache")
         else:
             cmd.append("--no-signature-lattice-generation-cache")
+        if self.use_sparse_emitter_routing_var.get():
+            cmd.append("--use-sparse-emitter-routing")
+        else:
+            cmd.append("--no-sparse-emitter-routing")
         if self.use_topk_mot_var.get():
             cmd.append("--use-topk-mot")
         else:

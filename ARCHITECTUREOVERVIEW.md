@@ -222,7 +222,7 @@ That means the same architecture can be exercised in a few different ways withou
 Some of the most important families of knobs are:
 
 - model size: `d_model`, `n_layers`, `ff_mult`
-- routing capacity: `n_emitters` as a reusable operator bank, `n_slots`, `top_k_emitters`, `top_k_slots`
+- routing capacity: `n_emitters` as a reusable operator bank, `n_slots`, `top_k_emitters`, `top_k_slots`, sparse emitter routing via `use_sparse_emitter_routing` and `router_sparse_candidate_budget`
 - hierarchy routing control: `emitter_hierarchy_score_weight`
 - torus shape: `torus_depth`, `torus_height`, `torus_width`
 - bus and relay behavior: `torus_global_bus_slots`, `torus_global_bus_decay`, `torus_global_bus_write_scale`

@@ -99,8 +99,12 @@ Key defaults:
 - `use_recursive_hmoe = true`
 - `use_signature_lattice_attention = true`
 - `use_signature_lattice_generation_cache = true`
+- `use_sparse_emitter_routing = true`
+- `router_sparse_candidate_budget = 256`
 - `use_torus_race_lanes = true`
 - `use_speculative_decoding = true`
+
+Set `--no-sparse-emitter-routing` if you want the older dense emitter scoring path for ablations.
 
 Precision support is backend-specific:
 

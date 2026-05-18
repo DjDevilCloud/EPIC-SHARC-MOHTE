@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from collections import deque
 from contextlib import nullcontext
+from functools import lru_cache
 import math
 import warnings
 import time
@@ -106,6 +107,27 @@ def _scalar_stat_tensor(value: torch.Tensor | float | int, *, device: torch.devi
             return value.detach().to(device=device)
         return value.detach().reshape(-1).mean().to(device=device)
     return torch.tensor(float(value), device=device)
+
+
+@lru_cache(maxsize=128)
+def _manhattan_offsets(limit: int) -> Tuple[Tuple[int, int], ...]:
+    limit = max(1, int(limit))
+    offsets: List[Tuple[int, int]] = [(0, 0)]
+    radius = 1
+    while len(offsets) < limit:
+        for dy in range(-radius, radius + 1):
+            dx = radius - abs(dy)
+            if dx == 0:
+                offsets.append((dy, 0))
+            else:
+                offsets.append((dy, dx))
+                if len(offsets) >= limit:
+                    break
+                offsets.append((dy, -dx))
+            if len(offsets) >= limit:
+                break
+        radius += 1
+    return tuple(offsets[:limit])
 
 
 def _aux_term_loss_breakdown(
@@ -5089,6 +5111,143 @@ class PrismalEmitterRouter(nn.Module):
         hierarchy_context = self.hierarchy_proj(hierarchy_context)
         return F.normalize(hierarchy_context, dim=-1)
 
+    @staticmethod
+    def _mix_seed(*values: int) -> int:
+        acc = 0x9E3779B97F4A7C15
+        for value in values:
+            acc ^= int(value) + 0x9E3779B97F4A7C15 + ((acc << 6) & 0xFFFFFFFFFFFFFFFF) + (acc >> 2)
+            acc &= 0xFFFFFFFFFFFFFFFF
+        return int(acc)
+
+    @staticmethod
+    def _append_candidate_id(
+        ordered: List[int],
+        seen: set[int],
+        value: int,
+        *,
+        total_emitters: int,
+    ) -> None:
+        if total_emitters <= 0:
+            return
+        item = int(value) % total_emitters
+        if item in seen:
+            return
+        seen.add(item)
+        ordered.append(item)
+
+    def _sparse_candidate_ids_for_token(
+        self,
+        *,
+        path_coord_y: float,
+        path_coord_x: float,
+        signature_family_id: int,
+        signature_id: int,
+        signature_level_id: int,
+        signature_relation_id: int,
+        parent_signature_id: int,
+        path_index: int,
+        layer_index: int,
+        total_emitters: int,
+        candidate_budget: int,
+    ) -> Tuple[int, ...]:
+        total_emitters = max(1, int(total_emitters))
+        candidate_budget = max(1, min(int(candidate_budget), total_emitters))
+        if total_emitters <= candidate_budget:
+            return tuple(range(total_emitters))
+
+        ordered: List[int] = []
+        seen: set[int] = set()
+        spatial_budget = max(1, candidate_budget // 2)
+        seed_budget = max(1, candidate_budget - spatial_budget)
+
+        row_center = int(round(float(path_coord_y))) % max(self.grid_height, 1)
+        col_center = int(round(float(path_coord_x))) % max(self.grid_width, 1)
+        for row_offset, col_offset in _manhattan_offsets(spatial_budget * 4):
+            if len(ordered) >= spatial_budget:
+                break
+            row = (row_center + row_offset) % max(self.grid_height, 1)
+            col = (col_center + col_offset) % max(self.grid_width, 1)
+            emitter_id = row * self.grid_width + col
+            if emitter_id >= total_emitters:
+                continue
+            self._append_candidate_id(ordered, seen, emitter_id, total_emitters=total_emitters)
+
+        seed_values = (
+            int(signature_family_id),
+            int(signature_id),
+            int(signature_level_id),
+            int(signature_relation_id),
+            int(parent_signature_id),
+            int(path_index),
+            int(layer_index),
+        )
+        per_seed_budget = max(1, seed_budget // max(len(seed_values), 1))
+        for source_index, seed in enumerate(seed_values):
+            if len(ordered) >= candidate_budget:
+                break
+            base = self._mix_seed(seed, path_index, layer_index, source_index, total_emitters)
+            for offset in range(per_seed_budget + 2):
+                if len(ordered) >= candidate_budget:
+                    break
+                self._append_candidate_id(ordered, seen, base + offset, total_emitters=total_emitters)
+                if offset > 0:
+                    self._append_candidate_id(ordered, seen, base - offset, total_emitters=total_emitters)
+
+        fallback_seed = self._mix_seed(
+            path_index,
+            layer_index,
+            total_emitters,
+            int(round(float(path_coord_y))),
+            int(round(float(path_coord_x))),
+        )
+        step = 0
+        while len(ordered) < candidate_budget:
+            self._append_candidate_id(ordered, seen, fallback_seed + step, total_emitters=total_emitters)
+            step += 1
+        return tuple(ordered[:candidate_budget])
+
+    def _build_sparse_candidate_tensor(
+        self,
+        *,
+        batch: int,
+        seq_len: int,
+        path_coord_y: float,
+        path_coord_x: float,
+        signature_family_ids: Optional[torch.Tensor],
+        signature_ids: Optional[torch.Tensor],
+        signature_level_ids: Optional[torch.Tensor],
+        signature_relation_ids: Optional[torch.Tensor],
+        parent_signature_ids: Optional[torch.Tensor],
+        path_index: int,
+        layer_index: int,
+        total_emitters: int,
+        candidate_budget: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        rows: List[List[int]] = []
+        for batch_idx in range(batch):
+            for seq_idx in range(seq_len):
+                family_id = int(signature_family_ids[batch_idx, seq_idx].item()) if signature_family_ids is not None else 0
+                sig_id = int(signature_ids[batch_idx, seq_idx].item()) if signature_ids is not None else family_id
+                level_id = int(signature_level_ids[batch_idx, seq_idx].item()) if signature_level_ids is not None else 0
+                relation_id = int(signature_relation_ids[batch_idx, seq_idx].item()) if signature_relation_ids is not None else 0
+                parent_id = int(parent_signature_ids[batch_idx, seq_idx].item()) if parent_signature_ids is not None else family_id
+                candidate_ids = self._sparse_candidate_ids_for_token(
+                    path_coord_y=path_coord_y,
+                    path_coord_x=path_coord_x,
+                    signature_family_id=family_id,
+                    signature_id=sig_id,
+                    signature_level_id=level_id,
+                    signature_relation_id=relation_id,
+                    parent_signature_id=parent_id,
+                    path_index=path_index,
+                    layer_index=layer_index,
+                    total_emitters=total_emitters,
+                    candidate_budget=candidate_budget,
+                )
+                rows.append(list(candidate_ids))
+        return torch.tensor(rows, device=device, dtype=torch.long).view(batch, seq_len, candidate_budget)
+
     def init_slots(
         self,
         batch_size: int,
@@ -5125,6 +5284,7 @@ class PrismalEmitterRouter(nn.Module):
         path_index: int,
         layer_index: int,
         torus_center: Optional[torch.Tensor] = None,
+        collect_telemetry: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         batch, seq_len, dim = hidden.shape
         state_dtype = getattr(self, "precision_state_dtype", None)
@@ -5155,6 +5315,173 @@ class PrismalEmitterRouter(nn.Module):
         path_coord = torch.sigmoid(self.path_coord_proj(path_vector.unsqueeze(0))) * coord_scale
         path_coord = path_coord.squeeze(0)
 
+        grid_h = torch.tensor(float(self.grid_height), device=hidden.device)
+        grid_w = torch.tensor(float(self.grid_width), device=hidden.device)
+        path_bias = (hidden * path_vector.view(1, 1, -1)).sum(dim=-1, keepdim=True) / math.sqrt(dim)
+
+        emitter_bank = emitter_bank_override if emitter_bank_override is not None else self.emitter_bank
+        operator_hierarchy_bank = (
+            operator_hierarchy_bank_override if operator_hierarchy_bank_override is not None else self.operator_hierarchy_bank
+        )
+        hierarchy_context_norm = hierarchy_context.norm(dim=-1).mean()
+        hierarchy_score_weight = float(getattr(self.cfg, "emitter_hierarchy_score_weight", 0.25))
+        router_temperature = max(float(self.cfg.router_temperature), 1e-3)
+        total_emitters = int(emitter_bank.size(0))
+        top_k_emitters = max(1, min(int(self.cfg.top_k_emitters), total_emitters))
+        emitter_chunk_size = max(1, min(total_emitters, int(getattr(self.cfg, "router_emitter_chunk_size", 1024))))
+
+        q_norm = F.normalize(query, dim=-1, eps=1e-6)
+        h_norm = F.normalize(hierarchy_context, dim=-1, eps=1e-6)
+        logit_scale = math.sqrt(dim)
+
+        use_sparse = bool(getattr(self.cfg, "use_sparse_emitter_routing", True))
+        if use_sparse:
+            candidate_budget = max(
+                top_k_emitters,
+                min(total_emitters, int(getattr(self.cfg, "router_sparse_candidate_budget", top_k_emitters))),
+            )
+            candidate_ids = self._build_sparse_candidate_tensor(
+                batch=batch,
+                seq_len=seq_len,
+                path_coord_y=float(path_coord[0].item()),
+                path_coord_x=float(path_coord[1].item()),
+                signature_family_ids=signature_family_ids,
+                signature_ids=signature_ids,
+                signature_level_ids=signature_level_ids,
+                signature_relation_ids=signature_relation_ids,
+                parent_signature_ids=parent_signature_ids,
+                path_index=path_index,
+                layer_index=layer_index,
+                total_emitters=total_emitters,
+                candidate_budget=candidate_budget,
+                device=hidden.device,
+            )
+            candidate_bank = emitter_bank[candidate_ids]
+            candidate_hierarchy_bank = operator_hierarchy_bank[candidate_ids]
+            candidate_phase = emitter_phase[candidate_ids]
+            candidate_frequency = emitter_frequency[candidate_ids]
+            candidate_coords = emitter_coords[candidate_ids]
+
+            candidate_content_scores = torch.sum(
+                q_norm.unsqueeze(2) * F.normalize(candidate_bank, dim=-1, eps=1e-6),
+                dim=-1,
+            ) * logit_scale
+            candidate_hierarchy_scores = torch.sum(
+                h_norm.unsqueeze(2) * F.normalize(candidate_hierarchy_bank, dim=-1, eps=1e-6),
+                dim=-1,
+            ) * logit_scale
+            candidate_phase_dist = (1.0 - torch.cos(phase_state.unsqueeze(2) - candidate_phase)).mean(dim=-1)
+            candidate_freq_dist = torch.abs(token_frequency.unsqueeze(2) - candidate_frequency).squeeze(-1)
+            candidate_coord_y = torch.abs(candidate_coords[..., 0] - path_coord[0]).clamp(max=float(self.grid_height))
+            candidate_coord_x = torch.abs(candidate_coords[..., 1] - path_coord[1]).clamp(max=float(self.grid_width))
+            candidate_coord_y = torch.minimum(candidate_coord_y, grid_h - candidate_coord_y)
+            candidate_coord_x = torch.minimum(candidate_coord_x, grid_w - candidate_coord_x)
+            candidate_grid_dist = candidate_coord_y + candidate_coord_x
+
+            candidate_scores = (
+                candidate_content_scores
+                + hierarchy_score_weight * candidate_hierarchy_scores
+                - self.cfg.torus_weight * candidate_phase_dist
+                - self.cfg.frequency_weight * candidate_freq_dist
+            )
+            candidate_scores = candidate_scores - self.cfg.emitter_neighbor_weight * candidate_grid_dist
+            candidate_scores = candidate_scores + 0.05 * path_bias
+            candidate_scores = candidate_scores + 0.03 * (layer_index + 1)
+
+            top_scores, top_local_idx = torch.topk(candidate_scores, k=top_k_emitters, dim=-1)
+            top_idx = torch.gather(candidate_ids, -1, top_local_idx)
+            top_weights = F.softmax(top_scores / router_temperature, dim=-1)
+            selected_emitters = torch.gather(
+                candidate_bank,
+                2,
+                top_local_idx.unsqueeze(-1).expand(-1, -1, -1, dim),
+            )
+            selected_hierarchy = torch.gather(
+                candidate_hierarchy_bank,
+                2,
+                top_local_idx.unsqueeze(-1).expand(-1, -1, -1, dim),
+            )
+            effective_emitters = selected_emitters + 0.25 * selected_hierarchy + 0.15 * hierarchy_context.unsqueeze(2)
+            emitter_context = torch.sum(top_weights.unsqueeze(-1) * effective_emitters, dim=2)
+            topk_entropy = -(top_weights * torch.log(top_weights + 1e-8)).sum(dim=-1)
+            topk_effective_count = torch.exp(topk_entropy)
+            emitter_mixture_target = float(getattr(self.cfg, "emitter_mixture_target_count", 2.0))
+            emitter_mixture_loss = torch.relu(
+                torch.tensor(emitter_mixture_target, device=hidden.device) - topk_effective_count.mean()
+            ) / max(emitter_mixture_target, 1.0)
+
+            slot_query = self.slot_query(hidden)
+            if slots.dtype != slot_query.dtype:
+                slots = slots.to(dtype=slot_query.dtype)
+            slot_scores = torch.einsum("btd,bsd->bts", slot_query, slots) / math.sqrt(dim)
+            top_k_slots = max(1, min(self.cfg.top_k_slots, slot_scores.size(-1)))
+            top_slot_scores, top_slot_idx = torch.topk(slot_scores, k=top_k_slots, dim=-1)
+            top_slot_weights = F.softmax(top_slot_scores / max(self.cfg.router_temperature, 1e-3), dim=-1)
+            slot_weights = torch.zeros_like(slot_scores, dtype=top_slot_weights.dtype)
+            slot_weights.scatter_(-1, top_slot_idx, top_slot_weights)
+            selected_slots = torch.take_along_dim(
+                slots.unsqueeze(1).expand(batch, seq_len, -1, -1),
+                top_slot_idx.unsqueeze(-1).expand(-1, -1, -1, dim),
+                dim=2,
+            )
+            slot_context = torch.sum(top_slot_weights.unsqueeze(-1) * selected_slots, dim=2)
+
+            combined_context = self.value_proj(emitter_context) + self.slot_value(slot_context) + 0.15 * hierarchy_context
+            gate = torch.sigmoid(self.route_gate(hidden))
+            delta = gate * self.out_proj(combined_context)
+
+            update_source = self.slot_value(value + emitter_context + slot_context + 0.25 * hierarchy_context)
+            per_token_slot_update = torch.einsum("bts,btd->btsd", slot_weights, update_source)
+            cumulative_slot_update = torch.cumsum(per_token_slot_update, dim=1)
+            cumulative_slot_weight = torch.cumsum(slot_weights, dim=1).unsqueeze(-1).clamp_min(1e-6)
+            running_slot_update = cumulative_slot_update / cumulative_slot_weight
+            final_slot_update = running_slot_update[:, -1]
+            updated_slots = self.cfg.memory_momentum * slots + (1.0 - self.cfg.memory_momentum) * (
+                self.slot_seed.unsqueeze(0) + final_slot_update
+            )
+
+            if collect_telemetry:
+                candidate_probs = F.softmax(candidate_scores / router_temperature, dim=-1).to(torch.float32)
+                entropy = -(candidate_probs * torch.log(candidate_probs + 1e-8)).sum(dim=-1).mean()
+                hierarchy_probs = F.softmax(candidate_hierarchy_scores / router_temperature, dim=-1).to(torch.float32)
+                hierarchy_entropy = -(hierarchy_probs * torch.log(hierarchy_probs + 1e-8)).sum(dim=-1).mean()
+                usage = torch.bincount(top_idx.reshape(-1).detach(), minlength=emitter_bank.size(0)).to(hidden.device).float()
+                usage = usage / usage.sum().clamp_min(1.0)
+                usage_accum = torch.zeros(total_emitters, device=hidden.device, dtype=torch.float32)
+                usage_accum.scatter_add_(0, candidate_ids.reshape(-1), candidate_probs.reshape(-1))
+                soft_usage = usage_accum / usage_accum.sum().clamp_min(1e-8)
+                usage_entropy = -(usage * torch.log(usage + 1e-8)).sum() / math.log(max(emitter_bank.size(0), 2))
+                usage_concentration = soft_usage.square().sum() * float(emitter_bank.size(0))
+                balance_loss = (usage_concentration - 1.0).clamp_min(0.0)
+            else:
+                entropy = torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
+                hierarchy_entropy = torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
+                usage = torch.zeros(1, device=hidden.device, dtype=query.dtype)
+                usage_concentration = torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
+                balance_loss = torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
+                usage_entropy = torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
+
+            active_emitters = torch.tensor(float(torch.unique(top_idx).numel()), device=hidden.device)
+            stats = {
+                "emitter_top_idx": top_idx.detach(),
+                "emitter_top_weights": top_weights.detach(),
+                "emitter_entropy": entropy,
+                "emitter_topk_entropy": topk_entropy.mean(),
+                "emitter_topk_effective_count": topk_effective_count.mean(),
+                "emitter_mixture_loss": emitter_mixture_loss,
+                "emitter_usage_entropy": usage_entropy.detach(),
+                "emitter_usage_concentration": usage_concentration.detach(),
+                "emitter_balance_loss": balance_loss,
+                "emitter_hierarchy_entropy": hierarchy_entropy.detach(),
+                "emitter_hierarchy_context_norm": hierarchy_context_norm.detach(),
+                "emitter_hierarchy_score_weight": torch.tensor(hierarchy_score_weight, device=hidden.device).detach(),
+                "slot_top_idx": top_slot_idx.detach(),
+                "slot_top_weights": top_slot_weights.detach(),
+                "slot_entropy": (-(slot_weights * torch.log(slot_weights + 1e-8)).sum(dim=-1).mean()).detach(),
+                "active_emitters": active_emitters.detach(),
+            }
+            return delta, updated_slots, stats
+
         phase_dist = (1.0 - torch.cos(phase_state.unsqueeze(2) - emitter_phase.view(1, 1, -1, dim))).mean(dim=-1)
         freq_dist = torch.abs(token_frequency - emitter_frequency.view(1, 1, -1))
         grid_h = torch.tensor(float(self.grid_height), device=hidden.device)
@@ -5170,33 +5497,89 @@ class PrismalEmitterRouter(nn.Module):
         operator_hierarchy_bank = (
             operator_hierarchy_bank_override if operator_hierarchy_bank_override is not None else self.operator_hierarchy_bank
         )
-        content_scores = torch.einsum(
-            "btd,ed->bte",
-            F.normalize(query, dim=-1, eps=1e-6),
-            F.normalize(emitter_bank, dim=-1, eps=1e-6),
-        ) * math.sqrt(dim)
-        hierarchy_scores = torch.einsum(
-            "btd,ed->bte",
-            F.normalize(hierarchy_context, dim=-1, eps=1e-6),
-            F.normalize(operator_hierarchy_bank, dim=-1, eps=1e-6),
-        ) * math.sqrt(dim)
         hierarchy_context_norm = hierarchy_context.norm(dim=-1).mean()
-        hierarchy_probs = F.softmax(hierarchy_scores / max(self.cfg.router_temperature, 1e-3), dim=-1)
-        hierarchy_entropy = -(hierarchy_probs * torch.log(hierarchy_probs + 1e-8)).sum(dim=-1).mean()
         hierarchy_score_weight = float(getattr(self.cfg, "emitter_hierarchy_score_weight", 0.25))
-        scores = (
-            content_scores
-            + hierarchy_score_weight * hierarchy_scores
-            - self.cfg.torus_weight * phase_dist
-            - self.cfg.frequency_weight * freq_dist
-        )
-        scores = scores - self.cfg.emitter_neighbor_weight * grid_dist
-        scores = scores + 0.05 * path_bias
-        scores = scores + 0.03 * (layer_index + 1)
+        router_temperature = max(float(self.cfg.router_temperature), 1e-3)
+        total_emitters = int(emitter_bank.size(0))
+        top_k_emitters = max(1, min(int(self.cfg.top_k_emitters), total_emitters))
+        emitter_chunk_size = max(1, min(total_emitters, int(getattr(self.cfg, "router_emitter_chunk_size", 1024))))
 
-        top_k_emitters = max(1, min(self.cfg.top_k_emitters, scores.size(-1)))
-        top_scores, top_idx = torch.topk(scores, k=top_k_emitters, dim=-1)
-        top_weights = F.softmax(top_scores / max(self.cfg.router_temperature, 1e-3), dim=-1)
+        q_norm = F.normalize(query, dim=-1, eps=1e-6)
+        h_norm = F.normalize(hierarchy_context, dim=-1, eps=1e-6)
+        logit_scale = math.sqrt(dim)
+        best_scores: Optional[torch.Tensor] = None
+        best_idx: Optional[torch.Tensor] = None
+        entropy_accum = torch.zeros(batch, seq_len, device=hidden.device, dtype=query.dtype)
+        hierarchy_entropy_accum = torch.zeros(batch, seq_len, device=hidden.device, dtype=query.dtype)
+        usage_accum = torch.zeros(total_emitters, device=hidden.device, dtype=query.dtype)
+        for emitter_start in range(0, total_emitters, emitter_chunk_size):
+            emitter_end = min(total_emitters, emitter_start + emitter_chunk_size)
+            emitter_slice = slice(emitter_start, emitter_end)
+            emitter_bank_chunk = emitter_bank[emitter_slice]
+            hierarchy_bank_chunk = operator_hierarchy_bank[emitter_slice]
+            emitter_phase_chunk = emitter_phase[emitter_slice]
+            emitter_frequency_chunk = emitter_frequency[emitter_slice]
+            emitter_coords_chunk = emitter_coords[emitter_slice]
+
+            chunk_content_scores = torch.einsum(
+                "btd,ed->bte",
+                q_norm,
+                F.normalize(emitter_bank_chunk, dim=-1, eps=1e-6),
+            ) * logit_scale
+            chunk_hierarchy_scores = torch.einsum(
+                "btd,ed->bte",
+                h_norm,
+                F.normalize(hierarchy_bank_chunk, dim=-1, eps=1e-6),
+            ) * logit_scale
+            chunk_hierarchy_logits = chunk_hierarchy_scores / router_temperature
+
+            chunk_phase_dist = (1.0 - torch.cos(phase_state.unsqueeze(2) - emitter_phase_chunk.view(1, 1, -1, dim))).mean(dim=-1)
+            chunk_freq_dist = torch.abs(token_frequency - emitter_frequency_chunk.view(1, 1, -1))
+            chunk_coord_y = torch.abs(emitter_coords_chunk[:, 0].view(1, 1, -1) - path_coord[0]).clamp(max=float(self.grid_height))
+            chunk_coord_x = torch.abs(emitter_coords_chunk[:, 1].view(1, 1, -1) - path_coord[1]).clamp(max=float(self.grid_width))
+            chunk_coord_y = torch.minimum(chunk_coord_y, grid_h - chunk_coord_y)
+            chunk_coord_x = torch.minimum(chunk_coord_x, grid_w - chunk_coord_x)
+            chunk_grid_dist = chunk_coord_y + chunk_coord_x
+
+            chunk_scores = (
+                chunk_content_scores
+                + hierarchy_score_weight * chunk_hierarchy_scores
+                - self.cfg.torus_weight * chunk_phase_dist
+                - self.cfg.frequency_weight * chunk_freq_dist
+            )
+            chunk_scores = chunk_scores - self.cfg.emitter_neighbor_weight * chunk_grid_dist
+            chunk_scores = chunk_scores + 0.05 * path_bias
+            chunk_scores = chunk_scores + 0.03 * (layer_index + 1)
+
+            chunk_logits = chunk_scores / router_temperature
+            chunk_lse = torch.logsumexp(chunk_logits, dim=-1)
+
+            chunk_top_k = min(top_k_emitters, emitter_end - emitter_start)
+            chunk_top_scores, chunk_top_idx = torch.topk(chunk_scores, k=chunk_top_k, dim=-1)
+            chunk_top_idx = chunk_top_idx + emitter_start
+            if best_scores is None or best_idx is None:
+                best_scores = chunk_top_scores
+                best_idx = chunk_top_idx
+            else:
+                merged_scores = torch.cat((best_scores, chunk_top_scores), dim=-1)
+                merged_idx = torch.cat((best_idx, chunk_top_idx), dim=-1)
+                best_scores, best_merge_idx = torch.topk(merged_scores, k=top_k_emitters, dim=-1)
+                best_idx = torch.gather(merged_idx, -1, best_merge_idx)
+
+            if collect_telemetry:
+                chunk_probs = torch.exp(chunk_logits - chunk_lse.unsqueeze(-1))
+                entropy_accum = entropy_accum - (chunk_probs * (chunk_logits - chunk_lse.unsqueeze(-1))).sum(dim=-1)
+                usage_accum[emitter_start:emitter_end] += chunk_probs.mean(dim=(0, 1))
+                chunk_hierarchy_lse = torch.logsumexp(chunk_hierarchy_logits, dim=-1)
+                chunk_hierarchy_probs = torch.exp(chunk_hierarchy_logits - chunk_hierarchy_lse.unsqueeze(-1))
+                hierarchy_entropy_accum = hierarchy_entropy_accum - (
+                    chunk_hierarchy_probs * (chunk_hierarchy_logits - chunk_hierarchy_lse.unsqueeze(-1))
+                ).sum(dim=-1)
+
+        assert best_scores is not None and best_idx is not None
+        top_scores = best_scores
+        top_idx = best_idx
+        top_weights = F.softmax(top_scores / router_temperature, dim=-1)
         selected_emitters = torch.take_along_dim(
             emitter_bank.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1, -1),
             top_idx.unsqueeze(-1).expand(-1, -1, -1, dim),
@@ -5246,16 +5629,15 @@ class PrismalEmitterRouter(nn.Module):
             self.slot_seed.unsqueeze(0) + final_slot_update
         )
 
-        emitter_probs = F.softmax(scores / max(self.cfg.router_temperature, 1e-3), dim=-1)
-        entropy = -(emitter_probs * torch.log(emitter_probs + 1e-8)).sum(dim=-1).mean()
+        entropy = entropy_accum.mean()
         active_emitters = torch.tensor(float(torch.unique(top_idx).numel()), device=hidden.device)
         usage = torch.bincount(top_idx.reshape(-1).detach(), minlength=emitter_bank.size(0)).to(hidden.device).float()
         usage = usage / usage.sum().clamp_min(1.0)
-        soft_usage = emitter_probs.mean(dim=(0, 1))
-        soft_usage = soft_usage / soft_usage.sum().clamp_min(1e-8)
+        soft_usage = usage_accum / usage_accum.sum().clamp_min(1e-8)
         usage_entropy = -(usage * torch.log(usage + 1e-8)).sum() / math.log(max(emitter_bank.size(0), 2))
         usage_concentration = soft_usage.square().sum() * float(emitter_bank.size(0))
         balance_loss = (usage_concentration - 1.0).clamp_min(0.0)
+        hierarchy_entropy = hierarchy_entropy_accum.mean() if collect_telemetry else torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
 
         stats = {
             "emitter_top_idx": top_idx.detach(),
