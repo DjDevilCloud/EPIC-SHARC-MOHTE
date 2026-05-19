@@ -425,6 +425,9 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_false",
         )
         p.set_defaults(use_residency_with_reinforcement=default_cfg.use_residency_with_reinforcement)
+        p.add_argument("--disable-auxlosses", dest="disable_auxlosses", action="store_true")
+        p.add_argument("--no-disable-auxlosses", dest="disable_auxlosses", action="store_false")
+        p.set_defaults(disable_auxlosses=default_cfg.disable_auxlosses)
         p.add_argument("--use-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_true")
         p.add_argument("--no-token-memory-cross-attention", dest="use_token_memory_cross_attention", action="store_false")
         p.set_defaults(use_token_memory_cross_attention=default_cfg.use_token_memory_cross_attention)
@@ -872,6 +875,7 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
             "use_residency_with_reinforcement",
             default_cfg.use_residency_with_reinforcement,
         ),
+        disable_auxlosses=getattr(args, "disable_auxlosses", default_cfg.disable_auxlosses),
         use_token_memory_cross_attention=getattr(args, "use_token_memory_cross_attention", default_cfg.use_token_memory_cross_attention),
         use_token_memory_generation_cache=getattr(args, "use_token_memory_generation_cache", default_cfg.use_token_memory_generation_cache),
         token_memory_window=getattr(args, "token_memory_window", default_cfg.token_memory_window),
@@ -1122,6 +1126,9 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.fst_max_prompt_chars = getattr(args, "fst_max_prompt_chars", raw_cfg.fst_max_prompt_chars)
             raw_cfg.fst_use_training_prefix = getattr(args, "fst_use_training_prefix", raw_cfg.fst_use_training_prefix)
             raw_cfg.fst_use_generation_prefix = getattr(args, "fst_use_generation_prefix", raw_cfg.fst_use_generation_prefix)
+            raw_cfg.disable_auxlosses = getattr(args, "disable_auxlosses", raw_cfg.disable_auxlosses)
+            if hasattr(model, "cfg"):
+                model.cfg.disable_auxlosses = raw_cfg.disable_auxlosses
             model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] initialized checkpoint weights "
@@ -1243,6 +1250,9 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.fst_max_prompt_chars = getattr(args, "fst_max_prompt_chars", raw_cfg.fst_max_prompt_chars)
             raw_cfg.fst_use_training_prefix = getattr(args, "fst_use_training_prefix", raw_cfg.fst_use_training_prefix)
             raw_cfg.fst_use_generation_prefix = getattr(args, "fst_use_generation_prefix", raw_cfg.fst_use_generation_prefix)
+            raw_cfg.disable_auxlosses = getattr(args, "disable_auxlosses", raw_cfg.disable_auxlosses)
+            if hasattr(model, "cfg"):
+                model.cfg.disable_auxlosses = raw_cfg.disable_auxlosses
             model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] resumed checkpoint architecture "
@@ -1376,6 +1386,7 @@ def main(argv: List[str] | None = None) -> int:
                 f"offload={bool(getattr(runtime_cfg, 'gatetrain_offload_to_cpu', False))}",
                 flush=True,
             )
+        runtime_cfg = getattr(model, "cfg", raw_cfg)
         model = maybe_compile_model(model, enabled=args.torch_compile)
         setattr(model, "_prismal_tokenizer", tokenizer)
         unwrapped_model = getattr(model, "_orig_mod", None)

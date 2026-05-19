@@ -174,6 +174,55 @@ def _aux_term_loss_breakdown(
     return total, components
 
 
+def _zero_aux_term_loss_breakdown(reference: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    zero = torch.zeros_like(reference)
+    return zero, {
+        "aux_signature_loss_term": zero,
+        "aux_signature_level_loss_term": zero,
+        "aux_signature_relation_loss_term": zero,
+        "aux_signature_contrastive_term": zero,
+        "aux_contrastive_routing_term": zero,
+        "aux_routing_entropy_term": zero,
+        "aux_emitter_balance_term": zero,
+        "aux_emitter_mixture_term": zero,
+        "aux_torus_active_balance_term": zero,
+        "aux_recursive_term": zero,
+        "aux_diversity_term": zero,
+        "aux_learned_residency_term": zero,
+    }
+
+
+def _zero_aux_loss_route_stats(route_stats: Dict[str, torch.Tensor], *, device: torch.device) -> None:
+    zero_keys = (
+        "signature_loss",
+        "signature_level_loss",
+        "signature_relation_loss",
+        "signature_contrastive_loss",
+        "pairwise_diversity",
+        "emitter_cell_mixture_loss",
+        "emitter_cell_coverage_loss",
+        "torus_coverage_loss",
+        "emitter_mixture_loss",
+        "emitter_balance_loss",
+        "recursive_aux_loss",
+        "learned_residency_loss",
+        "contrastive_routing_signature_neighborhood_loss",
+        "contrastive_routing_temporal_loss",
+        "contrastive_routing_residency_loss",
+        "contrastive_routing_cross_view_loss",
+        "contrastive_routing_self_contrast_loss",
+        "contrastive_routing_loss",
+        "aux_loss_total",
+    )
+    zero = torch.tensor(0.0, device=device)
+    for key in zero_keys:
+        value = route_stats.get(key)
+        if torch.is_tensor(value):
+            route_stats[key] = torch.zeros_like(value)
+        else:
+            route_stats[key] = zero
+
+
 def _repair_finite_tensor(
     tensor: torch.Tensor,
     *,
@@ -6462,6 +6511,8 @@ class PrismalWaveModel(nn.Module):
                 device=device,
             ),
         }
+        if getattr(self.cfg, "disable_auxlosses", False):
+            return stats, zero
         if not self.training or not self.use_contrastive_routing:
             return stats, zero
 
@@ -8930,8 +8981,12 @@ class PrismalWaveModel(nn.Module):
             learned_residency_weight=self.learned_residency_weight,
             learned_residency_loss=learned_residency_loss,
         )
+        if getattr(self.cfg, "disable_auxlosses", False):
+            aux_loss, aux_breakdown = _zero_aux_term_loss_breakdown(signature_loss)
         route_stats.update({key: value.detach() for key, value in aux_breakdown.items()})
         route_stats["aux_loss_total"] = aux_loss.detach()
+        if getattr(self.cfg, "disable_auxlosses", False):
+            _zero_aux_loss_route_stats(route_stats, device=input_ids.device)
 
         return PrismalWaveOutput(
             logits=final_logits,
@@ -9449,8 +9504,12 @@ class PrismalWaveModel(nn.Module):
             learned_residency_weight=self.learned_residency_weight,
             learned_residency_loss=learned_residency_loss,
         )
+        if getattr(self.cfg, "disable_auxlosses", False):
+            aux_loss, aux_breakdown = _zero_aux_term_loss_breakdown(signature_loss)
         route_stats.update({key: value.detach() for key, value in aux_breakdown.items()})
         route_stats["aux_loss_total"] = aux_loss.detach()
+        if getattr(self.cfg, "disable_auxlosses", False):
+            _zero_aux_loss_route_stats(route_stats, device=input_ids.device)
         final_logits, logits_repairs = self._sanitize_tensor(final_logits, fallback=torch.zeros_like(final_logits))
         final_output_signature, signature_repairs = self._sanitize_tensor(
             final_output_signature,
