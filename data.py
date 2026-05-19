@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import Counter
 import concurrent.futures
+from functools import lru_cache
 import itertools
 import os
 from dataclasses import dataclass, asdict, field
@@ -19,10 +20,23 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
+try:  # Optional dtype backend for bfloat16/float8 NumPy storage.
+    import ml_dtypes  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    ml_dtypes = None
+
+try:  # Optional GPU acceleration for a few conversion paths.
+    import cupy as cp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cp = None
+
 
 WORD_RE = re.compile(r"[A-Za-z0-9_']+|[^\w\s]", re.UNICODE)
 SEGMENT_RE = re.compile(r"[A-Za-z0-9_']+|\s+|[^\w\s]", re.UNICODE)
-ANSWER_MARKER_RE = re.compile(r"\b(response|answer|output|completion|target)\s*:\s*", re.IGNORECASE)
+ANSWER_MARKER_RE = re.compile(
+    r'(?:"?(?:response|answer|output|completion|target)"?\s*:\s*)',
+    re.IGNORECASE,
+)
 CONTROL_LINE_RE = re.compile(
     r"^(instruction|context|prompt|input|question|response|answer|output|completion|target|text)\s*:",
     re.IGNORECASE,
@@ -65,6 +79,145 @@ SIGNATURE_RELATION_IDS: Dict[str, int] = {
 }
 
 DEFAULT_HIERARCHY_VECTOR_DIM = 12
+DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM = 4
+
+
+def _normalize_hierarchy_vector_dtype_name(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("torch."):
+        text = text.split(".", 1)[1]
+    aliases = {
+        "half": "float16",
+        "fp16": "float16",
+        "bfloat16": "bfloat16",
+        "bf16": "bfloat16",
+        "fp32": "float32",
+        "float32": "float32",
+        "float8": "float8_e4m3fn",
+        "f8": "float8_e4m3fn",
+    }
+    return aliases.get(text, text or "float32")
+
+
+def hierarchy_vector_torch_dtype(value: object) -> torch.dtype:
+    name = _normalize_hierarchy_vector_dtype_name(value)
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16" and hasattr(torch, "bfloat16"):
+        return torch.bfloat16
+    if name == "float8_e4m3fn" and hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    if name == "float8_e4m3fn" and hasattr(torch, "float8_e5m2"):
+        return torch.float8_e5m2
+    if name == "float8_e5m2" and hasattr(torch, "float8_e5m2"):
+        return torch.float8_e5m2
+    if name == "float8_e5m2" and hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    return torch.float32
+
+
+def hierarchy_vector_numpy_dtype(value: object) -> np.dtype:
+    name = _normalize_hierarchy_vector_dtype_name(value)
+    if name == "float16":
+        return np.float16
+    if name == "bfloat16" and ml_dtypes is not None:
+        return np.dtype(ml_dtypes.bfloat16)
+    if name == "float8_e4m3fn" and ml_dtypes is not None and hasattr(ml_dtypes, "float8_e4m3fn"):
+        return np.dtype(ml_dtypes.float8_e4m3fn)
+    if name == "float8_e4m3fn" and ml_dtypes is not None and hasattr(ml_dtypes, "float8_e5m2"):
+        return np.dtype(ml_dtypes.float8_e5m2)
+    if name == "float8_e5m2" and ml_dtypes is not None and hasattr(ml_dtypes, "float8_e5m2"):
+        return np.dtype(ml_dtypes.float8_e5m2)
+    if name == "float8_e5m2" and ml_dtypes is not None and hasattr(ml_dtypes, "float8_e4m3fn"):
+        return np.dtype(ml_dtypes.float8_e4m3fn)
+    return np.float32
+
+
+def _hierarchy_vector_raw_numpy_dtype(value: object) -> np.dtype:
+    name = _normalize_hierarchy_vector_dtype_name(value)
+    if name == "bfloat16":
+        return np.uint16
+    if name.startswith("float8"):
+        return np.uint8
+    return hierarchy_vector_numpy_dtype(name)
+
+
+def _hierarchy_vector_tensor_to_numpy(tensor: torch.Tensor, *, dtype: object) -> np.ndarray:
+    cpu_tensor = tensor.detach().cpu()
+    target_name = _normalize_hierarchy_vector_dtype_name(dtype)
+    if target_name == "bfloat16" and ml_dtypes is not None and cpu_tensor.dtype == torch.bfloat16:
+        raw = cpu_tensor.view(torch.uint16).numpy()
+        return raw.view(hierarchy_vector_numpy_dtype(target_name))
+    if target_name.startswith("float8") and ml_dtypes is not None and hasattr(torch, target_name):
+        raw = cpu_tensor.view(torch.uint8).numpy()
+        return raw.view(hierarchy_vector_numpy_dtype(target_name))
+    if target_name == "float16" and cpu_tensor.dtype == torch.float16:
+        return cpu_tensor.numpy()
+    if cpu_tensor.dtype == torch.bfloat16:
+        return cpu_tensor.to(dtype=torch.float32).numpy()
+    if target_name.startswith("float8") and cpu_tensor.is_floating_point():
+        return cpu_tensor.to(dtype=torch.float32).numpy()
+    return cpu_tensor.numpy()
+
+
+def _hierarchy_vector_numpy_to_torch(
+    array: np.ndarray,
+    *,
+    dtype: object,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    target_name = _normalize_hierarchy_vector_dtype_name(dtype)
+    np_array = np.asarray(array)
+    if target_name == "bfloat16" and hasattr(torch, "bfloat16") and np_array.dtype.itemsize == 2:
+        raw = np_array.view(np.uint16)
+        tensor = torch.from_numpy(np.asarray(raw).copy()).view(torch.bfloat16)
+        return tensor.to(device=device) if device is not None else tensor
+    if target_name == "float8_e4m3fn" and hasattr(torch, "float8_e4m3fn") and np_array.dtype.itemsize == 1:
+        raw = np_array.view(np.uint8)
+        tensor = torch.from_numpy(np.asarray(raw).copy()).view(torch.float8_e4m3fn)
+        return tensor.to(device=device) if device is not None else tensor
+    if target_name == "float8_e5m2" and hasattr(torch, "float8_e5m2") and np_array.dtype.itemsize == 1:
+        raw = np_array.view(np.uint8)
+        tensor = torch.from_numpy(np.asarray(raw).copy()).view(torch.float8_e5m2)
+        return tensor.to(device=device) if device is not None else tensor
+    if target_name == "float16":
+        tensor = torch.from_numpy(np_array.copy()).to(dtype=torch.float16)
+        return tensor.to(device=device) if device is not None else tensor
+    tensor = torch.from_numpy(np_array.copy()).to(dtype=hierarchy_vector_torch_dtype(target_name))
+    return tensor.to(device=device) if device is not None else tensor
+
+
+@lru_cache(maxsize=None)
+def _hierarchy_vector_projection_matrix(source_dim: int, target_dim: int) -> torch.Tensor:
+    source_dim = max(1, int(source_dim))
+    target_dim = max(1, int(target_dim))
+    if target_dim >= source_dim:
+        return torch.eye(source_dim, dtype=torch.float32)
+
+    rows = torch.arange(source_dim, dtype=torch.float32).unsqueeze(1) + 1.0
+    cols = torch.arange(target_dim, dtype=torch.float32).unsqueeze(0) + 1.0
+    base = torch.cos((rows * cols) / float(source_dim + target_dim + 1))
+    basis, r = torch.linalg.qr(base, mode="reduced")
+    signs = torch.sign(torch.diag(r))
+    signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+    return (basis * signs).contiguous()
+
+
+def _project_hierarchy_vector_tensor(
+    vectors: torch.Tensor,
+    *,
+    enabled: bool = True,
+    target_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
+) -> torch.Tensor:
+    if not enabled:
+        return vectors
+    target_dim = max(1, int(target_dim))
+    source_dim = int(vectors.shape[-1])
+    if source_dim <= target_dim:
+        return vectors
+    projection = _hierarchy_vector_projection_matrix(source_dim, target_dim).to(device=vectors.device, dtype=torch.float32)
+    projected = torch.matmul(vectors.to(dtype=torch.float32), projection)
+    return projected
 
 
 def _build_hierarchy_vector_tensor(
@@ -80,6 +233,9 @@ def _build_hierarchy_vector_tensor(
     level_vocab_size: int,
     relation_vocab_size: int,
     family_vocab_size: int,
+    dtype: torch.dtype = torch.float32,
+    low_rank_enabled: bool = True,
+    low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
 ) -> torch.Tensor:
     token_ids = token_ids.to(dtype=torch.float32)
     signature_ids = signature_ids.to(dtype=torch.float32)
@@ -116,7 +272,7 @@ def _build_hierarchy_vector_tensor(
         | signature_relation_ids.eq(float(SIGNATURE_RELATION_IDS["containment"]))
     ).to(dtype=torch.float32)
 
-    return torch.stack(
+    vectors = torch.stack(
         [
             token_norm,
             signature_norm,
@@ -133,6 +289,10 @@ def _build_hierarchy_vector_tensor(
         ],
         dim=-1,
     )
+    vectors = _project_hierarchy_vector_tensor(vectors, enabled=low_rank_enabled, target_dim=low_rank_dim)
+    if dtype != torch.float32:
+        vectors = vectors.to(dtype=dtype)
+    return vectors
 
 
 @dataclass
@@ -272,6 +432,206 @@ def _clean_record_value(value: Any) -> str:
     return str(value).strip()
 
 
+_QA_STYLE_NAMES = ("instruction", "question", "json")
+_WHAT_IS_RE = re.compile(r"^(?:what is|what's)\s+(?P<subject>.+?)\??$", re.IGNORECASE)
+_WHAT_ARE_RE = re.compile(r"^what are\s+(?P<subject>.+?)\??$", re.IGNORECASE)
+_HOW_DO_RE = re.compile(r"^how do(?:es)?\s+(?P<subject>.+?)\??$", re.IGNORECASE)
+_WHY_DOES_RE = re.compile(r"^why does\s+(?P<subject>.+?)\??$", re.IGNORECASE)
+_NAME_RE = re.compile(r"^name\s+(?P<subject>.+?)\??$", re.IGNORECASE)
+_GIVE_ONE_REASON_RE = re.compile(r"^give one reason(?: why)?\s+(?P<subject>.+?)\??$", re.IGNORECASE)
+_QA_RESPONSE_BOILERPLATE_RE = re.compile(
+    r"^(?:"
+    r"in short|"
+    r"simply(?: put)?|"
+    r"basically|"
+    r"briefly|"
+    r"short answer(?: is)?|"
+    r"the short answer(?: is)?|"
+    r"to put it simply|"
+    r"in a nutshell|"
+    r"in one sentence|"
+    r"one sentence(?: answer)?|"
+    r"to answer(?: the question)?|"
+    r"put simply|"
+    r"simply speaking|"
+    r"in general|"
+    r"essentially|"
+    r"generally"
+    r")(?:\s*[,:\-]\s*|\s+)",
+    re.IGNORECASE,
+)
+
+
+def _stable_qa_style_index(*parts: Any) -> int:
+    seed = "\x1f".join(_clean_record_value(part) for part in parts if _clean_record_value(part))
+    digest = hashlib.sha1(seed.encode("utf-8")).digest()
+    return digest[0] % len(_QA_STYLE_NAMES)
+
+
+def _resolve_qa_style(style: str | None, *seed_parts: Any) -> tuple[str, int]:
+    normalized = _clean_record_value(style).lower() if style is not None else ""
+    if normalized in _QA_STYLE_NAMES:
+        return normalized, _stable_qa_style_index(*seed_parts)
+    return _QA_STYLE_NAMES[_stable_qa_style_index(*seed_parts)], _stable_qa_style_index(*seed_parts)
+
+
+def _rewrite_instruction_for_diversity(instruction: str, variation_index: int) -> str:
+    text = _clean_record_value(instruction)
+    lowered = text.lower()
+
+    def choose(templates: Sequence[str], subject: str) -> str:
+        subject = subject.strip().rstrip("?.!")
+        if not subject:
+            return text
+        template = templates[variation_index % len(templates)]
+        return template.format(subject=subject)
+
+    for pattern, templates in (
+        (
+            _WHAT_IS_RE,
+            (
+                "Explain what {subject} is.",
+                "Describe {subject}.",
+                "Tell me about {subject}.",
+                "What do you know about {subject}?",
+                "Give one brief explanation of {subject}.",
+                "Name what {subject} is.",
+            ),
+        ),
+        (
+            _WHAT_ARE_RE,
+            (
+                "Explain what {subject} are.",
+                "Describe {subject}.",
+                "Tell me about {subject}.",
+                "What do you know about {subject}?",
+                "Give one brief explanation of {subject}.",
+                "Name what {subject} are.",
+            ),
+        ),
+        (
+            _HOW_DO_RE,
+            (
+                "Explain how to {subject}.",
+                "Describe how to {subject}.",
+                "Show how to {subject}.",
+                "What is one way to {subject}?",
+                "Give one clear way to {subject}.",
+                "Tell me how to {subject}.",
+            ),
+        ),
+        (
+            _WHY_DOES_RE,
+            (
+                "Explain why {subject}.",
+                "Give one reason why {subject}.",
+                "Why is it that {subject}?",
+                "Tell me why {subject}.",
+                "Describe why {subject}.",
+                "What makes it so that {subject}?",
+            ),
+        ),
+        (
+            _NAME_RE,
+            (
+                "Name {subject}.",
+                "List {subject}.",
+                "Give the name of {subject}.",
+                "Identify {subject}.",
+                "State {subject}.",
+                "Tell me the name of {subject}.",
+            ),
+        ),
+        (
+            _GIVE_ONE_REASON_RE,
+            (
+                "Give one reason why {subject}.",
+                "Explain one reason why {subject}.",
+                "State one reason why {subject}.",
+                "Tell me one reason why {subject}.",
+                "Name one reason why {subject}.",
+                "Provide one reason why {subject}.",
+            ),
+        ),
+    ):
+        match = pattern.match(text)
+        if match:
+            return choose(templates, match.group("subject"))
+
+    return text
+
+
+def _rewrite_response_for_concision(response: str) -> str:
+    text = _clean_record_value(response)
+    while True:
+        rewritten = _QA_RESPONSE_BOILERPLATE_RE.sub("", text).strip()
+        if rewritten == text:
+            return text
+        text = rewritten
+
+
+def _build_structured_qa_blocks(
+    *,
+    instruction: str,
+    context: str,
+    response: str | None,
+    style: str = "mixed",
+) -> tuple[str, str]:
+    resolved_style, variation_index = _resolve_qa_style(style, instruction, context, response)
+    varied_instruction = _rewrite_instruction_for_diversity(instruction, variation_index)
+    context_text = _clean_record_value(context)
+    response_text = _rewrite_response_for_concision(response) if response is not None else ""
+
+    if resolved_style == "question":
+        input_lines = [f"Question: {varied_instruction}"]
+        if context_text:
+            input_lines.append(f"Context: {context_text}")
+        output_cue = "Answer:" if response is None else f"Answer: {response_text}"
+        return "\n".join(input_lines).strip(), output_cue
+
+    if resolved_style == "json":
+        input_payload: dict[str, str] = {"instruction": varied_instruction}
+        if context_text:
+            input_payload["context"] = context_text
+        input_text = json.dumps(input_payload, ensure_ascii=False, separators=(",", ": "))
+        if response is None:
+            return input_text, '{"response": '
+        output_text = json.dumps({"response": response_text}, ensure_ascii=False, separators=(",", ": "))
+        return input_text, output_text
+
+    input_lines = [f"Instruction: {varied_instruction}"]
+    if context_text:
+        input_lines.append(f"Context: {context_text}")
+    output_cue = "Response:" if response is None else f"Response: {response_text}"
+    return "\n".join(input_lines).strip(), output_cue
+
+
+def format_structured_qa_prompt(instruction: str, context: str = "", *, style: str = "mixed") -> str:
+    input_text, output_cue = _build_structured_qa_blocks(
+        instruction=instruction,
+        context=context,
+        response=None,
+        style=style,
+    )
+    return f"{input_text}\n{output_cue}".strip()
+
+
+def _compose_structured_qa_record(
+    *,
+    instruction: str,
+    context: str,
+    response: str,
+    style: str = "mixed",
+) -> str:
+    input_text, output_text = _build_structured_qa_blocks(
+        instruction=instruction,
+        context=context,
+        response=response,
+        style=style,
+    )
+    return "\n".join(["<BOI>", input_text, "<EOI>", "<BOO>", output_text, "<EOO>"]).strip()
+
+
 def _compose_record_text(payload: Dict[str, Any]) -> str:
     raw_text = _clean_record_value(payload.get("text") or payload.get("content"))
     if len(payload) == 1 and raw_text:
@@ -285,6 +645,9 @@ def _compose_record_text(payload: Dict[str, Any]) -> str:
         ("Question", ("question",)),
         ("Response", ("response", "output", "answer", "completion", "target")),
     ]
+    instruction_text = ""
+    context_text = ""
+    response_text = ""
     input_pieces: List[str] = []
     output_pieces: List[str] = []
     used_keys: set[str] = set()
@@ -299,7 +662,14 @@ def _compose_record_text(payload: Dict[str, Any]) -> str:
         if not value:
             continue
         if label == "Response":
+            response_text = value
             output_pieces.append(f"{label}: {value}")
+        elif label in {"Context", "Input"}:
+            context_text = context_text or value
+            input_pieces.append(f"{label}: {value}")
+        elif label in {"Instruction", "Question", "Prompt"}:
+            instruction_text = instruction_text or value
+            input_pieces.append(f"{label}: {value}")
         else:
             input_pieces.append(f"{label}: {value}")
 
@@ -310,6 +680,14 @@ def _compose_record_text(payload: Dict[str, Any]) -> str:
             input_pieces.append(f"Text: {raw_text}")
         elif input_pieces:
             input_pieces.append(f"Text: {raw_text}")
+
+    if instruction_text and response_text:
+        return _compose_structured_qa_record(
+            instruction=instruction_text,
+            context=context_text,
+            response=response_text,
+            style="mixed",
+        )
 
     if input_pieces or output_pieces:
         pieces: List[str] = []
@@ -481,7 +859,7 @@ class PrismalTokenizer:
     """Byte tokenizer with a handcrafted base alphabet plus learned construction units."""
 
     base_vocab_size: int = 0
-    codec_version: int = 5
+    codec_version: int = 6
     _COMMON_WORDS_AS_WHOLE_UNITS = CONTROL_TOKEN_TEXTS
     _CONSTRUCTION_PIECES: tuple[str, ...] = (
         "tion",
@@ -581,11 +959,19 @@ class PrismalTokenizer:
         ">",
     )
 
-    def __init__(self, *, use_pronunciation_signatures: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        use_pronunciation_signatures: bool = True,
+        hierarchy_vector_low_rank_enabled: bool = True,
+        hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
+    ) -> None:
         self.pad_id = 0
         self.bos_id = 1
         self.eos_id = 2
         self.use_pronunciation_signatures = bool(use_pronunciation_signatures)
+        self.hierarchy_vector_low_rank_enabled = bool(hierarchy_vector_low_rank_enabled)
+        self.hierarchy_vector_low_rank_dim = max(1, int(hierarchy_vector_low_rank_dim))
 
         self.dynamic_tokens: List[DynamicToken] = []
         self.token_to_id: Dict[str, int] = {}
@@ -1709,6 +2095,8 @@ class PrismalTokenizer:
             level_vocab_size=max(self.signature_level_vocab_size, 1),
             relation_vocab_size=max(self.signature_relation_vocab_size, 1),
             family_vocab_size=max(self.signature_family_vocab_size, 1),
+            low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
+            low_rank_dim=self.hierarchy_vector_low_rank_dim,
         ).tolist()
         bundle = HierarchyEncoding(
             token_ids=token_ids,
@@ -1774,6 +2162,8 @@ class PrismalTokenizer:
             level_vocab_size=max(self.signature_level_vocab_size, 1),
             relation_vocab_size=max(self.signature_relation_vocab_size, 1),
             family_vocab_size=max(self.signature_family_vocab_size, 1),
+            low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
+            low_rank_dim=self.hierarchy_vector_low_rank_dim,
         ).tolist()
         prompt_bundle = HierarchyEncoding(
             token_ids=token_ids,
@@ -2372,6 +2762,8 @@ class PrismalTokenizer:
             "bos_id": self.bos_id,
             "eos_id": self.eos_id,
             "use_pronunciation_signatures": self.use_pronunciation_signatures,
+            "hierarchy_vector_low_rank_enabled": self.hierarchy_vector_low_rank_enabled,
+            "hierarchy_vector_low_rank_dim": self.hierarchy_vector_low_rank_dim,
             "construction_units": [asdict(unit) for unit in self.construction_units],
             "dynamic_tokens": [],
             "signature_tokens": [asdict(tok) for tok in self.signature_tokens],
@@ -2381,6 +2773,8 @@ class PrismalTokenizer:
     def from_state_dict(cls, payload: Dict[str, object]) -> "PrismalTokenizer":
         tokenizer = cls(
             use_pronunciation_signatures=bool(payload.get("use_pronunciation_signatures", True)),
+            hierarchy_vector_low_rank_enabled=bool(payload.get("hierarchy_vector_low_rank_enabled", True)),
+            hierarchy_vector_low_rank_dim=int(payload.get("hierarchy_vector_low_rank_dim", DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM)),
         )
         tokenizer.pad_id = int(payload.get("pad_id", tokenizer.pad_id))
         tokenizer.bos_id = int(payload.get("bos_id", tokenizer.bos_id))
@@ -2602,6 +2996,8 @@ class PrismalTokenizer:
                 level_vocab_size=max(self.signature_level_vocab_size, 1),
                 relation_vocab_size=max(self.signature_relation_vocab_size, 1),
                 family_vocab_size=max(self.signature_family_vocab_size, 1),
+                low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
+                low_rank_dim=self.hierarchy_vector_low_rank_dim,
             )[0].tolist()
         return lookup
 
@@ -2713,7 +3109,12 @@ def _build_window_samples_from_text(
     *,
     seq_len: int,
     max_samples: int = 0,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
+    low_rank_enabled: Optional[bool] = None,
+    low_rank_dim: Optional[int] = None,
 ) -> List[WindowSample]:
+    low_rank_enabled = bool(getattr(tokenizer, "hierarchy_vector_low_rank_enabled", True)) if low_rank_enabled is None else bool(low_rank_enabled)
+    low_rank_dim = int(getattr(tokenizer, "hierarchy_vector_low_rank_dim", DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM)) if low_rank_dim is None else int(low_rank_dim)
     samples: List[WindowSample] = []
     seq_len = max(0, int(seq_len))
     encoded, encoded_signatures, encoded_levels, encoded_relations, encoded_parents, encoded_families = tokenizer.encode_hierarchy(
@@ -2766,6 +3167,9 @@ def _build_window_samples_from_text(
         level_vocab_size=max(tokenizer.signature_level_vocab_size, 1),
         relation_vocab_size=max(tokenizer.signature_relation_vocab_size, 1),
         family_vocab_size=max(tokenizer.signature_family_vocab_size, 1),
+        dtype=hierarchy_vector_torch_dtype(hierarchy_vector_dtype),
+        low_rank_enabled=low_rank_enabled,
+        low_rank_dim=low_rank_dim,
     )
 
     token_loss_mask = _build_loss_mask(tokenizer, merged, encoded)
@@ -2820,6 +3224,9 @@ def _build_window_samples_from_text(
             level_vocab_size=max(tokenizer.signature_level_vocab_size, 1),
             relation_vocab_size=max(tokenizer.signature_relation_vocab_size, 1),
             family_vocab_size=max(tokenizer.signature_family_vocab_size, 1),
+            dtype=hierarchy_vector_torch_dtype(hierarchy_vector_dtype),
+            low_rank_enabled=low_rank_enabled,
+            low_rank_dim=low_rank_dim,
         )
         samples.append(
             WindowSample(
@@ -2830,7 +3237,7 @@ def _build_window_samples_from_text(
                 signature_relation_ids=torch.tensor(rel_ids[:-1], dtype=torch.long),
                 parent_signature_ids=torch.tensor(parent_ids[:-1], dtype=torch.long),
                 signature_family_ids=torch.tensor(family_ids[:-1], dtype=torch.long),
-                hierarchy_vectors=hierarchy_vectors[:-1].to(dtype=torch.float32),
+                hierarchy_vectors=hierarchy_vectors[:-1],
                 loss_mask=torch.tensor(loss_mask[1:], dtype=torch.float32),
             )
         )
@@ -2881,9 +3288,11 @@ class TextWindowDataset(Dataset):
         stride: int | None = None,
         max_samples: int = 0,
         sample_seed: int | None = None,
+        hierarchy_vector_dtype: object = "float8_e4m3fn",
     ) -> None:
         self.tokenizer = tokenizer
         self.seq_len = max(0, int(seq_len))
+        self.hierarchy_vector_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
         if stride is not None:
             self.stride = max(1, int(stride))
         elif self.seq_len > 0:
@@ -2906,6 +3315,7 @@ class TextWindowDataset(Dataset):
                 merged,
                 seq_len=self.seq_len,
                 max_samples=max(0, int(max_samples) - len(self.samples)) if max_samples else 0,
+                hierarchy_vector_dtype=self.hierarchy_vector_dtype,
             )
             self.samples.extend(windows)
             if max_samples and len(self.samples) >= max_samples:
@@ -2942,10 +3352,12 @@ class StreamingTextCorpusDataset(IterableDataset):
         seed: int = 42,
         sample_seed: int | None = None,
         shuffle_buffer_size: int | None = None,
+        hierarchy_vector_dtype: object = "float8_e4m3fn",
     ) -> None:
         self.source = Path(source)
         self.tokenizer = tokenizer
         self.seq_len = max(0, int(seq_len))
+        self.hierarchy_vector_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
         self.max_samples = max(0, int(max_samples))
         self.split = split
         self.val_fraction = float(val_fraction)
@@ -2982,6 +3394,7 @@ class StreamingTextCorpusDataset(IterableDataset):
             merged,
             seq_len=self.seq_len,
             max_samples=remaining,
+            hierarchy_vector_dtype=self.hierarchy_vector_dtype,
         )
 
     def __iter__(self) -> Iterator[WindowSample]:
@@ -3073,6 +3486,8 @@ def _window_sample_numpy(sample: WindowSample, field_name: str) -> np.ndarray:
     tensor = getattr(sample, field_name)
     if not torch.is_tensor(tensor):
         raise TypeError(f"Expected tensor field {field_name}, got {type(tensor).__name__}")
+    if field_name == "hierarchy_vectors":
+        return _hierarchy_vector_tensor_to_numpy(tensor, dtype=tensor.dtype)
     return tensor.detach().cpu().numpy()
 
 
@@ -3082,8 +3497,19 @@ def save_pretokenized_windows(
     *,
     seq_len: int,
     metadata: Optional[Dict[str, Any]] = None,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
+    hierarchy_vector_low_rank_enabled: bool = True,
+    hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
 ) -> Path:
-    return stream_pretokenized_windows(samples, output_dir, seq_len=seq_len, metadata=metadata)
+    return stream_pretokenized_windows(
+        samples,
+        output_dir,
+        seq_len=seq_len,
+        metadata=metadata,
+        hierarchy_vector_dtype=hierarchy_vector_dtype,
+        hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
+    )
 
 
 def stream_pretokenized_windows(
@@ -3093,6 +3519,9 @@ def stream_pretokenized_windows(
     seq_len: int,
     metadata: Optional[Dict[str, Any]] = None,
     num_samples: Optional[int] = None,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
+    hierarchy_vector_low_rank_enabled: bool = True,
+    hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
 ) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -3118,6 +3547,8 @@ def stream_pretokenized_windows(
     offsets = np.zeros(num_samples, dtype=np.int64)
     lengths = np.zeros(num_samples, dtype=np.int64)
     hierarchy_vector_dim = DEFAULT_HIERARCHY_VECTOR_DIM
+    hierarchy_vector_dtype_name = _normalize_hierarchy_vector_dtype_name(hierarchy_vector_dtype)
+    hierarchy_vector_np_dtype = hierarchy_vector_numpy_dtype(hierarchy_vector_dtype_name)
     if num_samples > 0:
         preview_iter, samples_for_write = itertools.tee(samples_for_write)
         first_sample = next(preview_iter, None)
@@ -3131,7 +3562,7 @@ def stream_pretokenized_windows(
         "signature_relation_ids": np.int64,
         "parent_signature_ids": np.int64,
         "signature_family_ids": np.int64,
-        "hierarchy_vectors": np.float32,
+        "hierarchy_vectors": hierarchy_vector_np_dtype,
         "loss_mask": np.float32,
     }
     field_memmaps: Dict[str, np.ndarray] = {
@@ -3160,7 +3591,7 @@ def stream_pretokenized_windows(
                         "hierarchy_vectors must match sample length and shared width; "
                         f"got {tuple(array.shape)} expected {(sample_len, hierarchy_vector_dim)}"
                     )
-                field_memmaps[field_name][cursor : cursor + sample_len, :] = array.astype(np.float32, copy=False)
+                field_memmaps[field_name][cursor : cursor + sample_len, :] = array.astype(hierarchy_vector_np_dtype, copy=False)
                 continue
             flat = array.reshape(-1)
             if field_name != "loss_mask" and flat.dtype != np.int64:
@@ -3186,6 +3617,9 @@ def stream_pretokenized_windows(
         "num_samples": int(written),
         "field_names": _window_sample_field_names(),
         "hierarchy_vector_dim": int(hierarchy_vector_dim),
+        "hierarchy_vector_dtype": hierarchy_vector_dtype_name,
+        "hierarchy_vector_low_rank_enabled": bool(hierarchy_vector_low_rank_enabled),
+        "hierarchy_vector_low_rank_dim": int(max(1, int(hierarchy_vector_low_rank_dim))),
     }
     if metadata:
         payload.update(metadata)
@@ -3205,6 +3639,7 @@ class MemmapTokenDataset(Dataset):
         seed: int = 42,
         max_samples: int = 0,
         sample_seed: int | None = None,
+        hierarchy_vector_dtype: object | None = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.meta_path = self.root_dir / "meta.json"
@@ -3218,6 +3653,21 @@ class MemmapTokenDataset(Dataset):
         self.seed = int(seed)
         self.max_samples = max(0, int(max_samples))
         self.sample_seed = int(sample_seed) if sample_seed is not None else random.SystemRandom().randrange(1 << 63)
+        hierarchy_vector_dim = int(self.meta.get("hierarchy_vector_dim", DEFAULT_HIERARCHY_VECTOR_DIM))
+        if "hierarchy_vector_low_rank_enabled" in self.meta:
+            self.hierarchy_vector_low_rank_enabled = bool(self.meta.get("hierarchy_vector_low_rank_enabled"))
+        else:
+            self.hierarchy_vector_low_rank_enabled = hierarchy_vector_dim < DEFAULT_HIERARCHY_VECTOR_DIM
+        if "hierarchy_vector_low_rank_dim" in self.meta:
+            hierarchy_vector_low_rank_dim = int(self.meta.get("hierarchy_vector_low_rank_dim", DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM))
+        elif self.hierarchy_vector_low_rank_enabled:
+            hierarchy_vector_low_rank_dim = hierarchy_vector_dim
+        else:
+            hierarchy_vector_low_rank_dim = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM
+        self.hierarchy_vector_low_rank_dim = max(1, hierarchy_vector_low_rank_dim)
+        self.hierarchy_vector_dtype = hierarchy_vector_torch_dtype(
+            hierarchy_vector_dtype if hierarchy_vector_dtype is not None else self.meta.get("hierarchy_vector_dtype", "float8_e4m3fn")
+        )
         self.offsets = np.load(self.root_dir / "sample_offsets.npy", mmap_mode="r")
         self.lengths = np.load(self.root_dir / "sample_lengths.npy", mmap_mode="r")
         self.fields = {
@@ -3274,7 +3724,10 @@ class MemmapTokenDataset(Dataset):
         end = start + length
         hierarchy_vectors_field = self.fields.get("hierarchy_vectors")
         if hierarchy_vectors_field is not None:
-            hierarchy_vectors = torch.from_numpy(np.asarray(hierarchy_vectors_field[start:end]).copy()).to(dtype=torch.float32)
+            hierarchy_vectors = _hierarchy_vector_numpy_to_torch(
+                np.asarray(hierarchy_vectors_field[start:end]).copy(),
+                dtype=self.hierarchy_vector_dtype,
+            )
         else:
             input_ids = self._slice_field("input_ids", start, end, dtype=torch.long)
             signature_ids = self._slice_field("signature_ids", start, end, dtype=torch.long)
@@ -3294,6 +3747,9 @@ class MemmapTokenDataset(Dataset):
                 level_vocab_size=max(int(self.meta.get("signature_level_vocab_size", int(signature_level_ids.max().item()) + 1 if signature_level_ids.numel() > 0 else 1)), 1),
                 relation_vocab_size=max(int(self.meta.get("signature_relation_vocab_size", int(signature_relation_ids.max().item()) + 1 if signature_relation_ids.numel() > 0 else 1)), 1),
                 family_vocab_size=max(int(self.meta.get("signature_family_vocab_size", int(signature_family_ids.max().item()) + 1 if signature_family_ids.numel() > 0 else 1)), 1),
+                dtype=self.hierarchy_vector_dtype,
+                low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
+                low_rank_dim=self.hierarchy_vector_low_rank_dim,
             )
         return WindowSample(
             input_ids=self._slice_field("input_ids", start, end, dtype=torch.long),
@@ -3330,6 +3786,7 @@ def split_text_window_dataset(
 def build_collate_fn(
     pad_id: int,
     signature_pad_id: int = 0,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
 ) -> Callable[
     [Sequence[WindowSample]],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -3339,6 +3796,7 @@ def build_collate_fn(
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         max_len = max(sample.input_ids.numel() for sample in batch)
         hierarchy_dim = max(sample.hierarchy_vectors.size(-1) for sample in batch)
+        hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
         inputs = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
         labels = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
         signatures = torch.full((len(batch), max_len), signature_pad_id, dtype=torch.long)
@@ -3346,7 +3804,7 @@ def build_collate_fn(
         signature_relations = torch.full((len(batch), max_len), SIGNATURE_RELATION_IDS["pad"], dtype=torch.long)
         parent_signatures = torch.full((len(batch), max_len), signature_pad_id, dtype=torch.long)
         signature_families = torch.full((len(batch), max_len), 0, dtype=torch.long)
-        hierarchy_vectors = torch.zeros((len(batch), max_len, hierarchy_dim), dtype=torch.float32)
+        hierarchy_vectors = torch.zeros((len(batch), max_len, hierarchy_dim), dtype=hierarchy_dtype)
         loss_masks = torch.zeros((len(batch), max_len), dtype=torch.float32)
         for i, sample in enumerate(batch):
             n = sample.input_ids.numel()
@@ -3357,7 +3815,9 @@ def build_collate_fn(
             signature_relations[i, : sample.signature_relation_ids.numel()] = sample.signature_relation_ids
             parent_signatures[i, : sample.parent_signature_ids.numel()] = sample.parent_signature_ids
             signature_families[i, : sample.signature_family_ids.numel()] = sample.signature_family_ids
-            hierarchy_vectors[i, : sample.hierarchy_vectors.size(0), : sample.hierarchy_vectors.size(1)] = sample.hierarchy_vectors
+            hierarchy_vectors[i, : sample.hierarchy_vectors.size(0), : sample.hierarchy_vectors.size(1)] = sample.hierarchy_vectors.to(
+                dtype=hierarchy_dtype
+            )
             loss_masks[i, : sample.loss_mask.numel()] = sample.loss_mask
         return inputs, labels, signatures, signature_levels, signature_relations, parent_signatures, signature_families, hierarchy_vectors, loss_masks
 

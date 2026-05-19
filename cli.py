@@ -176,6 +176,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(use_turbo_quantization=default_cfg.use_turbo_quantization)
         p.add_argument("--turbo-quantization-bits", type=int, default=default_cfg.turbo_quantization_bits)
         p.add_argument("--turbo-quantization-method", type=str, default=default_cfg.turbo_quantization_method)
+        p.add_argument("--use-torchao-weight-only", dest="use_torchao_weight_only", action="store_true")
+        p.add_argument("--no-torchao-weight-only", dest="use_torchao_weight_only", action="store_false")
+        p.set_defaults(use_torchao_weight_only=default_cfg.use_torchao_weight_only)
+        p.add_argument("--torchao-weight-only-mode", type=str, default=default_cfg.torchao_weight_only_mode)
+        p.add_argument("--torchao-weight-only-group-size", type=int, default=default_cfg.torchao_weight_only_group_size)
+        p.add_argument("--use-torchao-embedding-weight-only", dest="use_torchao_embedding_weight_only", action="store_true")
+        p.add_argument("--no-torchao-embedding-weight-only", dest="use_torchao_embedding_weight_only", action="store_false")
+        p.set_defaults(use_torchao_embedding_weight_only=default_cfg.use_torchao_embedding_weight_only)
+        p.add_argument("--torchao-embedding-group-size", type=int, default=default_cfg.torchao_embedding_group_size)
+        p.add_argument("--torchao-embedding-output-dtype", type=str, default=default_cfg.torchao_embedding_output_dtype)
         p.add_argument(
             "--use-bitsandbytes-leaf-precision",
             dest="use_bitsandbytes_leaf_precision",
@@ -285,15 +295,20 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.set_defaults(use_learned_hierarchy_embeddings=default_cfg.use_learned_hierarchy_embeddings)
         p.add_argument(
-            "--learned-hierarchy-vector-dim",
-            type=int,
-            default=default_cfg.learned_hierarchy_vector_dim,
-        )
-        p.add_argument(
             "--learned-hierarchy-vector-scale",
             type=float,
             default=default_cfg.learned_hierarchy_vector_scale,
         )
+        p.add_argument(
+            "--hierarchy-vector-dtype",
+            type=str,
+            default=default_cfg.hierarchy_vector_dtype,
+            choices=("float32", "bfloat16", "float16", "float8_e4m3fn", "float8_e5m2"),
+        )
+        p.add_argument("--hierarchy-vector-low-rank-enabled", dest="hierarchy_vector_low_rank_enabled", action="store_true")
+        p.add_argument("--no-hierarchy-vector-low-rank-enabled", dest="hierarchy_vector_low_rank_enabled", action="store_false")
+        p.set_defaults(hierarchy_vector_low_rank_enabled=default_cfg.hierarchy_vector_low_rank_enabled)
+        p.add_argument("--hierarchy-vector-low-rank-dim", type=int, default=default_cfg.hierarchy_vector_low_rank_dim)
         p.add_argument("--hierarchical-tier-char-weight", type=float, default=default_cfg.hierarchical_tier_char_weight)
         p.add_argument("--hierarchical-tier-piece-weight", type=float, default=default_cfg.hierarchical_tier_piece_weight)
         p.add_argument("--hierarchical-tier-word-weight", type=float, default=default_cfg.hierarchical_tier_word_weight)
@@ -440,6 +455,18 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--use-speculative-decoding", dest="use_speculative_decoding", action="store_true")
         p.add_argument("--no-speculative-decoding", dest="use_speculative_decoding", action="store_false")
         p.set_defaults(use_speculative_decoding=default_cfg.use_speculative_decoding)
+        p.add_argument("--use-fst", dest="use_fst", action="store_true")
+        p.add_argument("--no-fst", dest="use_fst", action="store_false")
+        p.set_defaults(use_fst=default_cfg.use_fst)
+        p.add_argument("--fst-seed-prompt", type=str, default=default_cfg.fst_seed_prompt)
+        p.add_argument("--fst-refresh-interval", type=int, default=default_cfg.fst_refresh_interval)
+        p.add_argument("--fst-max-prompt-chars", type=int, default=default_cfg.fst_max_prompt_chars)
+        p.add_argument("--fst-use-training-prefix", dest="fst_use_training_prefix", action="store_true")
+        p.add_argument("--no-fst-use-training-prefix", dest="fst_use_training_prefix", action="store_false")
+        p.set_defaults(fst_use_training_prefix=default_cfg.fst_use_training_prefix)
+        p.add_argument("--fst-use-generation-prefix", dest="fst_use_generation_prefix", action="store_true")
+        p.add_argument("--no-fst-use-generation-prefix", dest="fst_use_generation_prefix", action="store_false")
+        p.set_defaults(fst_use_generation_prefix=default_cfg.fst_use_generation_prefix)
         p.add_argument("--speculative-draft-tokens", type=int, default=default_cfg.speculative_draft_tokens)
         p.add_argument("--speculative-temperature", type=float, default=default_cfg.speculative_temperature)
         p.add_argument("--torus-depth", type=int, default=default_cfg.torus_depth)
@@ -722,6 +749,12 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         use_turbo_quantization=args.use_turbo_quantization,
         turbo_quantization_bits=args.turbo_quantization_bits,
         turbo_quantization_method=args.turbo_quantization_method,
+        use_torchao_weight_only=getattr(args, "use_torchao_weight_only", default_cfg.use_torchao_weight_only),
+        torchao_weight_only_mode=getattr(args, "torchao_weight_only_mode", default_cfg.torchao_weight_only_mode),
+        torchao_weight_only_group_size=getattr(args, "torchao_weight_only_group_size", default_cfg.torchao_weight_only_group_size),
+        use_torchao_embedding_weight_only=getattr(args, "use_torchao_embedding_weight_only", default_cfg.use_torchao_embedding_weight_only),
+        torchao_embedding_group_size=getattr(args, "torchao_embedding_group_size", default_cfg.torchao_embedding_group_size),
+        torchao_embedding_output_dtype=getattr(args, "torchao_embedding_output_dtype", default_cfg.torchao_embedding_output_dtype),
         use_bitsandbytes_leaf_precision=args.use_bitsandbytes_leaf_precision,
         bitsandbytes_leaf_precision_mode=args.bitsandbytes_leaf_precision_mode,
         bitsandbytes_leaf_quant_type=args.bitsandbytes_leaf_quant_type,
@@ -759,8 +792,10 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         hierarchical_recursive_depth_scale=getattr(args, "hierarchical_recursive_depth_scale", default_cfg.hierarchical_recursive_depth_scale),
         hierarchical_fixed_point_scale=getattr(args, "hierarchical_fixed_point_scale", default_cfg.hierarchical_fixed_point_scale),
         use_learned_hierarchy_embeddings=getattr(args, "use_learned_hierarchy_embeddings", default_cfg.use_learned_hierarchy_embeddings),
-        learned_hierarchy_vector_dim=getattr(args, "learned_hierarchy_vector_dim", default_cfg.learned_hierarchy_vector_dim),
         learned_hierarchy_vector_scale=getattr(args, "learned_hierarchy_vector_scale", default_cfg.learned_hierarchy_vector_scale),
+        hierarchy_vector_dtype=getattr(args, "hierarchy_vector_dtype", default_cfg.hierarchy_vector_dtype),
+        hierarchy_vector_low_rank_enabled=getattr(args, "hierarchy_vector_low_rank_enabled", default_cfg.hierarchy_vector_low_rank_enabled),
+        hierarchy_vector_low_rank_dim=getattr(args, "hierarchy_vector_low_rank_dim", default_cfg.hierarchy_vector_low_rank_dim),
         hierarchical_tier_char_weight=getattr(args, "hierarchical_tier_char_weight", default_cfg.hierarchical_tier_char_weight),
         hierarchical_tier_piece_weight=getattr(args, "hierarchical_tier_piece_weight", default_cfg.hierarchical_tier_piece_weight),
         hierarchical_tier_word_weight=getattr(args, "hierarchical_tier_word_weight", default_cfg.hierarchical_tier_word_weight),
@@ -855,6 +890,12 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         token_copy_min_confidence=getattr(args, "token_copy_min_confidence", default_cfg.token_copy_min_confidence),
         use_pronunciation_signatures=getattr(args, "use_pronunciation_signatures", default_cfg.use_pronunciation_signatures),
         use_speculative_decoding=args.use_speculative_decoding,
+        use_fst=getattr(args, "use_fst", default_cfg.use_fst),
+        fst_seed_prompt=getattr(args, "fst_seed_prompt", default_cfg.fst_seed_prompt),
+        fst_refresh_interval=getattr(args, "fst_refresh_interval", default_cfg.fst_refresh_interval),
+        fst_max_prompt_chars=getattr(args, "fst_max_prompt_chars", default_cfg.fst_max_prompt_chars),
+        fst_use_training_prefix=getattr(args, "fst_use_training_prefix", default_cfg.fst_use_training_prefix),
+        fst_use_generation_prefix=getattr(args, "fst_use_generation_prefix", default_cfg.fst_use_generation_prefix),
         speculative_draft_tokens=args.speculative_draft_tokens,
         speculative_temperature=args.speculative_temperature,
         torus_depth=args.torus_depth,
@@ -1037,6 +1078,8 @@ def main(argv: List[str] | None = None) -> int:
                 max_source_samples=tokenizer_max_source_samples,
                 supervised_only=tokenizer_supervised_only,
                 use_pronunciation_signatures=args.use_pronunciation_signatures,
+                hierarchy_vector_low_rank_enabled=getattr(args, "hierarchy_vector_low_rank_enabled", True),
+                hierarchy_vector_low_rank_dim=getattr(args, "hierarchy_vector_low_rank_dim", 4),
                 tokenizer_workers=args.tokenizer_workers,
                 tokenizer_cache_dir=getattr(args, "tokenizer_cache_dir", ""),
                 tokenizer=tokenizer,
@@ -1073,6 +1116,12 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)
             raw_cfg.grad_clip_scalar = getattr(args, "grad_clip_scalar", raw_cfg.grad_clip_scalar)
             raw_cfg.grad_clip_rowwise = getattr(args, "grad_clip_rowwise", raw_cfg.grad_clip_rowwise)
+            raw_cfg.use_fst = getattr(args, "use_fst", raw_cfg.use_fst)
+            raw_cfg.fst_seed_prompt = getattr(args, "fst_seed_prompt", raw_cfg.fst_seed_prompt)
+            raw_cfg.fst_refresh_interval = getattr(args, "fst_refresh_interval", raw_cfg.fst_refresh_interval)
+            raw_cfg.fst_max_prompt_chars = getattr(args, "fst_max_prompt_chars", raw_cfg.fst_max_prompt_chars)
+            raw_cfg.fst_use_training_prefix = getattr(args, "fst_use_training_prefix", raw_cfg.fst_use_training_prefix)
+            raw_cfg.fst_use_generation_prefix = getattr(args, "fst_use_generation_prefix", raw_cfg.fst_use_generation_prefix)
             model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] initialized checkpoint weights "
@@ -1150,6 +1199,8 @@ def main(argv: List[str] | None = None) -> int:
                 max_source_samples=tokenizer_max_source_samples,
                 supervised_only=tokenizer_supervised_only,
                 use_pronunciation_signatures=args.use_pronunciation_signatures,
+                hierarchy_vector_low_rank_enabled=getattr(args, "hierarchy_vector_low_rank_enabled", True),
+                hierarchy_vector_low_rank_dim=getattr(args, "hierarchy_vector_low_rank_dim", 4),
                 tokenizer_workers=args.tokenizer_workers,
                 tokenizer_cache_dir=getattr(args, "tokenizer_cache_dir", ""),
                 tokenizer=tokenizer,
@@ -1186,6 +1237,12 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)
             raw_cfg.grad_clip_scalar = getattr(args, "grad_clip_scalar", raw_cfg.grad_clip_scalar)
             raw_cfg.grad_clip_rowwise = getattr(args, "grad_clip_rowwise", raw_cfg.grad_clip_rowwise)
+            raw_cfg.use_fst = getattr(args, "use_fst", raw_cfg.use_fst)
+            raw_cfg.fst_seed_prompt = getattr(args, "fst_seed_prompt", raw_cfg.fst_seed_prompt)
+            raw_cfg.fst_refresh_interval = getattr(args, "fst_refresh_interval", raw_cfg.fst_refresh_interval)
+            raw_cfg.fst_max_prompt_chars = getattr(args, "fst_max_prompt_chars", raw_cfg.fst_max_prompt_chars)
+            raw_cfg.fst_use_training_prefix = getattr(args, "fst_use_training_prefix", raw_cfg.fst_use_training_prefix)
+            raw_cfg.fst_use_generation_prefix = getattr(args, "fst_use_generation_prefix", raw_cfg.fst_use_generation_prefix)
             model = maybe_compile_model(model, enabled=args.torch_compile)
             print(
                 "[Prismal] resumed checkpoint architecture "
@@ -1261,11 +1318,17 @@ def main(argv: List[str] | None = None) -> int:
                 max_source_samples=tokenizer_max_source_samples,
                 supervised_only=tokenizer_supervised_only,
                 use_pronunciation_signatures=args.use_pronunciation_signatures,
+                hierarchy_vector_low_rank_enabled=getattr(args, "hierarchy_vector_low_rank_enabled", True),
+                hierarchy_vector_low_rank_dim=getattr(args, "hierarchy_vector_low_rank_dim", 4),
                 tokenizer_workers=args.tokenizer_workers,
                 tokenizer_cache_dir=getattr(args, "tokenizer_cache_dir", ""),
             )
             raw_cfg = _build_config(args, tokenizer)
-            raw_cfg.vocab_size = max(int(getattr(raw_cfg, "vocab_size", 0)), meta_vocab_size)
+            raw_cfg.vocab_size = max(
+                int(getattr(raw_cfg, "vocab_size", 0)),
+                int(getattr(tokenizer, "vocab_size", 0)),
+                meta_vocab_size,
+            )
             runtime_cfg = resolve_runtime_config(raw_cfg, tokenizer)
             model = PrismalWaveModel(runtime_cfg).to(device)
             model = maybe_compile_model(model, enabled=args.torch_compile)
@@ -1314,6 +1377,10 @@ def main(argv: List[str] | None = None) -> int:
                 flush=True,
             )
         model = maybe_compile_model(model, enabled=args.torch_compile)
+        setattr(model, "_prismal_tokenizer", tokenizer)
+        unwrapped_model = getattr(model, "_orig_mod", None)
+        if unwrapped_model is not None:
+            setattr(unwrapped_model, "_prismal_tokenizer", tokenizer)
         train_loader, val_loader = build_train_val_dataloaders(
             args.data,
             tokenizer,
@@ -1323,6 +1390,7 @@ def main(argv: List[str] | None = None) -> int:
             val_fraction=args.val_fraction,
             seed=args.seed,
             streaming=getattr(args, "dataset_streaming", True),
+            hierarchy_vector_dtype=getattr(runtime_cfg, "hierarchy_vector_dtype", "float8_e4m3fn"),
         )
         metrics = train_model(
             model,
@@ -1398,6 +1466,8 @@ def main(argv: List[str] | None = None) -> int:
             max_source_samples=tokenizer_max_source_samples,
             supervised_only=tokenizer_supervised_only,
             use_pronunciation_signatures=args.use_pronunciation_signatures,
+            hierarchy_vector_low_rank_enabled=getattr(args, "hierarchy_vector_low_rank_enabled", True),
+            hierarchy_vector_low_rank_dim=getattr(args, "hierarchy_vector_low_rank_dim", 4),
             tokenizer_workers=args.tokenizer_workers,
             tokenizer_cache_dir=getattr(args, "tokenizer_cache_dir", ""),
         )
@@ -1412,6 +1482,7 @@ def main(argv: List[str] | None = None) -> int:
             batch_size=args.batch_size,
             max_samples=args.max_samples,
             shuffle=False,
+            hierarchy_vector_dtype=getattr(runtime_cfg, "hierarchy_vector_dtype", "float8_e4m3fn"),
         )
         metrics = run_benchmark(model, dataloader, device, steps=args.steps)
         print(json.dumps(metrics, indent=2))

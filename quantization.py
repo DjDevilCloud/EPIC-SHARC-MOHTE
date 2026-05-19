@@ -14,6 +14,7 @@ Authors: Amir Zandieh, Vahab Mirrokni (Google Research)
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -34,6 +35,19 @@ except Exception:  # pragma: no cover - optional dependency
     NVFP4BlockScaling = None
 
 try:
+    from torchao.quantization import float8_weight_only as torchao_float8_weight_only  # type: ignore
+    from torchao.quantization import int4_weight_only as torchao_int4_weight_only  # type: ignore
+    from torchao.quantization import int8_weight_only as torchao_int8_weight_only  # type: ignore
+    from torchao.quantization import quantize_ as torchao_quantize_  # type: ignore
+    from torchao.quantization.prototype.qat.embedding import Int4WeightOnlyEmbedding as torchao_Int4WeightOnlyEmbedding  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    torchao_float8_weight_only = None
+    torchao_int4_weight_only = None
+    torchao_int8_weight_only = None
+    torchao_quantize_ = None
+    torchao_Int4WeightOnlyEmbedding = None
+
+try:
     from .hierarchical_precision import current_precision_spec
 except ImportError:  # pragma: no cover - supports direct script launching.
     from hierarchical_precision import current_precision_spec
@@ -52,6 +66,12 @@ class QuantizationConfig:
     adapter_rank: int = 8  # Low-rank adapter size for trainable deltas
     adapter_alpha: float = 16.0  # Adapter scaling factor
     adapter_dropout: float = 0.0  # Optional adapter dropout
+    use_torchao_weight_only: bool = True
+    torchao_weight_only_mode: str = "auto"
+    torchao_weight_only_group_size: int = 128
+    use_torchao_embedding_weight_only: bool = True
+    torchao_embedding_group_size: int = 32
+    torchao_embedding_output_dtype: str = "float32"
     use_bitsandbytes_leaf_precision: bool = True
     bitsandbytes_leaf_precision_mode: str = "fp4"
     bitsandbytes_leaf_quant_type: str = "nf4"
@@ -105,6 +125,164 @@ def _resolve_te_params_dtype(value: object) -> torch.dtype:
     if text in {"float32", "fp32"}:
         return torch.float32
     return torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
+
+
+def _torchao_ready() -> bool:
+    return torchao_quantize_ is not None
+
+
+def _torchao_embedding_ready() -> bool:
+    return torchao_Int4WeightOnlyEmbedding is not None
+
+
+def _normalize_torchao_weight_only_mode(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"", "auto"}:
+        return "auto"
+    if text in {"int4", "float8", "int8", "off", "manual"}:
+        return text
+    return "auto"
+
+
+@contextmanager
+def _temporary_default_dtype(dtype: torch.dtype):
+    previous = torch.get_default_dtype()
+    if previous != dtype:
+        torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        if torch.get_default_dtype() != previous:
+            torch.set_default_dtype(previous)
+
+
+def _torchao_quantized_linear_weight(
+    weight: torch.Tensor,
+    *,
+    mode: str,
+    group_size: int,
+) -> tuple[Optional[torch.Tensor], Optional[str]]:
+    if not _torchao_ready():
+        return None, None
+
+    mode = _normalize_torchao_weight_only_mode(mode)
+    if mode in {"off", "manual"}:
+        return None, None
+
+    if mode == "auto":
+        if weight.device.type == "cuda" and torchao_int4_weight_only is not None:
+            mode_candidates = ["int4", "float8"]
+        else:
+            mode_candidates = ["float8"]
+    elif mode == "int4":
+        mode_candidates = ["int4", "float8"]
+    elif mode == "int8":
+        mode_candidates = ["int8", "float8"]
+    else:
+        mode_candidates = ["float8"]
+
+    in_features = int(weight.shape[-1])
+    out_features = int(weight.shape[0])
+    device = weight.device
+
+    for candidate in mode_candidates:
+        if candidate == "int4":
+            if torchao_int4_weight_only is None or device.type != "cuda":
+                continue
+            if group_size < 1 or in_features < group_size or in_features % group_size != 0:
+                continue
+            quant_cfg = torchao_int4_weight_only(group_size=group_size)
+            dtype_ctx = _temporary_default_dtype(torch.bfloat16)
+            factory_dtype = torch.bfloat16
+        elif candidate == "int8":
+            if torchao_int8_weight_only is None:
+                continue
+            quant_cfg = torchao_int8_weight_only(group_size=max(1, group_size))
+            dtype_ctx = _temporary_default_dtype(torch.bfloat16)
+            factory_dtype = torch.bfloat16
+        else:
+            if torchao_float8_weight_only is None:
+                continue
+            quant_cfg = torchao_float8_weight_only()
+            dtype_ctx = _temporary_default_dtype(torch.get_default_dtype())
+            factory_dtype = weight.dtype if weight.is_floating_point() else torch.float32
+
+        try:
+            with dtype_ctx:
+                tmp = nn.Linear(in_features, out_features, bias=False, device=device, dtype=factory_dtype)
+                with torch.no_grad():
+                    tmp.weight.copy_(weight.detach().to(device=device, dtype=tmp.weight.dtype))
+                torchao_quantize_(tmp, quant_cfg, device=device)
+            return tmp.weight, candidate
+        except Exception:
+            continue
+
+    return None, None
+
+
+def _resolve_embedding_output_dtype(value: object) -> torch.dtype:
+    text = str(value or "").strip().lower()
+    if text.startswith("torch."):
+        text = text.split(".", 1)[1]
+    if text in {"bfloat16", "bf16"} and hasattr(torch, "bfloat16"):
+        return torch.bfloat16
+    if text in {"float16", "fp16", "half"}:
+        return torch.float16
+    return torch.float32
+
+
+def _resolve_embedding_group_size(embedding_dim: int, preferred: int) -> int:
+    preferred = max(1, int(preferred))
+    if embedding_dim % preferred == 0:
+        return preferred
+    for candidate in (32, 16, 8, 4, 2, 1):
+        if candidate <= embedding_dim and embedding_dim % candidate == 0:
+            return candidate
+    return 1
+
+
+def _torchao_quantized_embedding_weight(
+    weight: torch.Tensor,
+    *,
+    group_size: int,
+    output_dtype: torch.dtype,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[int]]:
+    if not _torchao_embedding_ready():
+        return None, None, None, None
+    if weight.dim() != 2:
+        return None, None, None, None
+
+    resolved_group_size = _resolve_embedding_group_size(int(weight.shape[-1]), group_size)
+    if resolved_group_size <= 0 or int(weight.shape[-1]) % resolved_group_size != 0:
+        return None, None, None, None
+
+    from torchao.quantization.quant_primitives import (
+        MappingType,
+        choose_qparams_affine,
+        quantize_affine,
+    )
+
+    qmin, qmax = -8, 7
+    scale, zero_point = choose_qparams_affine(
+        weight.detach(),
+        MappingType.SYMMETRIC,
+        (1, resolved_group_size),
+        torch.int8,
+        quant_min=qmin,
+        quant_max=qmax,
+        scale_dtype=torch.float32,
+        zero_point_dtype=torch.int32,
+    )
+    q_weight = quantize_affine(
+        weight.detach(),
+        (1, resolved_group_size),
+        scale,
+        zero_point,
+        torch.int8,
+        quant_min=qmin,
+        quant_max=qmax,
+    )
+    return q_weight, scale, zero_point, resolved_group_size
 
 
 class PolarQuantizer(nn.Module):
@@ -752,8 +930,42 @@ class QuantizedEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
         self.config = quantization_config or QuantizationConfig()
+        self._use_torchao_embedding_weight_only = bool(
+            getattr(self.config, "use_torchao_embedding_weight_only", True) and _torchao_embedding_ready()
+        )
+        self._torchao_embedding_group_size = max(1, int(getattr(self.config, "torchao_embedding_group_size", 32)))
+        self._torchao_embedding_output_dtype = _resolve_embedding_output_dtype(
+            getattr(self.config, "torchao_embedding_output_dtype", "float32")
+        )
 
-        if self.config.enabled:
+        self._torchao_embedding = None
+        if self.config.enabled and self._use_torchao_embedding_weight_only:
+            resolved_group_size = _resolve_embedding_group_size(embedding_dim, self._torchao_embedding_group_size)
+            if resolved_group_size > 1 and embedding_dim % resolved_group_size == 0:
+                self._torchao_embedding_group_size = resolved_group_size
+                self._torchao_embedding = torchao_Int4WeightOnlyEmbedding(
+                    num_embeddings=num_embeddings,
+                    embedding_dim=embedding_dim,
+                    padding_idx=padding_idx,
+                    max_norm=None,
+                    norm_type=2.0,
+                    scale_grad_by_freq=False,
+                    sparse=False,
+                    group_size=resolved_group_size,
+                    scale_precision=torch.float32,
+                    zero_point_precision=torch.int32,
+                    device=None,
+                    output_dtype=self._torchao_embedding_output_dtype,
+                )
+
+        if self.config.enabled and self._torchao_embedding is not None:
+            self.quantizer = None
+            self.adapter_dropout = nn.Identity()
+            self.adapter_down = None
+            self.adapter_up = None
+            self.adapter_scale = 0.0
+            self.set_base_weight(torch.randn(num_embeddings, embedding_dim) * 0.02)
+        elif self.config.enabled:
             self.quantizer = TurboQuantizer(
                 bits=self.config.bits,
                 seed=self.config.seed,
@@ -779,6 +991,19 @@ class QuantizedEmbedding(nn.Module):
                 self.adapter_down = None
                 self.adapter_up = None
                 self.adapter_scale = 0.0
+        elif self.config.enabled:
+            self.quantizer = None
+            self.adapter_dropout = nn.Identity()
+            self.adapter_down = None
+            self.adapter_up = None
+            self.adapter_scale = 0.0
+            self._base_weight_radii = None
+            self._base_weight_angles = None
+            self._base_weight_residual_std = None
+            self._base_weight_residual_signs = None
+            self._base_weight_dense = None
+            self._base_weight_skip = None
+            self._base_weight_shape = None
         else:
             self.quantizer = None
             self.embedding_matrix = nn.Parameter(torch.randn(num_embeddings, embedding_dim) * 0.02)
@@ -789,17 +1014,46 @@ class QuantizedEmbedding(nn.Module):
 
     @property
     def weight(self) -> torch.Tensor:
-        if not self.config.enabled or self.quantizer is None:
+        if not self.config.enabled:
+            return self.embedding_matrix
+        if self._torchao_embedding is not None:
+            return self._materialize_weight()
+        if self.quantizer is None:
             return self.embedding_matrix
         return self._materialize_weight()
 
     def set_base_weight(self, weight: torch.Tensor) -> None:
         """Set and quantize the frozen base embedding weights."""
-        if not self.config.enabled or self.quantizer is None:
+        if not self.config.enabled:
             with torch.no_grad():
                 self.embedding_matrix.copy_(weight)
             return
         with torch.no_grad():
+            if self._torchao_embedding is not None:
+                q_weight, scale, zero_point, resolved_group_size = _torchao_quantized_embedding_weight(
+                    weight.detach(),
+                    group_size=self._torchao_embedding_group_size,
+                    output_dtype=self._torchao_embedding_output_dtype,
+                )
+                if q_weight is not None and scale is not None and zero_point is not None:
+                    self._torchao_embedding_group_size = resolved_group_size or self._torchao_embedding_group_size
+                    self._torchao_embedding.weight.copy_(q_weight)
+                    self._torchao_embedding.scale.copy_(scale)
+                    self._torchao_embedding.zero_point.copy_(zero_point)
+                    return
+                self._torchao_embedding = None
+                self.quantizer = TurboQuantizer(
+                    bits=self.config.bits,
+                    seed=self.config.seed,
+                    device="cpu"
+                )
+                self.register_buffer("_base_weight_radii", None, persistent=True)
+                self.register_buffer("_base_weight_angles", None, persistent=True)
+                self.register_buffer("_base_weight_residual_std", None, persistent=True)
+                self.register_buffer("_base_weight_residual_signs", None, persistent=True)
+                self.register_buffer("_base_weight_dense", None, persistent=True)
+                self.register_buffer("_base_weight_skip", torch.tensor(False), persistent=True)
+                self.register_buffer("_base_weight_shape", torch.tensor([self.num_embeddings, self.embedding_dim], dtype=torch.long), persistent=True)
             quantized = self.quantizer.quantize(weight.detach())
             if quantized.get("skip_quantization", False):
                 self._base_weight_skip.copy_(torch.tensor(True, device=self._base_weight_skip.device))
@@ -818,11 +1072,18 @@ class QuantizedEmbedding(nn.Module):
 
     def refresh_quantization_cache(self) -> None:
         """Quantize the current base weight buffers again if needed."""
-        if not self.config.enabled or self.quantizer is None:
+        if not self.config.enabled:
             return
         self.set_base_weight(self._materialize_weight().detach())
 
     def _base_state(self) -> dict:
+        if self._torchao_embedding is not None:
+            return {
+                "torchao": True,
+                "weight": self._torchao_embedding.weight,
+                "scale": self._torchao_embedding.scale,
+                "zero_point": self._torchao_embedding.zero_point,
+            }
         if self._base_weight_skip.item():
             return {"skip_quantization": True, "radii": self._base_weight_dense}
         state = {
@@ -837,14 +1098,29 @@ class QuantizedEmbedding(nn.Module):
 
     def _materialize_weight(self) -> torch.Tensor:
         """Materialize the full dense base weight tensor on demand."""
-        if not self.config.enabled or self.quantizer is None:
+        if not self.config.enabled:
             return self.embedding_matrix
+        if self._torchao_embedding is not None:
+            from torchao.quantization.quant_primitives import dequantize_affine
+            qmin, qmax = -8, 7
+            return dequantize_affine(
+                self._torchao_embedding.weight,
+                (1, self._torchao_embedding_group_size),
+                self._torchao_embedding.scale,
+                self._torchao_embedding.zero_point,
+                torch.int8,
+                qmin,
+                qmax,
+                output_dtype=torch.float32,
+            )
         state = self._base_state()
         return self.quantizer.dequantize(state)
 
     def _materialize_rows(self, idx: torch.Tensor) -> torch.Tensor:
-        if not self.config.enabled or self.quantizer is None:
+        if not self.config.enabled:
             return F.embedding(idx, self.embedding_matrix, self.padding_idx)
+        if self._torchao_embedding is not None:
+            return self._torchao_embedding(idx)
         if self._base_weight_skip.item():
             return F.embedding(idx, self._base_weight_dense, self.padding_idx)
         flat_idx = idx.reshape(-1)
@@ -860,7 +1136,7 @@ class QuantizedEmbedding(nn.Module):
         return rows.reshape(*idx.shape, self.embedding_dim)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not self.config.enabled or self.quantizer is None:
+        if not self.config.enabled:
             return F.embedding(input, self.embedding_matrix, self.padding_idx)
 
         base = self._materialize_rows(input)
@@ -891,8 +1167,12 @@ class QuantizedLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.config = quantization_config or QuantizationConfig()
+        self._use_torchao_weight_only = bool(getattr(self.config, "use_torchao_weight_only", True) and _torchao_ready())
+        self._torchao_weight_mode = _normalize_torchao_weight_only_mode(getattr(self.config, "torchao_weight_only_mode", "auto"))
+        self._torchao_weight_group_size = max(1, int(getattr(self.config, "torchao_weight_only_group_size", 128)))
 
         if self.config.enabled:
+            self.register_buffer("_torchao_weight", None, persistent=False)
             self.quantizer = TurboQuantizer(
                 bits=self.config.bits,
                 seed=self.config.seed,
@@ -905,6 +1185,7 @@ class QuantizedLinear(nn.Module):
             self.register_buffer("_base_weight_dense", None, persistent=True)
             self.register_buffer("_base_weight_skip", torch.tensor(False), persistent=True)
             self.register_buffer("_base_weight_shape", torch.tensor([out_features, in_features], dtype=torch.long), persistent=True)
+            self.register_load_state_dict_post_hook(lambda _module, _incompatible_keys: self.refresh_quantization_cache())
             self.set_base_weight(torch.randn(out_features, in_features) * 0.02)
             if bias:
                 self.bias = nn.Parameter(torch.zeros(out_features))
@@ -935,6 +1216,8 @@ class QuantizedLinear(nn.Module):
     def weight(self) -> torch.Tensor:
         if not self.config.enabled or self.quantizer is None:
             return self.weight_param
+        if getattr(self, "_torchao_weight", None) is not None:
+            return self._torchao_weight
         return self._materialize_weight()
 
     def set_base_weight(self, weight: torch.Tensor) -> None:
@@ -944,6 +1227,17 @@ class QuantizedLinear(nn.Module):
                 self.weight_param.copy_(weight)
             return
         with torch.no_grad():
+            if self._use_torchao_weight_only:
+                torchao_weight, mode = _torchao_quantized_linear_weight(
+                    weight.detach(),
+                    mode=self._torchao_weight_mode,
+                    group_size=self._torchao_weight_group_size,
+                )
+                self._torchao_weight = torchao_weight
+                if mode is not None:
+                    self._torchao_weight_mode = mode
+            else:
+                self._torchao_weight = None
             quantized = self.quantizer.quantize(weight.detach())
             if quantized.get("skip_quantization", False):
                 self._base_weight_skip.copy_(torch.tensor(True, device=self._base_weight_skip.device))
@@ -964,6 +1258,16 @@ class QuantizedLinear(nn.Module):
         """Materialize the full dense base weight tensor on demand."""
         if not self.config.enabled or self.quantizer is None:
             return self.weight_param
+        if getattr(self, "_torchao_weight", None) is not None:
+            weight = self._torchao_weight
+            if hasattr(weight, "to_dense"):
+                return weight.to_dense()
+            if hasattr(weight, "dequantize"):
+                return weight.dequantize()
+            return weight
+        return self._manual_materialize_weight()
+
+    def _manual_materialize_weight(self) -> torch.Tensor:
         if self._base_weight_skip.item():
             return self._base_weight_dense
         state = {
@@ -980,11 +1284,27 @@ class QuantizedLinear(nn.Module):
         """Refresh the frozen base weight buffers if a dense copy exists."""
         if not self.config.enabled or self.quantizer is None:
             return
-        self.set_base_weight(self._materialize_weight().detach())
+        self.set_base_weight(self._manual_materialize_weight().detach())
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not self.config.enabled or self.quantizer is None:
             return F.linear(input, self.weight_param, self.bias)
+        if getattr(self, "_torchao_weight", None) is not None:
+            weight = self._torchao_weight
+            input_dtype = input.dtype
+            if input.is_floating_point() and weight.is_floating_point() and input.dtype != weight.dtype:
+                input = input.to(dtype=weight.dtype)
+            base = F.linear(input, weight, self.bias)
+            spec = current_precision_spec()
+            if spec is not None and base.is_floating_point() and base.dtype != spec.effective_compute_dtype:
+                base = base.to(spec.effective_compute_dtype)
+            elif spec is None and base.is_floating_point() and base.dtype != input_dtype:
+                base = base.to(dtype=input_dtype)
+            if self.adapter_up is not None and self.adapter_down is not None:
+                adapter_input = input.to(dtype=self.adapter_down.weight.dtype)
+                delta = self.adapter_up(self.adapter_dropout(self.adapter_down(adapter_input)))
+                base = base + self.adapter_scale * delta.to(dtype=base.dtype)
+            return base
 
         base = _FrozenQuantizedLinearFunction.apply(input, self.bias, self)
         spec = current_precision_spec()

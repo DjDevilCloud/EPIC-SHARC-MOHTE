@@ -155,6 +155,12 @@ class PrismalWaveGUI(tk.Tk):
         self.router_sparse_candidate_budget_var = tk.StringVar(value=str(DEFAULT_CFG.router_sparse_candidate_budget))
         self.use_topk_mot_var = tk.BooleanVar(value=DEFAULT_CFG.use_topk_mot)
         self.mot_top_k_var = tk.StringVar(value=str(DEFAULT_CFG.mot_top_k))
+        self.use_fst_var = tk.BooleanVar(value=DEFAULT_CFG.use_fst)
+        self.fst_seed_prompt_var = tk.StringVar(value=DEFAULT_CFG.fst_seed_prompt)
+        self.fst_refresh_interval_var = tk.StringVar(value=str(DEFAULT_CFG.fst_refresh_interval))
+        self.fst_max_prompt_chars_var = tk.StringVar(value=str(DEFAULT_CFG.fst_max_prompt_chars))
+        self.fst_use_training_prefix_var = tk.BooleanVar(value=DEFAULT_CFG.fst_use_training_prefix)
+        self.fst_use_generation_prefix_var = tk.BooleanVar(value=DEFAULT_CFG.fst_use_generation_prefix)
         self.infer_checkpoint_var = tk.StringVar(value="")
         self.infer_prompt_var = tk.StringVar(value="What is a cat?")
         self.infer_max_new_tokens_var = tk.StringVar(value="64")
@@ -203,7 +209,9 @@ class PrismalWaveGUI(tk.Tk):
         notebook.add(self.train_tab, text="Training")
         notebook.add(self.infer_tab, text="Inference")
 
-        self._build_training_tab(self.train_tab)
+        train_scroll, train_body = self._make_scrollable_tab(self.train_tab)
+        train_scroll.pack(fill="both", expand=True)
+        self._build_training_tab(train_body)
         self._build_inference_tab(self.infer_tab)
 
         log_header = ttk.Frame(log_panel)
@@ -359,6 +367,39 @@ class PrismalWaveGUI(tk.Tk):
             ],
         )
 
+        fst_box = ttk.LabelFrame(tab, text="Fast-Slow Training", padding=8)
+        fst_box.pack(fill="x", pady=(10, 0))
+        fst_flags = ttk.Frame(fst_box)
+        fst_flags.pack(fill="x")
+        ttk.Checkbutton(
+            fst_flags,
+            text="Enable FST",
+            variable=self.use_fst_var,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(
+            fst_flags,
+            text="Use training prefix",
+            variable=self.fst_use_training_prefix_var,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(
+            fst_flags,
+            text="Use generation prefix",
+            variable=self.fst_use_generation_prefix_var,
+        ).pack(side="left")
+        fst_prompt_row = ttk.Frame(fst_box)
+        fst_prompt_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(fst_prompt_row, text="Seed prompt", width=18).pack(side="left")
+        ttk.Entry(fst_prompt_row, textvariable=self.fst_seed_prompt_var).pack(side="left", fill="x", expand=True)
+        fst_grid = ttk.Frame(fst_box)
+        fst_grid.pack(fill="x", pady=(8, 0))
+        self._grid_params(
+            fst_grid,
+            [
+                ("Refresh steps", self.fst_refresh_interval_var),
+                ("Max chars", self.fst_max_prompt_chars_var),
+            ],
+        )
+
         prompt_box = ttk.LabelFrame(tab, text="Post-run prompt", padding=8)
         prompt_box.pack(fill="x", pady=(10, 0))
         prompt_row = ttk.Frame(prompt_box)
@@ -403,6 +444,39 @@ class PrismalWaveGUI(tk.Tk):
         ttk.Button(buttons, text="Continue Training", command=self._start_resume_train).pack(side="left", padx=(8, 0))
         self.stop_button = ttk.Button(buttons, text="Stop Training", command=self._stop_running_process, state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
+
+    def _make_scrollable_tab(self, parent: ttk.Frame) -> tuple[ttk.Frame, ttk.Frame]:
+        container = ttk.Frame(parent)
+        canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _sync_scrollregion(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_body_width(event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        body.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_body_width)
+
+        def _on_mousewheel(event: tk.Event) -> str | None:
+            if event.delta:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                return "break"
+            return None
+
+        for widget in (canvas, body):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            widget.bind("<Shift-MouseWheel>", _on_mousewheel)
+
+        return container, body
 
     def _build_inference_tab(self, tab: ttk.Frame) -> None:
         top = ttk.Frame(tab)
@@ -590,6 +664,15 @@ class PrismalWaveGUI(tk.Tk):
             self.min_token_frequency_var.get().strip() or "2",
             "--tokenizer-full-text" if self.tokenizer_full_text_var.get() else "--no-tokenizer-full-text",
             "--dataset-streaming" if self.dataset_streaming_var.get() else "--no-dataset-streaming",
+            "--use-fst" if self.use_fst_var.get() else "--no-fst",
+            "--fst-seed-prompt",
+            self.fst_seed_prompt_var.get().strip() or DEFAULT_CFG.fst_seed_prompt,
+            "--fst-refresh-interval",
+            self.fst_refresh_interval_var.get().strip() or str(DEFAULT_CFG.fst_refresh_interval),
+            "--fst-max-prompt-chars",
+            self.fst_max_prompt_chars_var.get().strip() or str(DEFAULT_CFG.fst_max_prompt_chars),
+            "--fst-use-training-prefix" if self.fst_use_training_prefix_var.get() else "--no-fst-use-training-prefix",
+            "--fst-use-generation-prefix" if self.fst_use_generation_prefix_var.get() else "--no-fst-use-generation-prefix",
             "--post-prompt",
             self.post_prompt_var.get().strip(),
             "--post-output",

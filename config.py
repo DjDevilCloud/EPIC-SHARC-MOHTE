@@ -22,6 +22,8 @@ def _normalize_dtype_name(value: object) -> str:
         "float32": "float32",
         "float8": "float8_e4m3fn",
         "f8": "float8_e4m3fn",
+        "float8_e4m3fn": "float8_e4m3fn",
+        "float8_e5m2": "float8_e5m2",
     }
     return aliases.get(text, text)
 
@@ -45,12 +47,12 @@ class PrismalWaveConfig:
     grad_clip_scalar: float = 0.2
     grad_clip_rowwise: float = 0.45
     hierarchical_precision_enabled: bool = True
-    hierarchical_precision_root_dtype: str = "bfloat16"
-    hierarchical_precision_mid_dtype: str = "bfloat16"
-    hierarchical_precision_leaf_dtype: str = "bfloat16"
+    hierarchical_precision_root_dtype: str = "float8_e4m3fn"
+    hierarchical_precision_mid_dtype: str = "float8_e4m3fn"
+    hierarchical_precision_leaf_dtype: str = "float8_e4m3fn"
     hierarchical_precision_fallback_dtype: str = "bfloat16"
     hierarchical_precision_accumulator_dtype: str = "bfloat16"
-    hierarchical_precision_allow_float8_leaf: bool = False
+    hierarchical_precision_allow_float8_leaf: bool = True
     muon_lr: float = 0.008
     muon_weight_decay: float = 0.01
     muon_momentum_beta: float = 0.95
@@ -65,22 +67,28 @@ class PrismalWaveConfig:
     nested_learning_local_ema_beta: float = 0.90
     nested_learning_mid_ema_beta: float = 0.95
     nested_learning_global_ema_beta: float = 0.99
-    d_model: int = 64
+    d_model: int = 128
     n_layers: int = 1
-    n_emitters: int = 8
-    n_slots: int = 4
+    n_emitters: int = 256
+    n_slots: int = 128
     n_paths: int = 1
-    top_k_emitters: int = 1
-    top_k_slots: int = 1
+    top_k_emitters: int = 6
+    top_k_slots: int = 2
     max_seq_len: int = 0
     position_embedding_init_size: int = 64
     dropout: float = 0.005
     ff_mult: int = 4
     use_factorized_embedding: bool = True
-    factorized_embedding_dim: int = 64
+    factorized_embedding_dim: int = 256
     use_turbo_quantization: bool = False
     turbo_quantization_bits: int = 3
     turbo_quantization_method: str = "turbo"
+    use_torchao_weight_only: bool = True
+    torchao_weight_only_mode: str = "auto"
+    torchao_weight_only_group_size: int = 128
+    use_torchao_embedding_weight_only: bool = True
+    torchao_embedding_group_size: int = 32
+    torchao_embedding_output_dtype: str = "float32"
     use_bitsandbytes_leaf_precision: bool = False
     bitsandbytes_leaf_precision_mode: str = "fp4"
     bitsandbytes_leaf_quant_type: str = "fp4"
@@ -108,22 +116,24 @@ class PrismalWaveConfig:
     hierarchical_torus_depth_scale: float = 0.125
     hierarchical_recursive_depth_scale: float = 0.125
     hierarchical_fixed_point_scale: float = 0.125
-    use_learned_hierarchy_embeddings: bool = False
-    learned_hierarchy_vector_dim: int = 64
-    learned_hierarchy_vector_scale: float = 0.25
-    per_family_torus_enabled: bool = False
+    use_learned_hierarchy_embeddings: bool = True
+    learned_hierarchy_vector_scale: float = 0.5
+    hierarchy_vector_dtype: str = "float8_e4m3fn"
+    hierarchy_vector_low_rank_enabled: bool = True
+    hierarchy_vector_low_rank_dim: int = 4
+    per_family_torus_enabled: bool = True
     per_family_torus_scale: float = 0.125
     family_specialist_d_model: int = 64
     family_specialist_gate_threshold: float = 0.02
-    leaf_cell_enabled: bool = False
+    leaf_cell_enabled: bool = True
     leaf_cell_dim: int = 64
-    leaf_router_confidence_threshold: float = 0.0
+    leaf_router_confidence_threshold: float = 0.01
     max_families_per_nest: int = 1
     family_budget: int = 1
     family_specialist_bank_size: int = 1
-    use_mixture_of_torus: bool = False
-    mot_num_experts: int = 1
-    mot_expert_scale: float = 0.15
+    use_mixture_of_torus: bool = True
+    mot_num_experts: int = 4
+    mot_expert_scale: float = 0.25
     mot_routing_temperature: float = 0.55
     use_topk_mot: bool = False
     mot_top_k: int = 1
@@ -137,39 +147,40 @@ class PrismalWaveConfig:
     signature_lattice_chunk_len: int = 8
     use_signature_lattice_generation_cache: bool = False
     use_sparse_emitter_routing: bool = True
-    router_sparse_candidate_budget: int = 8
+    router_sparse_candidate_budget: int = 32
     use_token_superposition_training: bool = False
     token_superposition_bag_size: int = 2
     token_superposition_phase_fraction: float = 0.30
-    use_gate: bool = False
-    gate_residency_budget: int = 1
-    gate_prefetch_horizon: int = 1
+    use_gate: bool = True
+    gate_residency_budget: int = 2
+    gate_prefetch_horizon: int = 4
     gate_tile_granularity: int = 1
     gate_offload_to_cpu: bool = False
     gate_fallback_on_miss: bool = True
-    use_gatetrain: bool = False
-    use_fullgatetrain: bool = False
-    gatetrain_residency_budget: int = 1
-    gatetrain_prefetch_horizon: int = 1
+    use_gatetrain: bool = True
+    use_fullgatetrain: bool = True
+    gatetrain_residency_budget: int = 2
+    gatetrain_prefetch_horizon: int = 4
     gatetrain_tile_granularity: int = 1
     gatetrain_offload_to_cpu: bool = False
     gatetrain_fallback_on_miss: bool = True
-    use_learned_residency_head: bool = False
+    use_learned_residency_head: bool = True
     residency_head_layers: int = 1
     residency_head_hidden_dim: int = 64
-    learned_residency_weight: float = 0.0
-    use_residency_with_reinforcement: bool = False
+    learned_residency_weight: float = 0.1
+    use_residency_with_reinforcement: bool = True
     use_token_memory_cross_attention: bool = False
     use_token_memory_generation_cache: bool = False
-    token_memory_window: int = 32
+    use_token_memory_copy_during_training: bool = False
+    token_memory_window: int = 6500
     token_memory_top_k: int = 1
-    token_memory_weight: float = 0.0
-    token_memory_copy_bias: float = 0.0
+    token_memory_weight: float = 0.25
+    token_memory_copy_bias: float = 0.1
     token_memory_rare_token_cutoff: int = 0
-    token_memory_copy_min_confidence: float = 0.0
+    token_memory_copy_min_confidence: float = 0.75
     use_token_copy_cross_attention: bool = False
     use_token_copy_generation_cache: bool = False
-    token_copy_window: int = 32
+    token_copy_window: int = 512
     token_copy_top_k: int = 1
     token_copy_weight: float = 0.0
     token_copy_bias_strength: float = 0.0
@@ -186,20 +197,20 @@ class PrismalWaveConfig:
     hierarchical_leaf_piece_boost: float = 1.05
     recursive_hmoe_depth: int = 1
     recursive_hmoe_branching: int = 1
-    recursive_hmoe_coarse_top_k: int = 12
-    recursive_hmoe_fine_top_k: int = 12
-    recursive_hmoe_child_torus_depth: int = 1
-    recursive_hmoe_child_torus_height: int = 1
-    recursive_hmoe_child_torus_width: int = 1
-    recursive_hmoe_balance_weight: float = 0.28
+    recursive_hmoe_coarse_top_k: int = 6
+    recursive_hmoe_fine_top_k: int = 4
+    recursive_hmoe_child_torus_depth: int = 3
+    recursive_hmoe_child_torus_height: int = 3
+    recursive_hmoe_child_torus_width: int = 3
+    recursive_hmoe_balance_weight: float = 0.88
     recursive_hmoe_child_mixture_weight: float = 0.12
     recursive_hmoe_agreement_weight: float = 0.12
     recursive_aux_weight: float = 0.05
     recursive_hidden_mix_scale: float = 0.05
     recursive_field_mix_scale: float = 0.05
-    torus_depth: int = 2
-    torus_height: int = 2
-    torus_width: int = 2
+    torus_depth: int = 6
+    torus_height: int = 6
+    torus_width: int = 6
     torus_local_field_radius: int = 1
     torus_global_bus_slots: int = 1
     torus_global_bus_decay: float = 0.72
@@ -219,15 +230,15 @@ class PrismalWaveConfig:
     torus_relay_temperature_3: float = 0.80
     torus_activity_threshold: float = 0.001
     torus_active_target_fraction: float = 0.48
-    torus_active_balance_weight: float = 0.02
-    use_torus_race_lanes: bool = False
+    torus_active_balance_weight: float = 0.82
+    use_torus_race_lanes: bool = True
     torus_lane_count: int = 1
     torus_scout_density: float = 0.5
     torus_lane_select_threshold_1: float = 0.45
     torus_lane_select_threshold_2: float = 0.70
     torus_lane_relay_hop_spacing: int = 6
     generation_lap_cap: int = 2
-    generation_lap_token_cap: int = 16
+    generation_lap_token_cap: int = 32
     torus_chunk_len: int = 16
     use_fixed_point_solver: bool = True
     use_chunk_solver_training: bool = False
@@ -244,7 +255,7 @@ class PrismalWaveConfig:
     emitter_parent_share: float = 0.25
     emitter_hierarchy_score_weight: float = 0.75
     emitter_balance_weight: float = 0.45
-    emitter_mixture_target_count: float = 8
+    emitter_mixture_target_count: float = 16
     emitter_mixture_weight: float = 0.45
     emitter_birth_threshold: float = 0.0001
     emitter_promotion_threshold: float = 0.85
@@ -252,8 +263,8 @@ class PrismalWaveConfig:
     emitter_seed_activity: float = 1.0
     torus_write_family_floor: float = 0.0
     torus_read_family_floor: float = 0.0
-    profile_runtime: bool = True
-    profile_vram: bool = True
+    profile_runtime: bool = False
+    profile_vram: bool = False
     router_temperature: float = 1.00
     signature_temperature: float = 0.65
     path_noise: float = 0.015
@@ -263,15 +274,15 @@ class PrismalWaveConfig:
     signature_level_loss_weight: float = 0.35
     signature_relation_loss_weight: float = 0.35
     signature_contrastive_weight: float = 0.0
-    use_contrastive_routing: bool = False
-    contrastive_routing_weight: float = 0.0
+    use_contrastive_routing: bool = True
+    contrastive_routing_weight: float = 0.01
     contrastive_routing_temperature: float = 0.65
-    contrastive_routing_hard_negatives: bool = False
-    use_contrastive_routing_signature_neighborhood: bool = False
-    use_contrastive_routing_temporal: bool = False
-    use_contrastive_routing_residency: bool = False
-    use_contrastive_routing_cross_view: bool = False
-    use_contrastive_routing_self_contrast: bool = False
+    contrastive_routing_hard_negatives: bool = True
+    use_contrastive_routing_signature_neighborhood: bool = True
+    use_contrastive_routing_temporal: bool = True
+    use_contrastive_routing_residency: bool = True
+    use_contrastive_routing_cross_view: bool = True
+    use_contrastive_routing_self_contrast: bool = True
     routing_entropy_weight: float = 0.25
     diversity_weight: float = 0.15
     emitter_neighbor_weight: float = 0.035
@@ -281,6 +292,15 @@ class PrismalWaveConfig:
     path_entropy_penalty: float = 0.0
     memory_momentum: float = 0.85
     use_speculative_decoding: bool = False
+    use_fst: bool = True
+    fst_seed_prompt: str = (
+        "You are a careful assistant. Preserve the base policy, use feedback to adapt task-specific behavior, "
+        "and keep reasoning structure stable."
+    )
+    fst_refresh_interval: int = 32
+    fst_max_prompt_chars: int = 512
+    fst_use_training_prefix: bool = True
+    fst_use_generation_prefix: bool = True
     speculative_draft_tokens: int = 2
     speculative_temperature: float = 0.01
     validator_temperature: float = 0.15
@@ -337,8 +357,6 @@ class PrismalWaveConfig:
             self.hierarchical_recursive_depth_scale = 0.8
         if self.hierarchical_fixed_point_scale <= 0:
             self.hierarchical_fixed_point_scale = 0.7
-        if self.learned_hierarchy_vector_dim < 4:
-            self.learned_hierarchy_vector_dim = 4
         if self.learned_hierarchy_vector_scale <= 0:
             self.learned_hierarchy_vector_scale = 0.25
         if self.per_family_torus_scale <= 0:
@@ -436,6 +454,7 @@ class PrismalWaveConfig:
             self.learned_residency_weight = 0.0
         self.use_token_memory_cross_attention = bool(self.use_token_memory_cross_attention)
         self.use_token_memory_generation_cache = bool(self.use_token_memory_generation_cache)
+        self.use_token_memory_copy_during_training = bool(self.use_token_memory_copy_during_training)
         self.use_token_copy_cross_attention = bool(self.use_token_copy_cross_attention)
         self.use_token_copy_generation_cache = bool(self.use_token_copy_generation_cache)
         if self.signature_lattice_dim < 1:
@@ -531,6 +550,19 @@ class PrismalWaveConfig:
             self.speculative_draft_tokens = 1
         if self.speculative_temperature < 0.0:
             self.speculative_temperature = 0.0
+        self.use_fst = bool(self.use_fst)
+        self.fst_seed_prompt = " ".join(str(self.fst_seed_prompt or "").split()).strip()
+        if not self.fst_seed_prompt:
+            self.fst_seed_prompt = (
+                "You are a careful assistant. Preserve the base policy, use feedback to adapt task-specific behavior, "
+                "and keep reasoning structure stable."
+            )
+        if self.fst_refresh_interval < 1:
+            self.fst_refresh_interval = 1
+        if self.fst_max_prompt_chars < 32:
+            self.fst_max_prompt_chars = 32
+        self.fst_use_training_prefix = bool(self.fst_use_training_prefix)
+        self.fst_use_generation_prefix = bool(self.fst_use_generation_prefix)
         self.use_hmote = bool(self.use_hmote)
         self.use_bitsandbytes_leaf_precision = bool(self.use_bitsandbytes_leaf_precision)
         def _normalize_choice(value: object, *, fallback: str, allowed: set[str]) -> str:
@@ -601,8 +633,27 @@ class PrismalWaveConfig:
         )
         self.hierarchical_precision_allow_float8_leaf = bool(self.hierarchical_precision_allow_float8_leaf)
         self.use_learned_hierarchy_embeddings = bool(self.use_learned_hierarchy_embeddings)
-        self.learned_hierarchy_vector_dim = int(self.learned_hierarchy_vector_dim)
         self.learned_hierarchy_vector_scale = float(self.learned_hierarchy_vector_scale)
+        self.hierarchy_vector_dtype = _normalize_dtype_name(self.hierarchy_vector_dtype)
+        if self.hierarchy_vector_dtype not in {"float32", "bfloat16", "float16", "float8_e4m3fn", "float8_e5m2"}:
+            self.hierarchy_vector_dtype = "float8_e4m3fn"
+        self.hierarchy_vector_low_rank_enabled = bool(self.hierarchy_vector_low_rank_enabled)
+        if self.hierarchy_vector_low_rank_dim < 1:
+            self.hierarchy_vector_low_rank_dim = 4
+        if self.hierarchy_vector_low_rank_dim > 12:
+            self.hierarchy_vector_low_rank_dim = 12
+        self.use_torchao_weight_only = bool(self.use_torchao_weight_only)
+        self.torchao_weight_only_mode = _normalize_dtype_name(self.torchao_weight_only_mode)
+        if self.torchao_weight_only_mode not in {"auto", "int4", "int8", "float8", "off", "manual"}:
+            self.torchao_weight_only_mode = "auto"
+        if self.torchao_weight_only_group_size < 1:
+            self.torchao_weight_only_group_size = 128
+        self.use_torchao_embedding_weight_only = bool(self.use_torchao_embedding_weight_only)
+        if self.torchao_embedding_group_size < 1:
+            self.torchao_embedding_group_size = 32
+        self.torchao_embedding_output_dtype = _normalize_dtype_name(self.torchao_embedding_output_dtype)
+        if self.torchao_embedding_output_dtype not in {"float32", "bfloat16", "float16"}:
+            self.torchao_embedding_output_dtype = "float32"
         self.quantization_aware_training = bool(self.quantization_aware_training)
         self.use_nested_learning = bool(self.use_nested_learning)
         if self.nested_learning_local_interval < 1:

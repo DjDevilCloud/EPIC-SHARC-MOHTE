@@ -153,8 +153,10 @@ It includes:
 - hierarchical precision tiers
 - root, mid, and leaf dtype controls
 - BF16 and float8-style execution paths where supported
+- torchao weight-only acceleration for common linear and embedding paths when available
 - bitsandbytes leaf precision support
 - Transformer Engine NVFP4 support for Blackwell-class GPUs when the backend is available and the explicit `nvfp4` recipe is selected
+- compressed hierarchy vectors with low-rank 4D defaults and float8/bfloat16 storage support
 - quantization-aware training scheduling
 - cached quantized modules and cache refresh hooks
 
@@ -212,6 +214,7 @@ Generation supports:
 - signature-lattice generation cache reuse
 - optional SHARC disabling for ablation-style comparisons
 - carried lattice-state reuse during decoding
+- FST prefixes only when a fast-context state is passed in explicitly, to avoid leaking the training prefix at inference
 
 That means the same architecture can be exercised in a few different ways without changing the model definition itself.
 
@@ -230,8 +233,10 @@ Some of the most important families of knobs are:
 - family specialists: `family_specialist_d_model`, `family_specialist_bank_size`
 - recursive hierarchy: `hierarchical_nest_depth`, `recursive_hmoe_depth`, `recursive_hmoe_branching`
 - signature lattice: `signature_lattice_dim`, `signature_lattice_buckets`, `signature_lattice_candidates`
-- precision and quantization: `hierarchical_precision_*`, `use_bitsandbytes_leaf_precision`, `use_turbo_quantization`
+- precision and quantization: `hierarchical_precision_*`, `use_bitsandbytes_leaf_precision`, `use_turbo_quantization`, `use_torchao_weight_only`, `use_torchao_embedding_weight_only`
+- hierarchy vector compression: `hierarchy_vector_dtype`, `hierarchy_vector_low_rank_enabled`, `hierarchy_vector_low_rank_dim`
 - Blackwell-specific leaf precision: `use_transformer_engine_leaf_precision`, `transformer_engine_leaf_recipe`, `transformer_engine_leaf_params_dtype`
+- FST control: `use_fst`, `fst_seed_prompt`, `fst_refresh_interval`, `fst_use_training_prefix`, `fst_use_generation_prefix`
 - generation behavior: `use_speculative_decoding`, `speculative_draft_tokens`, `speculative_temperature`
 - boundary handling: span-role logic in `data.py`, `use_pronunciation_signatures`, `signature_lattice_chunk_len`
 

@@ -1,12 +1,17 @@
-# EPIC-SHARC MOHTE v0.3.4
+# EPIC-SHARC MOHTE v0.3.5
 
-v0.3.4 Update Notes
+v0.3.5 Update Notes
 
-- Added an explicit Blackwell NVFP4 leaf backend through Transformer Engine
-- Kept the Ada float8 path separate from bitsandbytes so supported float8 stays float8
-- Tightened bitsandbytes leaf compute dtype handling to valid compute dtypes only
-- Added CLI flags, README notes, and architecture docs for Ada and Blackwell precision paths
-- Added focused tests for float8 resolution, bitsandbytes limits, and NVFP4 recipe locking
+- Reworked token memory to use a circular buffer instead of shifting the whole window on append
+- Added cached token counts so copy-bias lookup no longer rescans the full memory window every step
+- Made token-memory confidence use a real top-1 vs top-2 margin, so `token_memory_top_k = 1` still produces meaningful gating
+- Skipped token-memory copy and anchor bookkeeping during training by default, keeping that overhead on the generation side unless explicitly enabled
+- Added smoke coverage for the confidence margin behavior and the training-mode copy skip
+- Kept the existing precision-path work from v0.3.4 intact, including explicit NVFP4 leaf support and the float8 backend split
+- Compressed hierarchy vectors to a 4D low-rank path by default, with float8/bfloat16 storage and loading support through `ml_dtypes`
+- Added torchao-backed weight-only acceleration for the common quantized linear and embedding paths, with Windows-safe fallbacks when Triton is unavailable
+- Removed the obsolete `learned_hierarchy_vector_dim` config path so the hierarchy width is now controlled by the low-rank settings only
+- Fixed the Fast-Slow Training prefix leak so inference no longer inherits the training prefix unless `fast_context_state` is passed explicitly
 
 EPIC-SHARC MOHTE GATE
 
@@ -46,7 +51,7 @@ See [LICENSE](./LICENSE), [COMMERCIAL.md](./COMMERCIAL.md), and [LICENSES.md](./
 python -m pip install -r requirements.txt
 ```
 
-The core runtime depends on `numpy` and `torch`. Optional data-path helpers can also use `pandas`, `pyarrow`, `bitsandbytes`, or Transformer Engine if you install them.
+The core runtime depends on `numpy`, `torch`, `ml_dtypes`, and `torchao`. Optional data-path helpers can also use `pandas`, `pyarrow`, `bitsandbytes`, or Transformer Engine if you install them.
 
 For Blackwell users who want NVFP4 leaf precision, install Transformer Engine and use the explicit NVFP4 leaf backend flags. That path is optional and requires SM100+ hardware.
 
@@ -109,6 +114,7 @@ Set `--no-sparse-emitter-routing` if you want the older dense emitter scoring pa
 Precision support is backend-specific:
 
 - Ada-class GPUs can use the hierarchical float8 path where supported
+- torchao can accelerate the common quantized linear and embedding paths without Triton, including on Windows, while preserving a manual fallback path
 - bitsandbytes leaf precision stays limited to `float16`, `bfloat16`, and `float32` compute
 - Blackwell-class GPUs can opt into Transformer Engine NVFP4 leaf precision, which requires SM100+ and the explicit `nvfp4` recipe
 
@@ -130,7 +136,7 @@ The main code paths are:
 - `./data.py` for hierarchy encoding and loss-mask construction
 - `./model.py` for torus routing, lattice attention, and decoding
 - `./train.py` for training, checkpoint loading, and prompt generation
-- `./quantization.py` for cached TurboQuant wrappers plus Ada/Blackwell precision backends
+- `./quantization.py` for cached TurboQuant wrappers, torchao weight-only acceleration, and Ada/Blackwell precision backends
 
 ## Data Alignment
 

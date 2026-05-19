@@ -20,6 +20,8 @@ try:
     from .config import PrismalWaveConfig, save_config
     from .data import (
         ByteTokenizer,
+        DEFAULT_HIERARCHY_VECTOR_DIM,
+        DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
         PrismalTokenizer,
         MemmapTokenDataset,
         StreamingTextCorpusDataset,
@@ -28,6 +30,7 @@ try:
         _find_answer_start,
         load_text_corpus,
         iter_text_corpus,
+        hierarchy_vector_torch_dtype,
         split_text_window_dataset,
     )
     from .muon_optim import (
@@ -47,6 +50,8 @@ except ImportError:  # pragma: no cover - supports direct script launching.
     from config import PrismalWaveConfig, save_config
     from data import (
         ByteTokenizer,
+        DEFAULT_HIERARCHY_VECTOR_DIM,
+        DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
         PrismalTokenizer,
         MemmapTokenDataset,
         StreamingTextCorpusDataset,
@@ -55,6 +60,7 @@ except ImportError:  # pragma: no cover - supports direct script launching.
         _find_answer_start,
         load_text_corpus,
         iter_text_corpus,
+        hierarchy_vector_torch_dtype,
         split_text_window_dataset,
     )
     from muon_optim import (
@@ -102,6 +108,10 @@ def _tokenizer_cache_dir(cache_dir: str | Path | None = None) -> Path:
     if cache_dir is not None and str(cache_dir).strip():
         return Path(cache_dir)
     return Path(tempfile.gettempdir()) / "epicsharcmohte_tokenizer_cache"
+
+
+def _hierarchy_vector_dtype_from_config(cfg: PrismalWaveConfig | object) -> torch.dtype:
+    return hierarchy_vector_torch_dtype(getattr(cfg, "hierarchy_vector_dtype", "float8_e4m3fn"))
 
 
 def _tokenizer_source_fingerprint(source: str | Path) -> Dict[str, object]:
@@ -214,6 +224,262 @@ def _tokenizer_cache_path(
     )
     name = Path(source).stem or "source"
     return cache_root / f"{name}_{digest}.json"
+
+
+def _normalize_fast_context_text(text: object, *, max_chars: int | None = None) -> str:
+    raw = str(text or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return ""
+    cleaned_lines = [line.strip() for line in raw.split("\n")]
+    cleaned = "\n".join(line for line in cleaned_lines if line)
+    if max_chars is not None and max_chars > 0 and len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars].rstrip()
+    return cleaned
+
+
+def _fast_context_metric_summary(metrics: Optional[Dict[str, float]]) -> str:
+    if not metrics:
+        return ""
+    parts: list[str] = []
+    for label, key in (
+        ("loss", "loss"),
+        ("ce", "ce_loss"),
+        ("aux", "aux_loss"),
+        ("sig", "signature_agreement"),
+        ("entropy", "avg_entropy"),
+    ):
+        value = metrics.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except Exception:
+            continue
+        if math.isnan(numeric) or math.isinf(numeric):
+            continue
+        parts.append(f"{label}={numeric:.4f}")
+    return ", ".join(parts)
+
+
+def _fast_context_prompt_text(
+    cfg: PrismalWaveConfig,
+    *,
+    metrics: Optional[Dict[str, float]] = None,
+    base_prompt: Optional[str] = None,
+) -> str:
+    seed = _normalize_fast_context_text(
+        base_prompt if base_prompt is not None else getattr(cfg, "fst_seed_prompt", ""),
+        max_chars=max(32, int(getattr(cfg, "fst_max_prompt_chars", 512))),
+    )
+    if not seed:
+        seed = (
+            "You are a careful assistant. Preserve the base policy, use feedback to adapt task-specific behavior, "
+            "and keep reasoning structure stable."
+        )
+    max_chars = max(32, int(getattr(cfg, "fst_max_prompt_chars", 512)))
+    lines = [
+        seed,
+        "Fast context: keep the stable policy while adapting only the task-specific details that the latest feedback supports.",
+    ]
+    metric_summary = _fast_context_metric_summary(metrics)
+    if metric_summary:
+        lines.append(f"Recent signal: {metric_summary}.")
+    prompt_text = "\n".join(lines)
+    return _normalize_fast_context_text(prompt_text, max_chars=max_chars)
+
+
+def _fast_context_bundle_from_text(
+    tokenizer: PrismalTokenizer,
+    prompt_text: str,
+    *,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
+) -> Optional[Dict[str, torch.Tensor]]:
+    prompt_text = _normalize_fast_context_text(prompt_text)
+    if not prompt_text:
+        return None
+    hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
+    bundle = tokenizer.prepare_generation_hierarchy(prompt_text)
+    return {
+        "input_ids": torch.tensor(bundle.token_ids, dtype=torch.long),
+        "signature_ids": torch.tensor(bundle.signature_ids, dtype=torch.long),
+        "signature_level_ids": torch.tensor(bundle.signature_level_ids, dtype=torch.long),
+        "signature_relation_ids": torch.tensor(bundle.signature_relation_ids, dtype=torch.long),
+        "parent_signature_ids": torch.tensor(bundle.parent_signature_ids, dtype=torch.long),
+        "signature_family_ids": torch.tensor(bundle.signature_family_ids, dtype=torch.long),
+        "hierarchy_vectors": torch.tensor(bundle.hierarchy_vectors, dtype=hierarchy_dtype),
+    }
+
+
+def _fast_context_state_from_config(
+    cfg: PrismalWaveConfig,
+    tokenizer: Optional[PrismalTokenizer] = None,
+    *,
+    existing_state: Optional[Dict[str, object]] = None,
+    metrics: Optional[Dict[str, float]] = None,
+    step: int = 0,
+    force: bool = False,
+) -> Optional[Dict[str, object]]:
+    if not bool(getattr(cfg, "use_fst", True)):
+        return None
+    state: Dict[str, object] = dict(existing_state or {})
+    refresh_interval = max(1, int(state.get("refresh_interval", getattr(cfg, "fst_refresh_interval", 32))))
+    max_prompt_chars = max(32, int(state.get("max_prompt_chars", getattr(cfg, "fst_max_prompt_chars", 512))))
+    last_refresh_step = int(state.get("last_refresh_step", -refresh_interval))
+    should_refresh = force or (step - last_refresh_step) >= refresh_interval or "prompt_text" not in state
+    if should_refresh:
+        prompt_text = _fast_context_prompt_text(cfg, metrics=metrics, base_prompt=str(state.get("seed_prompt", "")) or None)
+        prompt_text = _normalize_fast_context_text(prompt_text, max_chars=max_prompt_chars)
+        state["prompt_text"] = prompt_text
+        state["last_refresh_step"] = int(step)
+        if tokenizer is not None:
+            state["bundle"] = _fast_context_bundle_from_text(
+                tokenizer,
+                prompt_text,
+                hierarchy_vector_dtype=getattr(cfg, "hierarchy_vector_dtype", "float8_e4m3fn"),
+            )
+    elif state.get("bundle") is None and tokenizer is not None:
+        prompt_text = _normalize_fast_context_text(str(state.get("prompt_text", "")), max_chars=max_prompt_chars)
+        if prompt_text:
+            state["bundle"] = _fast_context_bundle_from_text(
+                tokenizer,
+                prompt_text,
+                hierarchy_vector_dtype=getattr(cfg, "hierarchy_vector_dtype", "float8_e4m3fn"),
+            )
+    state["enabled"] = bool(getattr(cfg, "use_fst", True))
+    state["use_training_prefix"] = bool(getattr(cfg, "fst_use_training_prefix", True))
+    state["use_generation_prefix"] = bool(getattr(cfg, "fst_use_generation_prefix", True))
+    state["refresh_interval"] = refresh_interval
+    state["max_prompt_chars"] = max_prompt_chars
+    state["seed_prompt"] = _normalize_fast_context_text(getattr(cfg, "fst_seed_prompt", ""))
+    if metrics:
+        state["last_metrics"] = {
+            key: float(value)
+            for key, value in metrics.items()
+            if isinstance(value, (int, float)) or torch.is_tensor(value)
+        }
+    return state
+
+
+def _prepend_fast_context_prefix(
+    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    fast_context_state: Optional[Dict[str, object]],
+    *,
+    pad_id: int,
+    signature_pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not fast_context_state or not bool(fast_context_state.get("enabled", True)) or not bool(fast_context_state.get("use_training_prefix", True)):
+        return batch
+    bundle = fast_context_state.get("bundle")
+    if not isinstance(bundle, dict):
+        return batch
+    prefix_input = bundle.get("input_ids")
+    prefix_signatures = bundle.get("signature_ids")
+    prefix_levels = bundle.get("signature_level_ids")
+    prefix_relations = bundle.get("signature_relation_ids")
+    prefix_parents = bundle.get("parent_signature_ids")
+    prefix_families = bundle.get("signature_family_ids")
+    prefix_vectors = bundle.get("hierarchy_vectors")
+    if not all(torch.is_tensor(tensor) for tensor in (prefix_input, prefix_signatures, prefix_levels, prefix_relations, prefix_parents, prefix_families, prefix_vectors)):
+        return batch
+    (
+        input_ids,
+        labels,
+        signature_ids,
+        signature_level_ids,
+        signature_relation_ids,
+        parent_signature_ids,
+        signature_family_ids,
+        hierarchy_vectors,
+        loss_mask,
+    ) = batch
+    prefix_len = int(prefix_input.size(0))
+    if prefix_len <= 0:
+        return batch
+    batch_size = int(input_ids.size(0))
+    device = input_ids.device
+    prefix_input_ids = prefix_input.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    prefix_labels = torch.full((batch_size, prefix_len), int(pad_id), device=device, dtype=torch.long)
+    prefix_signature_ids = prefix_signatures.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    prefix_levels = prefix_levels.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    prefix_relations = prefix_relations.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    prefix_parents = prefix_parents.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    prefix_families = prefix_families.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    prefix_vectors = prefix_vectors.to(device=device, dtype=hierarchy_vectors.dtype).unsqueeze(0).expand(batch_size, -1, -1)
+    prefix_loss_mask = torch.zeros((batch_size, prefix_len), device=device, dtype=loss_mask.dtype)
+    return (
+        torch.cat([prefix_input_ids, input_ids], dim=1),
+        torch.cat([prefix_labels, labels], dim=1),
+        torch.cat([prefix_signature_ids, signature_ids], dim=1),
+        torch.cat([prefix_levels, signature_level_ids], dim=1),
+        torch.cat([prefix_relations, signature_relation_ids], dim=1),
+        torch.cat([prefix_parents, parent_signature_ids], dim=1),
+        torch.cat([prefix_families, signature_family_ids], dim=1),
+        torch.cat([prefix_vectors, hierarchy_vectors], dim=1),
+        torch.cat([prefix_loss_mask, loss_mask], dim=1),
+    )
+
+
+def _fast_context_generation_prompt(
+    prompt: str,
+    *,
+    cfg: PrismalWaveConfig,
+    fast_context_state: Optional[Dict[str, object]] = None,
+) -> str:
+    if not bool(getattr(cfg, "use_fst", True)):
+        return prompt
+    state = fast_context_state or {}
+    if isinstance(state, dict):
+        if not bool(state.get("enabled", True)) or not bool(state.get("use_generation_prefix", True)):
+            return prompt
+        bundle = state.get("bundle")
+        if not isinstance(bundle, dict) or not torch.is_tensor(bundle.get("input_ids")):
+            return prompt
+        prefix = _normalize_fast_context_text(str(state.get("prompt_text", "")))
+    else:
+        prefix = ""
+    if not prefix:
+        prefix = _fast_context_prompt_text(cfg)
+    prompt = prompt.strip()
+    if not prompt:
+        return prefix
+    return f"{prefix}\n\n{prompt}"
+
+
+def _normalize_training_batch(
+    batch: Sequence[torch.Tensor],
+    *,
+    hierarchy_vector_dim: int = DEFAULT_HIERARCHY_VECTOR_DIM,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if len(batch) == 9:
+        return tuple(batch)  # type: ignore[return-value]
+    if len(batch) == 8:
+        (
+            input_ids,
+            labels,
+            signature_ids,
+            signature_level_ids,
+            signature_relation_ids,
+            parent_signature_ids,
+            signature_family_ids,
+            loss_mask,
+        ) = batch
+        hierarchy_vectors = torch.zeros(
+            (*input_ids.shape, int(max(1, hierarchy_vector_dim))),
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        return (
+            input_ids,
+            labels,
+            signature_ids,
+            signature_level_ids,
+            signature_relation_ids,
+            parent_signature_ids,
+            signature_family_ids,
+            hierarchy_vectors,
+            loss_mask,
+        )
+    raise ValueError(f"Expected batch with 8 or 9 tensors, got {len(batch)}")
 
 
 @dataclass
@@ -483,11 +749,17 @@ def build_tokenizer_from_source(
     max_source_samples: int = 0,
     supervised_only: bool = False,
     use_pronunciation_signatures: bool = True,
+    hierarchy_vector_low_rank_enabled: bool = True,
+    hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
     tokenizer_workers: int = 1,
     tokenizer_cache_dir: str | Path | None = None,
     tokenizer: PrismalTokenizer | None = None,
 ) -> PrismalTokenizer:
-    tokenizer = tokenizer or PrismalTokenizer(use_pronunciation_signatures=use_pronunciation_signatures)
+    tokenizer = tokenizer or PrismalTokenizer(
+        use_pronunciation_signatures=use_pronunciation_signatures,
+        hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
+    )
     base_fingerprint = _tokenizer_state_fingerprint(tokenizer)
     cache_path = _tokenizer_cache_path(
         base_fingerprint,
@@ -499,9 +771,11 @@ def build_tokenizer_from_source(
         max_line_tokens=max_line_tokens,
         max_signature_tokens=max_signature_tokens,
         max_source_samples=max_source_samples,
-        supervised_only=supervised_only,
-        use_pronunciation_signatures=use_pronunciation_signatures,
-    )
+          supervised_only=supervised_only,
+          use_pronunciation_signatures=use_pronunciation_signatures,
+          hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+          hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
+      )
     if cache_path.exists():
         try:
             cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -539,10 +813,12 @@ def build_tokenizer_from_source(
                 "max_word_tokens": int(max_word_tokens),
                 "max_line_tokens": int(max_line_tokens),
                 "max_signature_tokens": int(max_signature_tokens),
-                "max_source_samples": int(max_source_samples),
-                "supervised_only": bool(supervised_only),
-                "use_pronunciation_signatures": bool(use_pronunciation_signatures),
-            },
+                  "max_source_samples": int(max_source_samples),
+                  "supervised_only": bool(supervised_only),
+                  "use_pronunciation_signatures": bool(use_pronunciation_signatures),
+                  "hierarchy_vector_low_rank_enabled": bool(hierarchy_vector_low_rank_enabled),
+                  "hierarchy_vector_low_rank_dim": int(hierarchy_vector_low_rank_dim),
+              },
             "tokenizer_state": tokenizer.to_state_dict(),
         }
         cache_path.write_text(json.dumps(cache_payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -588,36 +864,57 @@ def build_dataloader(
     batch_size: int,
     max_samples: int = 1000,
     shuffle: bool = True,
+    *,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
 ) -> DataLoader:
+    hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
     if isinstance(texts_or_source, (str, Path)):
         source = Path(texts_or_source)
         pretokenized_root = _find_pretokenized_root(source)
         if pretokenized_root is not None:
-            dataset = MemmapTokenDataset(pretokenized_root, split="all", max_samples=max_samples)
+            dataset = MemmapTokenDataset(
+                pretokenized_root,
+                split="all",
+                max_samples=max_samples,
+                hierarchy_vector_dtype=hierarchy_dtype,
+            )
             return DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=shuffle,
                 drop_last=False,
-                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
             )
-        dataset = StreamingTextCorpusDataset(source, tokenizer, seq_len=seq_len, max_samples=max_samples, split="all")
+        dataset = StreamingTextCorpusDataset(
+            source,
+            tokenizer,
+            seq_len=seq_len,
+            max_samples=max_samples,
+            split="all",
+            hierarchy_vector_dtype=hierarchy_dtype,
+        )
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+            collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
         )
     else:
         texts = texts_or_source
-    dataset = TextWindowDataset(texts, tokenizer, seq_len=seq_len, max_samples=max_samples)
+    dataset = TextWindowDataset(
+        texts,
+        tokenizer,
+        seq_len=seq_len,
+        max_samples=max_samples,
+        hierarchy_vector_dtype=hierarchy_dtype,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=len(dataset) >= batch_size,
-        collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+        collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
     )
 
 
@@ -631,7 +928,9 @@ def build_train_val_dataloaders(
     max_samples: int = 1000,
     seed: int = 42,
     streaming: bool = True,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
 ) -> tuple[DataLoader, DataLoader]:
+    hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
     if isinstance(texts_or_source, (str, Path)):
         source = Path(texts_or_source)
         pretokenized_root = _find_pretokenized_root(source)
@@ -642,6 +941,7 @@ def build_train_val_dataloaders(
                 val_fraction=val_fraction,
                 seed=seed,
                 max_samples=max_samples,
+                hierarchy_vector_dtype=hierarchy_dtype,
             )
             val_dataset = MemmapTokenDataset(
                 pretokenized_root,
@@ -649,39 +949,46 @@ def build_train_val_dataloaders(
                 val_fraction=val_fraction,
                 seed=seed,
                 max_samples=max_samples,
+                hierarchy_vector_dtype=hierarchy_dtype,
             )
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=batch_size,
                 shuffle=True,
                 drop_last=len(train_dataset) >= batch_size,
-                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
             )
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
                 drop_last=False,
-                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
             )
             return train_loader, val_loader
         if not bool(streaming):
             texts = load_text_corpus(source)
-            dataset = TextWindowDataset(texts, tokenizer, seq_len=seq_len, max_samples=max_samples)
+            dataset = TextWindowDataset(
+                texts,
+                tokenizer,
+                seq_len=seq_len,
+                max_samples=max_samples,
+                hierarchy_vector_dtype=hierarchy_dtype,
+            )
             train_dataset, val_dataset = split_text_window_dataset(dataset, val_fraction=val_fraction, seed=seed)
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=batch_size,
                 shuffle=True,
                 drop_last=len(train_dataset) >= batch_size,
-                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
             )
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
                 drop_last=False,
-                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+                collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
             )
             return train_loader, val_loader
         train_dataset = StreamingTextCorpusDataset(
@@ -692,6 +999,7 @@ def build_train_val_dataloaders(
             split="train",
             val_fraction=val_fraction,
             seed=seed,
+            hierarchy_vector_dtype=hierarchy_dtype,
         )
         val_dataset = StreamingTextCorpusDataset(
             source,
@@ -701,39 +1009,46 @@ def build_train_val_dataloaders(
             split="val",
             val_fraction=val_fraction,
             seed=seed,
+            hierarchy_vector_dtype=hierarchy_dtype,
         )
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+            collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+            collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
         )
         return train_loader, val_loader
     else:
         texts = texts_or_source
-    dataset = TextWindowDataset(texts, tokenizer, seq_len=seq_len, max_samples=max_samples)
+    dataset = TextWindowDataset(
+        texts,
+        tokenizer,
+        seq_len=seq_len,
+        max_samples=max_samples,
+        hierarchy_vector_dtype=hierarchy_dtype,
+    )
     train_dataset, val_dataset = split_text_window_dataset(dataset, val_fraction=val_fraction, seed=seed)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=len(train_dataset) >= batch_size,
-        collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+        collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
-        collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id),
+        collate_fn=build_collate_fn(tokenizer.pad_id, tokenizer.signature_pad_id, hierarchy_vector_dtype=hierarchy_dtype),
     )
     return train_loader, val_loader
 
@@ -783,6 +1098,12 @@ def save_checkpoint(
             "use_token_superposition_training",
             "token_superposition_bag_size",
             "token_superposition_phase_fraction",
+            "use_fst",
+            "fst_seed_prompt",
+            "fst_refresh_interval",
+            "fst_max_prompt_chars",
+            "fst_use_training_prefix",
+            "fst_use_generation_prefix",
             "muon_lr",
             "muon_weight_decay",
             "muon_momentum_beta",
@@ -1107,8 +1428,8 @@ def _format_precision_breakdown(model: PrismalWaveModel) -> str:
         ("torus", getattr(model, "torus_core", None)),
         ("router", getattr(model, "router", None)),
         ("token_hierarchy", getattr(model, "token_hierarchy", None)),
-        ("signature_lattice", getattr(model, "signature_lattice_attention", None)),
-        ("token_memory", getattr(model, "token_memory_attention", None)),
+        ("signature_lattice", model._modules.get("signature_lattice_attention")),
+        ("token_memory", model._modules.get("token_memory_attention")),
     ):
         spec = _module_spec(module)
         if spec is not None:
@@ -1584,7 +1905,18 @@ def evaluate_model(
     usage_concentration = []
     aux_breakdown_sums = {key: 0.0 for key in AUX_BREAKDOWN_KEYS}
     try:
-        for input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask in dataloader:
+        for batch in dataloader:
+            (
+                input_ids,
+                labels,
+                signature_ids,
+                signature_level_ids,
+                signature_relation_ids,
+                parent_signature_ids,
+                signature_family_ids,
+                hierarchy_vectors,
+                loss_mask,
+            ) = _normalize_training_batch(batch)
             input_ids = input_ids.to(device)
             labels = labels.to(device)
             signature_ids = signature_ids.to(device)
@@ -1710,6 +2042,12 @@ def train_model(
         "use_token_superposition_training",
         "token_superposition_bag_size",
         "token_superposition_phase_fraction",
+        "use_fst",
+        "fst_seed_prompt",
+        "fst_refresh_interval",
+        "fst_max_prompt_chars",
+        "fst_use_training_prefix",
+        "fst_use_generation_prefix",
     ):
         if hasattr(cfg, field_name):
             setattr(runtime_model.cfg, field_name, getattr(cfg, field_name))
@@ -1773,6 +2111,17 @@ def train_model(
                 scaler.load_state_dict(resume_scaler_state)
             except Exception as exc:
                 print(f"[Prismal] scaler state restore skipped: {exc}", flush=True)
+    tokenizer = getattr(runtime_model, "_prismal_tokenizer", None)
+    resume_fst_state = resume_state.get("fst_state") if isinstance(resume_state, dict) else None
+    fast_context_state = _fast_context_state_from_config(
+        runtime_model.cfg,
+        tokenizer if isinstance(tokenizer, PrismalTokenizer) else None,
+        existing_state=resume_fst_state if isinstance(resume_fst_state, dict) else None,
+        step=resume_global_step,
+        force=False,
+    )
+    if fast_context_state is not None:
+        runtime_model._prismal_fast_context_state = fast_context_state
     if hasattr(runtime_model, "configure_precision"):
         runtime_model.configure_precision(
             device,
@@ -1957,11 +2306,21 @@ def train_model(
         return [num_batches]
 
     def _run_validation(label: str) -> None:
-        nonlocal last_val_metrics
+        nonlocal last_val_metrics, fast_context_state
         if val_loader is None:
             return
         val_metrics = evaluate_model(model, val_loader, device, use_amp=use_amp)
         last_val_metrics = val_metrics
+        fast_context_state = _fast_context_state_from_config(
+            runtime_model.cfg,
+            getattr(runtime_model, "_prismal_tokenizer", None),
+            existing_state=fast_context_state,
+            metrics=val_metrics,
+            step=step,
+            force=True,
+        ) or fast_context_state
+        if fast_context_state is not None:
+            runtime_model._prismal_fast_context_state = fast_context_state
         val_losses.append(float(val_metrics["loss"]))
         val_agreements.append(float(val_metrics["signature_agreement"]))
         if progress:
@@ -2025,6 +2384,7 @@ def train_model(
         nonlocal gatetrain_hit_sum, gatetrain_miss_sum, gatetrain_churn_sum, gatetrain_predicted_tiles_sum
         nonlocal gatetrain_confidence_sum, gatetrain_latency_saved_sum, gatetrain_plan_time_sum, gatetrain_lead_time_sum
         nonlocal gatetrain_full_scope_sum
+        nonlocal fast_context_state
         input_ids = input_ids.to(device)
         labels = labels.to(device)
         signature_ids = signature_ids.to(device)
@@ -2034,6 +2394,33 @@ def train_model(
         signature_family_ids = signature_family_ids.to(device)
         hierarchy_vectors = hierarchy_vectors.to(device)
         loss_mask = loss_mask.to(device)
+        if fast_context_state is not None:
+            (
+                input_ids,
+                labels,
+                signature_ids,
+                signature_level_ids,
+                signature_relation_ids,
+                parent_signature_ids,
+                signature_family_ids,
+                hierarchy_vectors,
+                loss_mask,
+            ) = _prepend_fast_context_prefix(
+                (
+                    input_ids,
+                    labels,
+                    signature_ids,
+                    signature_level_ids,
+                    signature_relation_ids,
+                    parent_signature_ids,
+                    signature_family_ids,
+                    hierarchy_vectors,
+                    loss_mask,
+                ),
+                fast_context_state,
+                pad_id=int(getattr(runtime_model.cfg, "pad_id", 0)),
+                signature_pad_id=int(getattr(runtime_model.cfg, "signature_pad_id", 0)),
+            )
         token_superposition_bag_size = 1
         if _token_superposition_phase_active(
             cfg,
@@ -2191,6 +2578,22 @@ def train_model(
             last_aux_component_values[key] = value
             aux_component_sum[key] = value if aux_component_sum[key] is None else aux_component_sum[key] + value
         best_loss_tensor = loss_value if best_loss_tensor is None else min(best_loss_tensor, loss_value)
+        fast_context_state = _fast_context_state_from_config(
+            runtime_model.cfg,
+            getattr(runtime_model, "_prismal_tokenizer", None),
+            existing_state=fast_context_state,
+            metrics={
+                "loss": loss_value,
+                "ce_loss": ce_value,
+                "aux_loss": aux_value,
+                "signature_agreement": _stat_value(output.route_stats, "signature_agreement"),
+                "avg_entropy": _stat_value(output.route_stats, "avg_entropy"),
+            },
+            step=step,
+            force=False,
+        ) or fast_context_state
+        if fast_context_state is not None:
+            runtime_model._prismal_fast_context_state = fast_context_state
 
         if should_collect:
             sig_value = float(output.route_stats["signature_agreement"].mean().detach().item())
@@ -2297,21 +2700,22 @@ def train_model(
             validation_points = [] if streaming_mode else _epoch_validation_points(batches_per_epoch)
             validation_point_index = 0
             iterator = iter(dataloader)
-            for batch_idx, (
-                input_ids,
-                labels,
-                signature_ids,
-                signature_level_ids,
-                signature_relation_ids,
-                parent_signature_ids,
-                signature_family_ids,
-                hierarchy_vectors,
-                loss_mask,
-            ) in enumerate(iterator, start=1):
+            for batch_idx, batch in enumerate(iterator, start=1):
                 if limit_seconds is not None and step > 0 and (time.perf_counter() - start) >= limit_seconds:
                     break
                 if step_limit > 0 and step >= step_limit:
                     break
+                (
+                    input_ids,
+                    labels,
+                    signature_ids,
+                    signature_level_ids,
+                    signature_relation_ids,
+                    parent_signature_ids,
+                    signature_family_ids,
+                    hierarchy_vectors,
+                    loss_mask,
+                ) = _normalize_training_batch(batch)
                 _train_batch(
                     input_ids,
                     labels,
@@ -2340,10 +2744,22 @@ def train_model(
                 break
 
             try:
-                input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
+                batch = next(iterator)
             except StopIteration:
                 iterator = iter(dataloader)
-                input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
+                batch = next(iterator)
+
+            (
+                input_ids,
+                labels,
+                signature_ids,
+                signature_level_ids,
+                signature_relation_ids,
+                parent_signature_ids,
+                signature_family_ids,
+                hierarchy_vectors,
+                loss_mask,
+            ) = _normalize_training_batch(batch)
 
             batch_idx = (batch_idx % batches_per_epoch) + 1
             epoch_idx = min(epoch_count if epoch_count > 0 else 1, ((step // batches_per_epoch) + 1))
@@ -2379,6 +2795,7 @@ def train_model(
         "use_amp": bool(use_amp),
         "precision_policy_state": getattr(getattr(runtime_model, "precision_policy", None), "to_state_dict", lambda: None)(),
         "precision_tier_map": getattr(runtime_model, "_precision_tier_map", []),
+        "fst_state": fast_context_state,
     }
     if hasattr(runtime_model, "configure_precision"):
         runtime_model.configure_precision(device, enabled=False, checkpoint_precision_state=runtime_model._prismal_training_state)
@@ -2509,10 +2926,21 @@ def run_benchmark(
 
     for _ in range(max(1, steps)):
         try:
-            input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
+            batch = next(iterator)
         except StopIteration:
             iterator = iter(dataloader)
-            input_ids, labels, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids, hierarchy_vectors, loss_mask = next(iterator)
+            batch = next(iterator)
+        (
+            input_ids,
+            labels,
+            signature_ids,
+            signature_level_ids,
+            signature_relation_ids,
+            parent_signature_ids,
+            signature_family_ids,
+            hierarchy_vectors,
+            loss_mask,
+        ) = _normalize_training_batch(batch)
         input_ids = input_ids.to(device)
         labels = labels.to(device)
         signature_ids = signature_ids.to(device)
@@ -2603,10 +3031,17 @@ def generate_text(
     speculative_draft_tokens: Optional[int] = None,
     speculative_temperature: Optional[float] = None,
     template_prompt: bool = False,
+    fast_context_state: Optional[Dict[str, object]] = None,
 ) -> str:
     model.eval()
     prompt = _format_generation_prompt(prompt, template_prompt=template_prompt)
-    prompt_bundle = tokenizer.prepare_generation_hierarchy(prompt)
+    conditioning_prompt = _fast_context_generation_prompt(
+        prompt,
+        cfg=getattr(model, "cfg", PrismalWaveConfig()),
+        fast_context_state=fast_context_state,
+    )
+    prompt_bundle = tokenizer.prepare_generation_hierarchy(conditioning_prompt)
+    hierarchy_dtype = _hierarchy_vector_dtype_from_config(getattr(model, "cfg", PrismalWaveConfig()))
     (
         prompt_ids,
         prompt_signature_ids,
@@ -2615,7 +3050,7 @@ def generate_text(
         prompt_parent_signature_ids,
         prompt_signature_family_ids,
     ) = prompt_bundle.as_tuple()
-    prompt_hierarchy_vectors = torch.tensor(prompt_bundle.hierarchy_vectors, dtype=torch.float32, device=device)
+    prompt_hierarchy_vectors = torch.tensor(prompt_bundle.hierarchy_vectors, dtype=hierarchy_dtype, device=device)
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     signature_ids = torch.tensor([prompt_signature_ids], dtype=torch.long, device=device)
     signature_level_ids = torch.tensor([prompt_signature_level_ids], dtype=torch.long, device=device)

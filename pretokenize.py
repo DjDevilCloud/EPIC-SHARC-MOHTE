@@ -18,21 +18,27 @@ import numpy as np
 
 try:
     from .data import (
+        DEFAULT_HIERARCHY_VECTOR_DIM,
+        DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
         PrismalTokenizer,
         StreamingTextCorpusDataset,
         _build_window_samples_from_text,
         _clean_record_value,
         _compose_record_text,
+        hierarchy_vector_numpy_dtype,
         stream_pretokenized_windows,
     )
     from .train import build_tokenizer_from_source
 except ImportError:  # pragma: no cover - supports direct script launching.
     from data import (
+        DEFAULT_HIERARCHY_VECTOR_DIM,
+        DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
         PrismalTokenizer,
         StreamingTextCorpusDataset,
         _build_window_samples_from_text,
         _clean_record_value,
         _compose_record_text,
+        hierarchy_vector_numpy_dtype,
         stream_pretokenized_windows,
     )
     from train import build_tokenizer_from_source
@@ -57,11 +63,17 @@ class _ShardSampleIterable:
         *,
         seq_len: int,
         max_samples: int = 0,
+        hierarchy_vector_dtype: object = "float8_e4m3fn",
+        hierarchy_vector_low_rank_enabled: bool = True,
+        hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
     ) -> None:
         self.tokenizer = tokenizer
         self.shard_spec = shard_spec
         self.seq_len = max(0, int(seq_len))
         self.max_samples = max(0, int(max_samples))
+        self.hierarchy_vector_dtype = hierarchy_vector_dtype
+        self.hierarchy_vector_low_rank_enabled = bool(hierarchy_vector_low_rank_enabled)
+        self.hierarchy_vector_low_rank_dim = max(1, int(hierarchy_vector_low_rank_dim))
 
     def __iter__(self) -> Iterator[Any]:
         yielded = 0
@@ -75,6 +87,9 @@ class _ShardSampleIterable:
                 merged,
                 seq_len=self.seq_len,
                 max_samples=max(0, remaining),
+                hierarchy_vector_dtype=self.hierarchy_vector_dtype,
+                low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
+                low_rank_dim=self.hierarchy_vector_low_rank_dim,
             )
             for sample in windows:
                 yield sample
@@ -285,6 +300,9 @@ def _worker_pretokenize_shard(
     seq_len: int,
     max_samples: int,
     output_dir: str | Path,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
+    hierarchy_vector_low_rank_enabled: bool = True,
+    hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
 ) -> str:
     tokenizer = PrismalTokenizer.from_state_dict(tokenizer_state)
     shard_dir = Path(output_dir)
@@ -294,11 +312,17 @@ def _worker_pretokenize_shard(
         shard_spec,
         seq_len=seq_len,
         max_samples=max_samples,
+        hierarchy_vector_dtype=hierarchy_vector_dtype,
+        hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
     )
     stream_pretokenized_windows(
         sample_iterable,
         shard_dir,
         seq_len=seq_len,
+        hierarchy_vector_dtype=hierarchy_vector_dtype,
+        hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
         metadata={
             "source": shard_spec.source,
             "shard_kind": shard_spec.kind,
@@ -319,6 +343,9 @@ def _merge_pretokenized_shards(
     seq_len: int,
     metadata: Optional[dict[str, Any]] = None,
     max_samples: int = 0,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
+    hierarchy_vector_low_rank_enabled: bool = True,
+    hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
 ) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -358,8 +385,20 @@ def _merge_pretokenized_shards(
         "signature_relation_ids",
         "parent_signature_ids",
         "signature_family_ids",
+        "hierarchy_vectors",
         "loss_mask",
     ]
+    hierarchy_vector_dtype_name = str(first_meta.get("hierarchy_vector_dtype", hierarchy_vector_dtype) or hierarchy_vector_dtype)
+    hierarchy_vector_np_dtype = hierarchy_vector_numpy_dtype(hierarchy_vector_dtype_name)
+    hierarchy_vector_dim = int(first_meta.get("hierarchy_vector_dim", DEFAULT_HIERARCHY_VECTOR_DIM))
+    if "hierarchy_vector_low_rank_enabled" in first_meta:
+        hierarchy_vector_low_rank_enabled = bool(first_meta.get("hierarchy_vector_low_rank_enabled"))
+    else:
+        hierarchy_vector_low_rank_enabled = hierarchy_vector_dim < DEFAULT_HIERARCHY_VECTOR_DIM
+    if "hierarchy_vector_low_rank_dim" in first_meta:
+        hierarchy_vector_low_rank_dim = int(first_meta.get("hierarchy_vector_low_rank_dim"))
+    elif hierarchy_vector_low_rank_enabled:
+        hierarchy_vector_low_rank_dim = hierarchy_vector_dim
 
     offsets = np.zeros(total_samples, dtype=np.int64)
     lengths = np.zeros(total_samples, dtype=np.int64)
@@ -371,6 +410,7 @@ def _merge_pretokenized_shards(
         "signature_relation_ids": np.int64,
         "parent_signature_ids": np.int64,
         "signature_family_ids": np.int64,
+        "hierarchy_vectors": hierarchy_vector_np_dtype,
         "loss_mask": np.float32,
     }
     field_memmaps: dict[str, np.ndarray] = {
@@ -378,7 +418,7 @@ def _merge_pretokenized_shards(
             output_path / f"{field_name}.npy",
             mode="w+",
             dtype=dtype,
-            shape=(total_tokens,),
+            shape=(total_tokens, hierarchy_vector_dim) if field_name == "hierarchy_vectors" else (total_tokens,),
         )
         for field_name, dtype in field_dtypes.items()
     }
@@ -394,7 +434,12 @@ def _merge_pretokenized_shards(
             sample_cursor += 1
         for field_name in field_names:
             shard_field = np.load(shard_dir / f"{field_name}.npy", mmap_mode="r")
-            if field_name == "loss_mask":
+            if field_name == "hierarchy_vectors":
+                field_memmaps[field_name][token_cursor : token_cursor + token_count, :] = np.asarray(
+                    shard_field[:token_count],
+                    dtype=hierarchy_vector_np_dtype,
+                )
+            elif field_name == "loss_mask":
                 field_memmaps[field_name][token_cursor : token_cursor + token_count] = np.asarray(
                     shard_field[:token_count],
                     dtype=np.float32,
@@ -419,6 +464,10 @@ def _merge_pretokenized_shards(
         "field_names": field_names,
         "sharded": True,
         "num_shards": int(len(shard_plans)),
+        "hierarchy_vector_dim": int(hierarchy_vector_dim),
+        "hierarchy_vector_dtype": hierarchy_vector_dtype_name,
+        "hierarchy_vector_low_rank_enabled": bool(hierarchy_vector_low_rank_enabled),
+        "hierarchy_vector_low_rank_dim": int(hierarchy_vector_low_rank_dim),
     }
     if metadata:
         payload.update(metadata)
@@ -434,17 +483,32 @@ def pretokenize_corpus(
     max_samples: int = 0,
     output_dir: str | Path = "pretokenized",
     workers: int = 1,
+    hierarchy_vector_dtype: object = "float8_e4m3fn",
+    hierarchy_vector_low_rank_enabled: bool = True,
+    hierarchy_vector_low_rank_dim: int = DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM,
 ) -> Path:
     """Tokenize a corpus once and write memmapped training windows."""
     source = Path(source_path)
     requested_workers = _resolve_worker_count(source, workers)
     shard_specs = _build_shard_specs(source, requested_workers)
     if len(shard_specs) <= 1:
-        second_pass = StreamingTextCorpusDataset(source, tokenizer, seq_len=seq_len, max_samples=max_samples, split="all")
+        second_pass = StreamingTextCorpusDataset(
+            source,
+            tokenizer,
+            seq_len=seq_len,
+            max_samples=max_samples,
+            split="all",
+            hierarchy_vector_dtype=hierarchy_vector_dtype,
+            hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+            hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
+        )
         return stream_pretokenized_windows(
             second_pass,
             output_dir,
             seq_len=seq_len,
+            hierarchy_vector_dtype=hierarchy_vector_dtype,
+            hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+            hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
             metadata={
                 "source": str(source),
                 "vocab_size": int(getattr(tokenizer, "vocab_size", 0)),
@@ -472,14 +536,17 @@ def pretokenize_corpus(
                 shard_dir.mkdir(parents=True, exist_ok=True)
                 futures.append(
                     executor.submit(
-                        _worker_pretokenize_shard,
-                        token_state,
-                        shard_spec,
-                        seq_len=seq_len,
-                        max_samples=per_shard_max,
-                        output_dir=str(shard_dir),
-                    )
+                    _worker_pretokenize_shard,
+                    token_state,
+                    shard_spec,
+                    seq_len=seq_len,
+                    max_samples=per_shard_max,
+                    output_dir=str(shard_dir),
+                    hierarchy_vector_dtype=hierarchy_vector_dtype,
+                    hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+                    hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
                 )
+            )
             for future in concurrent.futures.as_completed(futures):
                 shard_path = Path(future.result())
                 print(f"[Prismal] shard complete: {shard_path.name}", flush=True)
@@ -488,6 +555,9 @@ def pretokenize_corpus(
             shard_dirs,
             output_dir,
             seq_len=seq_len,
+            hierarchy_vector_dtype=hierarchy_vector_dtype,
+            hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+            hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
             metadata={
                 "source": str(source),
                 "vocab_size": int(getattr(tokenizer, "vocab_size", 0)),
@@ -515,6 +585,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--workers", type=int, default=1, help="Parallel shard workers to use")
+    parser.add_argument(
+        "--hierarchy-vector-dtype",
+        type=str,
+        default="float8_e4m3fn",
+        choices=("float32", "bfloat16", "float16", "float8_e4m3fn", "float8_e5m2"),
+        help="Storage dtype for hierarchy vectors in pretokenized memmaps.",
+    )
+    parser.add_argument("--hierarchy-vector-low-rank-enabled", dest="hierarchy_vector_low_rank_enabled", action="store_true")
+    parser.add_argument("--no-hierarchy-vector-low-rank-enabled", dest="hierarchy_vector_low_rank_enabled", action="store_false")
+    parser.set_defaults(hierarchy_vector_low_rank_enabled=True)
+    parser.add_argument("--hierarchy-vector-low-rank-dim", type=int, default=DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM)
     parser.add_argument("--max-new-tokens", type=int, default=0)
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument("--max-word-tokens", type=int, default=0)
@@ -536,6 +617,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_line_tokens=args.max_line_tokens,
         max_signature_tokens=args.max_signature_tokens,
         supervised_only=args.supervised_only,
+        hierarchy_vector_low_rank_enabled=args.hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=args.hierarchy_vector_low_rank_dim,
         tokenizer_workers=args.workers,
     )
     output_path = pretokenize_corpus(
@@ -545,6 +628,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_samples=args.max_samples,
         output_dir=args.output_dir,
         workers=args.workers,
+        hierarchy_vector_dtype=args.hierarchy_vector_dtype,
+        hierarchy_vector_low_rank_enabled=args.hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=args.hierarchy_vector_low_rank_dim,
     )
     print(f"Saved pretokenized dataset to {output_path}")
     return 0

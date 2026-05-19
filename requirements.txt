@@ -1,13 +1,18 @@
-numpy
+numpy>=2.4.6
 torch
+ml_dtypes
+torchao>=0.12.0
 
 # Optional features used by some data paths and utilities.
 # Install these if you want the broader dataset and precision feature set:
+# - torchao: weight-only linear / embedding acceleration on CPU and CUDA
 # - bitsandbytes: leaf precision / quantization paths
 # - transformer-engine: optional NVFP4 leaf precision backend for Blackwell users
+# - cupy-cuda12x: GPU-accelerated array conversion / preprocessing where available
 # - pyarrow: parquet corpus support
 # - pandas: parquet fallback and dataset utilities
 # pandas
 # pyarrow
 # bitsandbytes
 # transformer-engine
+# cupy-cuda12x
