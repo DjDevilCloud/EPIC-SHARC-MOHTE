@@ -2427,13 +2427,25 @@ class SignatureEmitterRegistry(nn.Module):
         unique_ids = torch.unique(flat)
         max_id = int(unique_ids.max().item())
         if buffer_name == "family_activity":
-            self._ensure_capacity(max_id, 0, 0)
+            if self.training and self.capacity_growth_locked and max_id >= self.family_embedding.num_embeddings:
+                unique_ids = unique_ids.clamp(max=max(0, self.family_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(max_id, 0, 0)
         elif buffer_name == "relation_activity":
-            self._ensure_capacity(0, max_id, 0)
+            if self.training and self.capacity_growth_locked and max_id >= self.relation_embedding.num_embeddings:
+                unique_ids = unique_ids.clamp(max=max(0, self.relation_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(0, max_id, 0)
         elif buffer_name == "parent_activity":
-            self._ensure_capacity(max_id, 0, 0)
+            if self.training and self.capacity_growth_locked and max_id >= self.parent_embedding.num_embeddings:
+                unique_ids = unique_ids.clamp(max=max(0, self.parent_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(max_id, 0, 0)
         else:
-            self._ensure_capacity(0, 0, max_id)
+            if self.training and self.capacity_growth_locked and max_id >= self.level_embedding.num_embeddings:
+                unique_ids = unique_ids.clamp(max=max(0, self.level_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(0, 0, max_id)
         activity: torch.Tensor = getattr(self, buffer_name)
         active_mask: torch.Tensor = getattr(self, mask_name)
         with torch.no_grad():
@@ -2475,7 +2487,11 @@ class SignatureEmitterRegistry(nn.Module):
     def family_context(self, family_ids: torch.Tensor) -> torch.Tensor:
         family_ids = family_ids.clamp(min=0)
         if family_ids.numel() > 0:
-            self._ensure_capacity(int(family_ids.max().item()), 0, 0)
+            max_family_id = int(family_ids.max().item())
+            if self.training and self.capacity_growth_locked and max_family_id >= self.family_embedding.num_embeddings:
+                family_ids = family_ids.clamp(max=max(0, self.family_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(max_family_id, 0, 0)
         embed = self.family_embedding(family_ids)
         mask = self.family_active_mask[family_ids].to(embed.dtype).unsqueeze(-1)
         activity = self.family_activity[family_ids].to(embed.dtype).unsqueeze(-1)
@@ -2488,7 +2504,11 @@ class SignatureEmitterRegistry(nn.Module):
             device, dtype = self._module_device_dtype(self.family_embedding)
             return torch.zeros(0, device=device, dtype=dtype)
         if level_ids.numel() > 0:
-            self._ensure_capacity(0, 0, int(level_ids.max().item()))
+            max_level_id = int(level_ids.max().item())
+            if self.training and self.capacity_growth_locked and max_level_id >= self.level_embedding.num_embeddings:
+                level_ids = level_ids.clamp(max=max(0, self.level_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(0, 0, max_level_id)
         embed = self.level_embedding(level_ids.clamp(min=0))
         mask = self.level_active_mask[level_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
         return embed * (0.5 + 0.5 * mask)
@@ -2498,7 +2518,11 @@ class SignatureEmitterRegistry(nn.Module):
             device, dtype = self._module_device_dtype(self.family_embedding)
             return torch.zeros(0, device=device, dtype=dtype)
         if relation_ids.numel() > 0:
-            self._ensure_capacity(0, int(relation_ids.max().item()), 0)
+            max_relation_id = int(relation_ids.max().item())
+            if self.training and self.capacity_growth_locked and max_relation_id >= self.relation_embedding.num_embeddings:
+                relation_ids = relation_ids.clamp(max=max(0, self.relation_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(0, max_relation_id, 0)
         embed = self.relation_embedding(relation_ids.clamp(min=0))
         mask = self.relation_active_mask[relation_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
         activity = self.relation_activity[relation_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
@@ -2509,7 +2533,11 @@ class SignatureEmitterRegistry(nn.Module):
             device, dtype = self._module_device_dtype(self.family_embedding)
             return torch.zeros(0, device=device, dtype=dtype)
         if parent_ids.numel() > 0:
-            self._ensure_capacity(int(parent_ids.max().item()), 0, 0)
+            max_parent_id = int(parent_ids.max().item())
+            if self.training and self.capacity_growth_locked and max_parent_id >= self.parent_embedding.num_embeddings:
+                parent_ids = parent_ids.clamp(max=max(0, self.parent_embedding.num_embeddings - 1))
+            else:
+                self._ensure_capacity(max_parent_id, 0, 0)
         embed = self.parent_embedding(parent_ids.clamp(min=0))
         mask = self.parent_active_mask[parent_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
         activity = self.parent_activity[parent_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
@@ -5241,13 +5269,25 @@ class PrismalEmitterRouter(nn.Module):
         signature_relation_ids: Optional[torch.Tensor] = None,
         parent_signature_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        self._ensure_hierarchy_capacity(
-            signature_family_ids=signature_family_ids,
-            signature_ids=signature_ids,
-            signature_level_ids=signature_level_ids,
-            signature_relation_ids=signature_relation_ids,
-            parent_signature_ids=parent_signature_ids,
-        )
+        if self.training and self.capacity_growth_locked:
+            if signature_ids is not None and signature_ids.numel() > 0:
+                signature_ids = signature_ids.clamp(max=max(0, self.signature_embedding.num_embeddings - 1))
+            if signature_family_ids is not None and signature_family_ids.numel() > 0:
+                signature_family_ids = signature_family_ids.clamp(max=max(0, self.family_embedding.num_embeddings - 1))
+            if signature_level_ids is not None and signature_level_ids.numel() > 0:
+                signature_level_ids = signature_level_ids.clamp(max=max(0, self.level_embedding.num_embeddings - 1))
+            if signature_relation_ids is not None and signature_relation_ids.numel() > 0:
+                signature_relation_ids = signature_relation_ids.clamp(max=max(0, self.relation_embedding.num_embeddings - 1))
+            if parent_signature_ids is not None and parent_signature_ids.numel() > 0:
+                parent_signature_ids = parent_signature_ids.clamp(max=max(0, self.parent_embedding.num_embeddings - 1))
+        else:
+            self._ensure_hierarchy_capacity(
+                signature_family_ids=signature_family_ids,
+                signature_ids=signature_ids,
+                signature_level_ids=signature_level_ids,
+                signature_relation_ids=signature_relation_ids,
+                parent_signature_ids=parent_signature_ids,
+            )
         family_ids = signature_family_ids if signature_family_ids is not None else signature_ids
         parent_ids = parent_signature_ids if parent_signature_ids is not None else family_ids
         tensors: List[torch.Tensor] = []
