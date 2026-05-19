@@ -19,11 +19,22 @@ if str(ROOT) not in sys.path:
 from config import PrismalWaveConfig
 from config import load_config
 from cli import build_parser, _build_config, _resolve_tokenizer_bootstrap
-from data import PrismalTokenizer, iter_text_corpus
+from data import MemmapTokenDataset, PrismalTokenizer, WindowSample, iter_text_corpus, stream_pretokenized_windows
 from model import PrismalTorusCore, PrismalWaveModel
 from muon_optim import PrecisionAdaptiveHierarchicalOptimizer
 from quantization import QuantizationConfig
-from train import build_train_val_dataloaders, generate_text, load_model_from_checkpoint, save_checkpoint, train_model, _clip_optimizer_group_gradients, _token_superposition_phase_active
+from train import (
+    build_train_val_dataloaders,
+    generate_text,
+    load_bundle_from_checkpoint,
+    load_model_from_checkpoint,
+    save_checkpoint,
+    train_model,
+    _clip_optimizer_group_gradients,
+    _prepend_fast_context_prefix,
+    _token_superposition_phase_active,
+)
+from quantization import create_quantized_embedding, create_quantized_linear
 
 
 class SmokeTests(unittest.TestCase):
@@ -60,6 +71,7 @@ class SmokeTests(unittest.TestCase):
         cfg.n_paths = 1
         cfg.top_k_emitters = 2
         cfg.top_k_slots = 2
+        cfg.router_emitter_chunk_size = 3
         cfg.use_factorized_embedding = True
         cfg.factorized_embedding_dim = 8
         cfg.use_torus_core = use_torus_core
@@ -280,6 +292,23 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(clone.gate_tile_granularity, cfg.gate_tile_granularity)
         self.assertFalse(clone.gate_offload_to_cpu)
         self.assertTrue(clone.gate_fallback_on_miss)
+
+    def test_sparse_emitter_router_config_roundtrip(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_gate_cfg(tokenizer, use_gate=False)
+        cfg.use_sparse_emitter_routing = True
+        cfg.router_sparse_candidate_budget = 64
+        payload = cfg.to_dict()
+        clone = PrismalWaveConfig.from_dict(payload)
+        self.assertTrue(clone.use_sparse_emitter_routing)
+        self.assertEqual(clone.router_sparse_candidate_budget, cfg.router_sparse_candidate_budget)
+
+        model = PrismalWaveModel(cfg)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_checkpoint(model, tmpdir, config=cfg)
+            saved_cfg = load_config(Path(tmpdir) / "config.json")
+        self.assertTrue(saved_cfg.use_sparse_emitter_routing)
+        self.assertEqual(saved_cfg.router_sparse_candidate_budget, cfg.router_sparse_candidate_budget)
 
     def test_gatetrain_config_roundtrip(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -596,6 +625,37 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(args.token_superposition_bag_size, 4)
         self.assertAlmostEqual(args.token_superposition_phase_fraction, 0.4)
 
+    def test_sparse_emitter_router_cli_flags_parse(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "train",
+            "--data",
+            "demo/corpus",
+            "--save-dir",
+            "tmp/run",
+            "--no-sparse-emitter-routing",
+            "--router-sparse-candidate-budget",
+            "128",
+        ])
+        self.assertFalse(args.use_sparse_emitter_routing)
+        self.assertEqual(args.router_sparse_candidate_budget, 128)
+
+        args = parser.parse_args([
+            "train",
+            "--data",
+            "demo/corpus",
+            "--save-dir",
+            "tmp/run",
+            "--top-k-emitters",
+            "64",
+            "--use-sparse-emitter-routing",
+            "--router-sparse-candidate-budget",
+            "96",
+        ])
+        cfg = _build_config(args)
+        self.assertTrue(cfg.use_sparse_emitter_routing)
+        self.assertEqual(cfg.router_sparse_candidate_budget, 96)
+
     def test_token_superposition_phase_schedule_is_resume_safe(self) -> None:
         cfg = PrismalWaveConfig(
             use_token_superposition_training=True,
@@ -683,10 +743,16 @@ class SmokeTests(unittest.TestCase):
     def test_stability_config_roundtrip_and_checkpoint_persistence(self) -> None:
         tokenizer = PrismalTokenizer()
         cfg = self._build_small_stability_cfg(tokenizer)
+        self.assertTrue(cfg.use_fst)
         payload = cfg.to_dict()
         clone = PrismalWaveConfig.from_dict(payload)
         self.assertTrue(clone.training_finite_guard_enabled)
         self.assertTrue(clone.inference_finite_guard_enabled)
+        self.assertTrue(clone.use_fst)
+        self.assertEqual(clone.fst_refresh_interval, cfg.fst_refresh_interval)
+        self.assertEqual(clone.fst_max_prompt_chars, cfg.fst_max_prompt_chars)
+        self.assertTrue(clone.fst_use_training_prefix)
+        self.assertTrue(clone.fst_use_generation_prefix)
         self.assertEqual(clone.grad_clip_muon, cfg.grad_clip_muon)
         self.assertEqual(clone.grad_clip_scalar, cfg.grad_clip_scalar)
         self.assertEqual(clone.grad_clip_rowwise, cfg.grad_clip_rowwise)
@@ -697,9 +763,210 @@ class SmokeTests(unittest.TestCase):
             saved_cfg = load_config(Path(tmpdir) / "config.json")
         self.assertTrue(saved_cfg.training_finite_guard_enabled)
         self.assertTrue(saved_cfg.inference_finite_guard_enabled)
+        self.assertTrue(saved_cfg.use_fst)
+        self.assertEqual(saved_cfg.fst_refresh_interval, cfg.fst_refresh_interval)
+        self.assertEqual(saved_cfg.fst_max_prompt_chars, cfg.fst_max_prompt_chars)
         self.assertEqual(saved_cfg.grad_clip_muon, cfg.grad_clip_muon)
         self.assertEqual(saved_cfg.grad_clip_scalar, cfg.grad_clip_scalar)
         self.assertEqual(saved_cfg.grad_clip_rowwise, cfg.grad_clip_rowwise)
+
+    def test_fast_slow_checkpoint_preserves_fast_context_state(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        model = PrismalWaveModel(cfg)
+        model._prismal_tokenizer = tokenizer
+        prompt_text = "Fast context: preserve the base policy and adapt to the latest feedback."
+        bundle = tokenizer.prepare_generation_hierarchy(prompt_text)
+        model._prismal_training_state = {
+            "optimizer_name": "adamw",
+            "optimizer_state": {},
+            "scheduler_state": None,
+            "scaler_state": None,
+            "global_step": 7,
+            "microbatch_step": 7,
+            "grad_accum_steps": 1,
+            "scheduler_total_steps": 1,
+            "scheduler_warmup_steps": 1,
+            "use_amp": False,
+            "precision_policy_state": None,
+            "precision_tier_map": [],
+            "fst_state": {
+                "enabled": True,
+                "use_training_prefix": True,
+                "use_generation_prefix": True,
+                "refresh_interval": 4,
+                "max_prompt_chars": 256,
+                "seed_prompt": cfg.fst_seed_prompt,
+                "prompt_text": prompt_text,
+                "last_refresh_step": 7,
+                "bundle": {
+                    "input_ids": torch.tensor(bundle.token_ids, dtype=torch.long),
+                    "signature_ids": torch.tensor(bundle.signature_ids, dtype=torch.long),
+                    "signature_level_ids": torch.tensor(bundle.signature_level_ids, dtype=torch.long),
+                    "signature_relation_ids": torch.tensor(bundle.signature_relation_ids, dtype=torch.long),
+                    "parent_signature_ids": torch.tensor(bundle.parent_signature_ids, dtype=torch.long),
+                    "signature_family_ids": torch.tensor(bundle.signature_family_ids, dtype=torch.long),
+                    "hierarchy_vectors": torch.tensor(bundle.hierarchy_vectors, dtype=torch.float32),
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_checkpoint(model, tmpdir, tokenizer=tokenizer, config=cfg)
+            loaded_model, loaded_tokenizer, loaded_cfg = load_bundle_from_checkpoint(Path(tmpdir) / "model.pt", device="cpu")
+
+        self.assertEqual(loaded_tokenizer.vocab_size, tokenizer.vocab_size)
+        self.assertTrue(loaded_cfg.use_fst)
+        self.assertIn("fst_state", loaded_model._prismal_training_state)
+        self.assertEqual(loaded_model._prismal_training_state["fst_state"]["prompt_text"], prompt_text)
+        self.assertNotIn("_prismal_fast_context_state", loaded_model.__dict__)
+
+    def test_fast_slow_generation_uses_explicit_prefix_only(self) -> None:
+        tokenizer = PrismalTokenizer()
+        bundle = tokenizer.prepare_generation_hierarchy("Fast context prefix")
+
+        class DummyModel:
+            def __init__(self) -> None:
+                self.cfg = PrismalWaveConfig()
+                self.cfg.use_fst = True
+                self.cfg.fst_seed_prompt = "Seed prompt"
+                self.cfg.fst_refresh_interval = 4
+                self.cfg.fst_max_prompt_chars = 256
+                self.last_prompt_ids: list[int] | None = None
+                self._prismal_training_state = {
+                    "fst_state": {
+                        "enabled": True,
+                        "use_training_prefix": True,
+                        "use_generation_prefix": True,
+                        "prompt_text": "Fast context prefix",
+                        "bundle": {
+                            "input_ids": torch.tensor(bundle.token_ids, dtype=torch.long),
+                            "signature_ids": torch.tensor(bundle.signature_ids, dtype=torch.long),
+                            "signature_level_ids": torch.tensor(bundle.signature_level_ids, dtype=torch.long),
+                            "signature_relation_ids": torch.tensor(bundle.signature_relation_ids, dtype=torch.long),
+                            "parent_signature_ids": torch.tensor(bundle.parent_signature_ids, dtype=torch.long),
+                            "signature_family_ids": torch.tensor(bundle.signature_family_ids, dtype=torch.long),
+                            "hierarchy_vectors": torch.tensor(bundle.hierarchy_vectors, dtype=torch.float32),
+                        },
+                    }
+                }
+
+            def eval(self) -> None:
+                return None
+
+            def generate(self, input_ids: torch.Tensor, **kwargs):
+                self.last_prompt_ids = input_ids[0].tolist()
+                return input_ids
+
+        model = DummyModel()
+        explicit_state = {
+            "enabled": True,
+            "use_training_prefix": True,
+            "use_generation_prefix": True,
+            "prompt_text": "Fast context prefix",
+            "bundle": {
+                "input_ids": torch.tensor(bundle.token_ids, dtype=torch.long),
+                "signature_ids": torch.tensor(bundle.signature_ids, dtype=torch.long),
+                "signature_level_ids": torch.tensor(bundle.signature_level_ids, dtype=torch.long),
+                "signature_relation_ids": torch.tensor(bundle.signature_relation_ids, dtype=torch.long),
+                "parent_signature_ids": torch.tensor(bundle.parent_signature_ids, dtype=torch.long),
+                "signature_family_ids": torch.tensor(bundle.signature_family_ids, dtype=torch.long),
+                "hierarchy_vectors": torch.tensor(bundle.hierarchy_vectors, dtype=torch.float32),
+            },
+        }
+        model._prismal_training_state = {
+            "fst_state": {
+                "enabled": True,
+                "use_training_prefix": True,
+                "use_generation_prefix": True,
+                "prompt_text": "Leaky prefix",
+                "bundle": {
+                    "input_ids": torch.tensor(bundle.token_ids, dtype=torch.long),
+                    "signature_ids": torch.tensor(bundle.signature_ids, dtype=torch.long),
+                    "signature_level_ids": torch.tensor(bundle.signature_level_ids, dtype=torch.long),
+                    "signature_relation_ids": torch.tensor(bundle.signature_relation_ids, dtype=torch.long),
+                    "parent_signature_ids": torch.tensor(bundle.parent_signature_ids, dtype=torch.long),
+                    "signature_family_ids": torch.tensor(bundle.signature_family_ids, dtype=torch.long),
+                    "hierarchy_vectors": torch.tensor(bundle.hierarchy_vectors, dtype=torch.float32),
+                },
+            }
+        }
+        generate_text(
+            model,  # type: ignore[arg-type]
+            tokenizer,
+            "What is a cat?",
+            torch.device("cpu"),
+            max_new_tokens=8,
+            min_new_tokens=1,
+            top_k=0,
+            top_p=1.0,
+            temperature=0.0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+            beam_size=1,
+            use_speculative_decoding=False,
+            template_prompt=False,
+            fast_context_state=explicit_state,
+        )
+
+        self.assertIsNotNone(model.last_prompt_ids)
+        conditioned_text = tokenizer.decode(model.last_prompt_ids or [])
+        self.assertIn("fast context prefix", conditioned_text.lower())
+        self.assertNotIn("leaky prefix", conditioned_text.lower())
+
+    def test_fast_slow_prefix_vector_width_is_adapted_to_batch(self) -> None:
+        batch = (
+            torch.tensor([[11, 12]], dtype=torch.long),
+            torch.tensor([[11, 12]], dtype=torch.long),
+            torch.tensor([[21, 22]], dtype=torch.long),
+            torch.tensor([[31, 32]], dtype=torch.long),
+            torch.tensor([[41, 42]], dtype=torch.long),
+            torch.tensor([[51, 52]], dtype=torch.long),
+            torch.tensor([[61, 62]], dtype=torch.long),
+            torch.zeros((1, 2, 12), dtype=torch.float32),
+            torch.ones((1, 2), dtype=torch.float32),
+        )
+        prefix_state = {
+            "enabled": True,
+            "use_training_prefix": True,
+            "bundle": {
+                "input_ids": torch.tensor([1, 2], dtype=torch.long),
+                "signature_ids": torch.tensor([3, 4], dtype=torch.long),
+                "signature_level_ids": torch.tensor([5, 6], dtype=torch.long),
+                "signature_relation_ids": torch.tensor([7, 8], dtype=torch.long),
+                "parent_signature_ids": torch.tensor([9, 10], dtype=torch.long),
+                "signature_family_ids": torch.tensor([11, 12], dtype=torch.long),
+                "hierarchy_vectors": torch.zeros((2, 4), dtype=torch.float32),
+            },
+        }
+
+        merged = _prepend_fast_context_prefix(
+            batch,
+            prefix_state,
+            pad_id=0,
+            signature_pad_id=0,
+        )
+
+        self.assertEqual(tuple(merged[7].shape), (1, 4, 12))
+        self.assertTrue(torch.allclose(merged[7][0, :2, :4], torch.zeros((2, 4), dtype=torch.float32)))
+        self.assertTrue(torch.allclose(merged[7][0, :2, 4:], torch.zeros((2, 8), dtype=torch.float32)))
+
+    def test_prepare_capacity_for_tokenizer_pregrows_registry(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = self._build_small_stability_cfg(tokenizer)
+        cfg.signature_vocab_size = 1
+        cfg.signature_level_vocab_size = 1
+        cfg.signature_relation_vocab_size = 1
+        cfg.signature_bucket_vocab_size = 1
+        model = PrismalWaveModel(cfg)
+        self.assertLess(model.registry.family_embedding.num_embeddings, tokenizer.signature_vocab_size)
+
+        model.prepare_capacity_for_tokenizer(tokenizer)
+        model.set_capacity_growth_locked(True)
+
+        self.assertGreaterEqual(model.registry.family_embedding.num_embeddings, tokenizer.signature_vocab_size)
+        self.assertGreaterEqual(model.registry.parent_embedding.num_embeddings, tokenizer.signature_vocab_size)
+        self.assertGreaterEqual(model.registry.level_embedding.num_embeddings, tokenizer.signature_level_vocab_size)
+        self.assertGreaterEqual(model.registry.relation_embedding.num_embeddings, tokenizer.signature_relation_vocab_size)
 
     def test_leaf_precision_mode_preserves_fp4(self) -> None:
         cfg = PrismalWaveConfig()
@@ -1287,6 +1554,123 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(top_b, 1)
         self.assertNotEqual(top_a, top_b)
 
+    def test_sparse_emitter_router_matches_dense_when_budget_covers_all_emitters(self) -> None:
+        tokenizer = PrismalTokenizer()
+        sparse_cfg = PrismalWaveConfig()
+        sparse_cfg.base_vocab_size = tokenizer.base_vocab_size
+        sparse_cfg.vocab_size = tokenizer.vocab_size
+        sparse_cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        sparse_cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        sparse_cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        sparse_cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        sparse_cfg.d_model = 8
+        sparse_cfg.ff_mult = 2
+        sparse_cfg.n_layers = 1
+        sparse_cfg.n_emitters = 4
+        sparse_cfg.n_slots = 4
+        sparse_cfg.n_paths = 1
+        sparse_cfg.top_k_emitters = 1
+        sparse_cfg.top_k_slots = 1
+        sparse_cfg.use_factorized_embedding = True
+        sparse_cfg.factorized_embedding_dim = 8
+        sparse_cfg.use_torus_core = False
+        sparse_cfg.Torus_SHARC_Router = False
+        sparse_cfg.use_hmote = False
+        sparse_cfg.use_recursive_hmoe = False
+        sparse_cfg.use_signature_lattice_attention = False
+        sparse_cfg.use_turbo_quantization = False
+        sparse_cfg.use_bitsandbytes_leaf_precision = False
+        sparse_cfg.use_speculative_decoding = False
+        sparse_cfg.use_gradient_checkpointing = False
+        sparse_cfg.dropout = 0.0
+        sparse_cfg.position_embedding_init_size = 32
+        sparse_cfg.torus_weight = 0.0
+        sparse_cfg.frequency_weight = 0.0
+        sparse_cfg.emitter_neighbor_weight = 0.0
+        sparse_cfg.emitter_hierarchy_score_weight = 1.0
+        sparse_cfg.use_sparse_emitter_routing = True
+        sparse_cfg.router_sparse_candidate_budget = 4
+
+        dense_cfg = PrismalWaveConfig.from_dict(sparse_cfg.to_dict())
+        dense_cfg.use_sparse_emitter_routing = False
+
+        sparse_model = PrismalWaveModel(sparse_cfg)
+        dense_model = PrismalWaveModel(dense_cfg)
+        dense_model.load_state_dict(sparse_model.state_dict(), strict=False)
+
+        hidden = torch.zeros(1, 1, sparse_cfg.d_model)
+        slots = torch.zeros(1, sparse_cfg.n_slots, sparse_cfg.d_model)
+        shared_ids = torch.zeros(1, 1, dtype=torch.long)
+        with torch.no_grad():
+            sparse_model.router.emitter_bank.zero_()
+            sparse_model.router.operator_hierarchy_bank.zero_()
+            sparse_model.router.operator_hierarchy_bank[0, 0] = 8.0
+            sparse_model.router.operator_hierarchy_bank[1, 1] = 8.0
+            sparse_model.router.operator_hierarchy_bank[2, 0] = -8.0
+            sparse_model.router.operator_hierarchy_bank[3, 1] = -8.0
+            sparse_model.router.emitter_phase.zero_()
+            sparse_model.router.emitter_frequency.fill_(1.0)
+            sparse_model.router.path_basis.zero_()
+            sparse_model.router.slot_seed.zero_()
+            sparse_model.router.signature_embedding.weight.zero_()
+            sparse_model.router.signature_embedding.weight[3, 0] = 8.0
+            sparse_model.router.signature_embedding.weight[4, 1] = 8.0
+            sparse_model.router.family_embedding.weight.zero_()
+            sparse_model.router.level_embedding.weight.zero_()
+            sparse_model.router.relation_embedding.weight.zero_()
+            sparse_model.router.parent_embedding.weight.zero_()
+            for module in (
+                sparse_model.router.query_proj,
+                sparse_model.router.value_proj,
+                sparse_model.router.signature_proj,
+                sparse_model.router.hierarchy_proj,
+                sparse_model.router.phase_proj,
+                sparse_model.router.frequency_proj,
+                sparse_model.router.route_gate,
+                sparse_model.router.out_proj,
+                sparse_model.router.slot_query,
+                sparse_model.router.slot_value,
+                sparse_model.router.path_coord_proj,
+            ):
+                weight = getattr(module, "weight", None)
+                bias = getattr(module, "bias", None)
+                if weight is not None:
+                    weight.zero_()
+                    if weight.ndim == 2 and weight.shape[0] == weight.shape[1]:
+                        weight.copy_(torch.eye(weight.shape[0]))
+                if bias is not None:
+                    bias.zero_()
+
+        dense_model.load_state_dict(sparse_model.state_dict(), strict=False)
+        sparse_model.eval()
+        dense_model.eval()
+
+        sparse_stats = sparse_model.router.route(
+            hidden,
+            slots,
+            signature_family_ids=shared_ids,
+            signature_ids=torch.tensor([[3]], dtype=torch.long),
+            signature_level_ids=shared_ids,
+            signature_relation_ids=shared_ids,
+            parent_signature_ids=shared_ids,
+            path_index=0,
+            layer_index=0,
+        )[2]
+        dense_stats = dense_model.router.route(
+            hidden,
+            slots,
+            signature_family_ids=shared_ids,
+            signature_ids=torch.tensor([[3]], dtype=torch.long),
+            signature_level_ids=shared_ids,
+            signature_relation_ids=shared_ids,
+            parent_signature_ids=shared_ids,
+            path_index=0,
+            layer_index=0,
+        )[2]
+
+        self.assertTrue(torch.equal(sparse_stats["emitter_top_idx"], dense_stats["emitter_top_idx"]))
+        self.assertEqual(tuple(sparse_stats["emitter_top_idx"].shape), tuple(dense_stats["emitter_top_idx"].shape))
+
     def test_emitter_router_casts_slot_cache_to_query_dtype(self) -> None:
         tokenizer = PrismalTokenizer()
         cfg = PrismalWaveConfig()
@@ -1538,6 +1922,9 @@ class SmokeTests(unittest.TestCase):
         repeated_score = float(copy_logits[0, repeated_token_id].item())
         unique_score = float(copy_logits[0, unique_token_id].item())
         self.assertGreater(repeated_score, unique_score)
+        self.assertGreater(float(attention._copy_confidence(torch.tensor([0.9, 0.1])).item()), 0.75)
+        self.assertLess(float(attention._copy_confidence(torch.tensor([0.2, 0.19])).item()), 0.75)
+        self.assertEqual(float(attention._copy_confidence(torch.tensor([0.42])).item()), 1.0)
 
         step_output = model.forward_incremental(
             input_ids[:, -1:],
@@ -1553,6 +1940,71 @@ class SmokeTests(unittest.TestCase):
         )
         self.assertEqual(step_output[0].shape[-1], cfg.vocab_size)
         self.assertIsNotNone(step_output[2].token_memory_state)
+
+    def test_token_memory_training_skips_copy_bias(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 32
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 8
+        cfg.n_slots = 8
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 2
+        cfg.top_k_slots = 2
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 16
+        cfg.use_torus_core = True
+        cfg.use_hmote = False
+        cfg.use_recursive_hmoe = False
+        cfg.use_signature_lattice_attention = False
+        cfg.use_path_logits = True
+        cfg.use_token_memory_cross_attention = True
+        cfg.use_token_memory_generation_cache = True
+        cfg.use_token_memory_copy_during_training = False
+        cfg.token_memory_window = 6
+        cfg.token_memory_top_k = 1
+        cfg.token_memory_weight = 0.5
+        cfg.token_memory_copy_bias = 1.0
+        cfg.token_memory_rare_token_cutoff = 2
+        cfg.profile_runtime = True
+        cfg.profile_vram = True
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 32
+
+        model = PrismalWaveModel(cfg)
+        model.train()
+
+        bundle = tokenizer.encode_hierarchy_bundle("alpha beta alpha gamma alpha", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        signature_ids = torch.tensor([bundle.signature_ids], dtype=torch.long)
+        signature_level_ids = torch.tensor([bundle.signature_level_ids], dtype=torch.long)
+        signature_relation_ids = torch.tensor([bundle.signature_relation_ids], dtype=torch.long)
+        parent_signature_ids = torch.tensor([bundle.parent_signature_ids], dtype=torch.long)
+        signature_family_ids = torch.tensor([bundle.signature_family_ids], dtype=torch.long)
+
+        output = model(
+            input_ids,
+            signature_family_ids=signature_family_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+        )
+
+        self.assertIsNone(output.token_memory_state)
+        self.assertEqual(float(output.route_stats["copy_attention_enabled"].item()), 0.0)
+        self.assertEqual(float(output.route_stats["copy_attention_candidate_count"].item()), 0.0)
 
     def test_torus_single_path_fast_path_matches_explicit_path_index(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -1866,6 +2318,179 @@ class SmokeTests(unittest.TestCase):
         self.assertIsNotNone(model.token_hierarchy)
         assert model.token_hierarchy is not None
         self.assertEqual(model.token_hierarchy.leaf_size, 6)
+
+    def test_hierarchy_embedding_accepts_bfloat16_and_float8_inputs(self) -> None:
+        tokenizer = PrismalTokenizer()
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 32
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 8
+        cfg.n_slots = 8
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 2
+        cfg.top_k_slots = 2
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 16
+        cfg.use_torus_core = False
+        cfg.Torus_SHARC_Router = False
+        cfg.use_hmote = False
+        cfg.use_recursive_hmoe = False
+        cfg.use_signature_lattice_attention = False
+        cfg.use_token_memory_cross_attention = False
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 32
+
+        model = PrismalWaveModel(cfg)
+        bundle = tokenizer.encode_hierarchy_bundle("Hello world.", add_special_tokens=True)
+        input_ids = torch.tensor([bundle.token_ids], dtype=torch.long)
+        hierarchy_vectors = torch.tensor([bundle.hierarchy_vectors], dtype=torch.float32)
+
+        bf16_context = model._hierarchy_embedding_context(
+            input_ids,
+            hierarchy_vectors=hierarchy_vectors.to(dtype=torch.bfloat16),
+        )
+        self.assertIsNotNone(bf16_context)
+        assert bf16_context is not None
+        self.assertEqual(tuple(bf16_context.shape[:2]), tuple(input_ids.shape))
+        self.assertEqual(bf16_context.dtype, torch.bfloat16)
+
+        if hasattr(torch, "float8_e4m3fn"):
+            try:
+                float8_vectors = hierarchy_vectors.to(dtype=torch.float8_e4m3fn)
+            except (TypeError, RuntimeError, ValueError):
+                self.skipTest("float8 hierarchy tensors are not supported in this PyTorch build")
+
+            float8_context = model._hierarchy_embedding_context(
+                input_ids,
+                hierarchy_vectors=float8_vectors,
+            )
+            self.assertIsNotNone(float8_context)
+            assert float8_context is not None
+            self.assertEqual(tuple(float8_context.shape[:2]), tuple(input_ids.shape))
+            self.assertNotEqual(float8_context.dtype, torch.float8_e4m3fn)
+
+    def test_hierarchy_vector_dtype_flows_through_dataloader(self) -> None:
+        tokenizer = PrismalTokenizer()
+        train_loader, _ = build_train_val_dataloaders(
+            ["Alpha beta gamma.", "Delta epsilon zeta."],
+            tokenizer,
+            seq_len=32,
+            batch_size=2,
+            val_fraction=0.5,
+            max_samples=0,
+            seed=7,
+            streaming=False,
+        )
+        batch = next(iter(train_loader))
+        if hasattr(torch, "float8_e4m3fn"):
+            self.assertEqual(batch[7].dtype, torch.float8_e4m3fn)
+        else:
+            self.assertEqual(batch[7].dtype, torch.float32)
+
+    def test_hierarchy_vector_low_rank_defaults_to_4d(self) -> None:
+        tokenizer = PrismalTokenizer()
+        bundle = tokenizer.encode_hierarchy_bundle("Hello world.", add_special_tokens=True)
+        self.assertEqual(len(bundle.hierarchy_vectors[0]), 4)
+
+    def test_hierarchy_vector_low_rank_can_be_disabled(self) -> None:
+        tokenizer = PrismalTokenizer(hierarchy_vector_low_rank_enabled=False)
+        bundle = tokenizer.encode_hierarchy_bundle("Hello world.", add_special_tokens=True)
+        self.assertEqual(len(bundle.hierarchy_vectors[0]), 12)
+
+    def test_hierarchy_vector_bfloat16_pretokenized_roundtrip(self) -> None:
+        tokenizer = PrismalTokenizer()
+        bundle = tokenizer.encode_hierarchy_bundle("Hello world.", add_special_tokens=True)
+        sample = WindowSample(
+            input_ids=torch.tensor(bundle.token_ids, dtype=torch.long),
+            labels=torch.tensor(bundle.token_ids, dtype=torch.long),
+            signature_ids=torch.tensor(bundle.signature_ids, dtype=torch.long),
+            signature_level_ids=torch.tensor(bundle.signature_level_ids, dtype=torch.long),
+            signature_relation_ids=torch.tensor(bundle.signature_relation_ids, dtype=torch.long),
+            parent_signature_ids=torch.tensor(bundle.parent_signature_ids, dtype=torch.long),
+            signature_family_ids=torch.tensor(bundle.signature_family_ids, dtype=torch.long),
+            hierarchy_vectors=torch.tensor(bundle.hierarchy_vectors, dtype=torch.bfloat16),
+            loss_mask=torch.ones(len(bundle.token_ids), dtype=torch.float32),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stream_pretokenized_windows([sample], tmpdir, seq_len=len(bundle.token_ids), hierarchy_vector_dtype="bfloat16")
+            dataset = MemmapTokenDataset(tmpdir)
+            loaded = dataset[0]
+            del dataset
+
+        self.assertEqual(loaded.hierarchy_vectors.dtype, torch.bfloat16)
+        self.assertEqual(tuple(loaded.hierarchy_vectors.shape), tuple(sample.hierarchy_vectors.shape))
+
+    def test_hierarchy_vector_float8_default_roundtrip(self) -> None:
+        if not hasattr(torch, "float8_e4m3fn"):
+            self.skipTest("float8 hierarchy tensors are not supported in this PyTorch build")
+        tokenizer = PrismalTokenizer()
+        bundle = tokenizer.encode_hierarchy_bundle("Hello world.", add_special_tokens=True)
+        sample = WindowSample(
+            input_ids=torch.tensor(bundle.token_ids, dtype=torch.long),
+            labels=torch.tensor(bundle.token_ids, dtype=torch.long),
+            signature_ids=torch.tensor(bundle.signature_ids, dtype=torch.long),
+            signature_level_ids=torch.tensor(bundle.signature_level_ids, dtype=torch.long),
+            signature_relation_ids=torch.tensor(bundle.signature_relation_ids, dtype=torch.long),
+            parent_signature_ids=torch.tensor(bundle.parent_signature_ids, dtype=torch.long),
+            signature_family_ids=torch.tensor(bundle.signature_family_ids, dtype=torch.long),
+            hierarchy_vectors=torch.tensor(bundle.hierarchy_vectors, dtype=torch.float8_e4m3fn),
+            loss_mask=torch.ones(len(bundle.token_ids), dtype=torch.float32),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stream_pretokenized_windows([sample], tmpdir, seq_len=len(bundle.token_ids))
+            dataset = MemmapTokenDataset(tmpdir)
+            loaded = dataset[0]
+            del dataset
+
+        self.assertEqual(loaded.hierarchy_vectors.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(loaded.hierarchy_vectors.shape), tuple(sample.hierarchy_vectors.shape))
+
+    def test_torchao_weight_only_linear_roundtrip(self) -> None:
+        cfg = QuantizationConfig(
+            use_torchao_weight_only=True,
+            torchao_weight_only_mode="auto",
+            torchao_weight_only_group_size=64,
+        )
+        layer = create_quantized_linear(256, 128, bias=True, quantization_config=cfg)
+        if getattr(layer, "_torchao_weight", None) is None:
+            self.skipTest("torchao weight-only backend is unavailable in this build")
+        x = torch.randn(3, 256)
+        y = layer(x)
+        clone = create_quantized_linear(256, 128, bias=True, quantization_config=cfg)
+        clone.load_state_dict(layer.state_dict())
+        self.assertIsNotNone(getattr(clone, "_torchao_weight", None))
+        y_clone = clone(x)
+        self.assertEqual(tuple(y.shape), tuple(y_clone.shape))
+        self.assertEqual(tuple(y.shape), (3, 128))
+
+    def test_torchao_weight_only_embedding_roundtrip(self) -> None:
+        cfg = QuantizationConfig(
+            use_torchao_embedding_weight_only=True,
+            torchao_embedding_group_size=32,
+            torchao_embedding_output_dtype="float32",
+        )
+        emb = create_quantized_embedding(256, 64, quantization_config=cfg)
+        if getattr(emb, "_torchao_embedding", None) is None:
+            self.skipTest("torchao embedding backend is unavailable in this build")
+        x = torch.randint(0, 256, (2, 3), dtype=torch.long)
+        y = emb(x)
+        clone = create_quantized_embedding(256, 64, quantization_config=cfg)
+        clone.load_state_dict(emb.state_dict())
+        self.assertIsNotNone(getattr(clone, "_torchao_embedding", None))
+        y_clone = clone(x)
+        self.assertEqual(tuple(y.shape), tuple(y_clone.shape))
+        self.assertEqual(tuple(y.shape), (2, 3, 64))
 
     def test_token_memory_disabled_shape_stability(self) -> None:
         tokenizer = PrismalTokenizer()

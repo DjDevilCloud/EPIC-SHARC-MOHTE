@@ -2081,6 +2081,9 @@ def train_model(
             torch.cuda.set_per_process_memory_fraction(0.95)
         except Exception:
             pass
+    tokenizer = getattr(runtime_model, "_prismal_tokenizer", None)
+    if isinstance(tokenizer, PrismalTokenizer) and hasattr(runtime_model, "prepare_capacity_for_tokenizer"):
+        runtime_model.prepare_capacity_for_tokenizer(tokenizer)
     optimizer = _build_optimizer(
         runtime_model,
         optimizer_name=optimizer_name_norm,
@@ -2134,7 +2137,6 @@ def train_model(
                 scaler.load_state_dict(resume_scaler_state)
             except Exception as exc:
                 print(f"[Prismal] scaler state restore skipped: {exc}", flush=True)
-    tokenizer = getattr(runtime_model, "_prismal_tokenizer", None)
     resume_fst_state = resume_state.get("fst_state") if isinstance(resume_state, dict) else None
     fast_context_state = _fast_context_state_from_config(
         runtime_model.cfg,
