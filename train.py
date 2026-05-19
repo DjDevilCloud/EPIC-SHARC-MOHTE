@@ -169,9 +169,11 @@ def _tokenizer_cache_key(
     max_source_samples: int,
     supervised_only: bool,
     use_pronunciation_signatures: bool,
+    hierarchy_vector_low_rank_enabled: bool,
+    hierarchy_vector_low_rank_dim: int,
 ) -> str:
     payload = {
-        "cache_version": 1,
+        "cache_version": 2,
         "base_tokenizer": base_tokenizer_fingerprint,
         "source": _tokenizer_source_fingerprint(source),
         "settings": {
@@ -183,6 +185,8 @@ def _tokenizer_cache_key(
             "max_source_samples": int(max_source_samples),
             "supervised_only": bool(supervised_only),
             "use_pronunciation_signatures": bool(use_pronunciation_signatures),
+            "hierarchy_vector_low_rank_enabled": bool(hierarchy_vector_low_rank_enabled),
+            "hierarchy_vector_low_rank_dim": int(hierarchy_vector_low_rank_dim),
         },
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -207,6 +211,8 @@ def _tokenizer_cache_path(
     max_source_samples: int,
     supervised_only: bool,
     use_pronunciation_signatures: bool,
+    hierarchy_vector_low_rank_enabled: bool,
+    hierarchy_vector_low_rank_dim: int,
 ) -> Path:
     cache_root = _tokenizer_cache_dir(cache_dir)
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -221,6 +227,8 @@ def _tokenizer_cache_path(
         max_source_samples=max_source_samples,
         supervised_only=supervised_only,
         use_pronunciation_signatures=use_pronunciation_signatures,
+        hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
     )
     name = Path(source).stem or "source"
     return cache_root / f"{name}_{digest}.json"
@@ -405,6 +413,21 @@ def _prepend_fast_context_prefix(
     prefix_parents = prefix_parents.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
     prefix_families = prefix_families.to(device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
     prefix_vectors = prefix_vectors.to(device=device, dtype=hierarchy_vectors.dtype).unsqueeze(0).expand(batch_size, -1, -1)
+    target_width = int(hierarchy_vectors.size(-1))
+    prefix_width = int(prefix_vectors.size(-1))
+    if prefix_width != target_width:
+        if prefix_width > target_width:
+            prefix_vectors = prefix_vectors[..., :target_width]
+        else:
+            pad_width = target_width - prefix_width
+            if pad_width > 0:
+                padding = torch.zeros(
+                    *prefix_vectors.shape[:-1],
+                    pad_width,
+                    device=device,
+                    dtype=prefix_vectors.dtype,
+                )
+                prefix_vectors = torch.cat([prefix_vectors, padding], dim=-1)
     prefix_loss_mask = torch.zeros((batch_size, prefix_len), device=device, dtype=loss_mask.dtype)
     return (
         torch.cat([prefix_input_ids, input_ids], dim=1),
@@ -771,11 +794,11 @@ def build_tokenizer_from_source(
         max_line_tokens=max_line_tokens,
         max_signature_tokens=max_signature_tokens,
         max_source_samples=max_source_samples,
-          supervised_only=supervised_only,
-          use_pronunciation_signatures=use_pronunciation_signatures,
-          hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
-          hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
-      )
+        supervised_only=supervised_only,
+        use_pronunciation_signatures=use_pronunciation_signatures,
+        hierarchy_vector_low_rank_enabled=hierarchy_vector_low_rank_enabled,
+        hierarchy_vector_low_rank_dim=hierarchy_vector_low_rank_dim,
+    )
     if cache_path.exists():
         try:
             cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -804,7 +827,7 @@ def build_tokenizer_from_source(
     )
     try:
         cache_payload = {
-            "cache_version": 1,
+            "cache_version": 2,
             "source": str(Path(source).resolve()),
             "base_tokenizer": base_fingerprint,
             "settings": {
@@ -813,12 +836,12 @@ def build_tokenizer_from_source(
                 "max_word_tokens": int(max_word_tokens),
                 "max_line_tokens": int(max_line_tokens),
                 "max_signature_tokens": int(max_signature_tokens),
-                  "max_source_samples": int(max_source_samples),
-                  "supervised_only": bool(supervised_only),
-                  "use_pronunciation_signatures": bool(use_pronunciation_signatures),
-                  "hierarchy_vector_low_rank_enabled": bool(hierarchy_vector_low_rank_enabled),
-                  "hierarchy_vector_low_rank_dim": int(hierarchy_vector_low_rank_dim),
-              },
+                "max_source_samples": int(max_source_samples),
+                "supervised_only": bool(supervised_only),
+                "use_pronunciation_signatures": bool(use_pronunciation_signatures),
+                "hierarchy_vector_low_rank_enabled": bool(hierarchy_vector_low_rank_enabled),
+                "hierarchy_vector_low_rank_dim": int(hierarchy_vector_low_rank_dim),
+            },
             "tokenizer_state": tokenizer.to_state_dict(),
         }
         cache_path.write_text(json.dumps(cache_payload, indent=2, sort_keys=True), encoding="utf-8")
