@@ -302,11 +302,20 @@ def _fast_context_bundle_from_text(
     *,
     hierarchy_vector_dtype: object = "float8_e4m3fn",
 ) -> Optional[Dict[str, torch.Tensor]]:
+    """Build a content-only FST prefix (no outer BOS / EOI / BOO generation scaffold).
+
+    Training windows already carry their own span protocol. Prepending a full
+    ``prepare_generation_hierarchy`` bundle previously produced
+    ``… EOI BOO BOS BOI …``, which corrupts span placement.
+    """
+
     prompt_text = _normalize_fast_context_text(prompt_text)
     if not prompt_text:
         return None
     hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
-    bundle = tokenizer.prepare_generation_hierarchy(prompt_text)
+    bundle = tokenizer.encode_hierarchy_bundle(prompt_text, add_special_tokens=False)
+    if not bundle.token_ids:
+        return None
     return {
         "input_ids": torch.tensor(bundle.token_ids, dtype=torch.long),
         "signature_ids": torch.tensor(bundle.signature_ids, dtype=torch.long),
@@ -354,7 +363,7 @@ def _fast_context_state_from_config(
                 hierarchy_vector_dtype=getattr(cfg, "hierarchy_vector_dtype", "float8_e4m3fn"),
             )
     state["enabled"] = bool(getattr(cfg, "use_fst", True))
-    state["use_training_prefix"] = bool(getattr(cfg, "fst_use_training_prefix", True))
+    state["use_training_prefix"] = bool(getattr(cfg, "fst_use_training_prefix", False))
     state["use_generation_prefix"] = bool(getattr(cfg, "fst_use_generation_prefix", True))
     state["refresh_interval"] = refresh_interval
     state["max_prompt_chars"] = max_prompt_chars

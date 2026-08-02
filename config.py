@@ -299,7 +299,9 @@ class PrismalWaveConfig:
     )
     fst_refresh_interval: int = 32
     fst_max_prompt_chars: int = 512
-    fst_use_training_prefix: bool = True
+    # Disabled by default: generation-hierarchy prefixes inject BOO+BOS into train windows.
+    # Re-enable only with a content-only prefix bundle (see train._fast_context_bundle_from_text).
+    fst_use_training_prefix: bool = False
     fst_use_generation_prefix: bool = True
     speculative_draft_tokens: int = 2
     speculative_temperature: float = 0.01

@@ -7241,6 +7241,69 @@ class PrismalWaveModel(nn.Module):
                 blocked[:, token_id] = 0.0
         return logits + blocked
 
+    def _clone_token_memory_state(self, state: Optional[TokenMemoryState]) -> Optional[TokenMemoryState]:
+        """Deep-clone token-memory tensors so prefill/append cannot mutate a force rail."""
+
+        if state is None:
+            return None
+        return TokenMemoryState(
+            token_ids=state.token_ids.detach().clone(),
+            memory_keys=state.memory_keys.detach().clone(),
+            memory_values=state.memory_values.detach().clone(),
+            family_ids=state.family_ids.detach().clone(),
+            signature_ids=state.signature_ids.detach().clone(),
+            level_ids=state.level_ids.detach().clone(),
+            relation_ids=state.relation_ids.detach().clone(),
+            parent_ids=state.parent_ids.detach().clone(),
+            token_counts=state.token_counts.detach().clone(),
+            write_pos=state.write_pos.detach().clone(),
+            lengths=state.lengths.detach().clone(),
+            anchor_token_ids=state.anchor_token_ids.detach().clone(),
+            anchor_span_ids=state.anchor_span_ids.detach().clone(),
+            anchor_offsets=state.anchor_offsets.detach().clone(),
+            anchor_lengths=state.anchor_lengths.detach().clone(),
+            anchor_tags=state.anchor_tags.detach().clone(),
+            anchor_flags=state.anchor_flags.detach().clone(),
+            anchor_span_starts=state.anchor_span_starts.detach().clone(),
+            anchor_cursor_pos=state.anchor_cursor_pos.detach().clone(),
+            anchor_cursor_span_id=state.anchor_cursor_span_id.detach().clone(),
+            anchor_cursor_offset=state.anchor_cursor_offset.detach().clone(),
+            anchor_cursor_length=state.anchor_cursor_length.detach().clone(),
+            anchor_cursor_tag=state.anchor_cursor_tag.detach().clone(),
+            anchor_cursor_active=state.anchor_cursor_active.detach().clone(),
+        )
+
+    def _snapshot_anchor_force_rail(self, state: Optional[TokenMemoryState]) -> Optional[TokenMemoryState]:
+        """Capture an active force-rail before prefill mutates the shared memory ring."""
+
+        if state is None:
+            return None
+        active = state.anchor_cursor_active
+        if active is None or active.numel() == 0 or not bool(active.any().item()):
+            return None
+        return self._clone_token_memory_state(state)
+
+    def _ordered_anchor_token_ids(
+        self,
+        token_memory_state: TokenMemoryState,
+        batch_idx: int,
+        length: int,
+    ) -> torch.Tensor:
+        """Return ordered anchor tokens for force-copy.
+
+        Prefers ``TokenMemoryCrossAttention`` ring ordering when available; falls
+        back to a linear prefix so force rails still work without the module.
+        """
+
+        length = max(0, int(length))
+        attn = self.token_memory_attention
+        if attn is not None and hasattr(attn, "_ordered_anchor_view"):
+            ordered = attn._ordered_anchor_view(token_memory_state, batch_idx, length)[0]
+            return ordered
+        if length <= 0:
+            return token_memory_state.anchor_token_ids.new_zeros((0,), dtype=torch.long)
+        return token_memory_state.anchor_token_ids[batch_idx, :length]
+
     def _token_memory_anchor_next_ids(
         self,
         token_memory_state: Optional[TokenMemoryState],
@@ -7261,7 +7324,7 @@ class PrismalWaveModel(nn.Module):
             pos = int(token_memory_state.anchor_cursor_pos[batch_idx].item())
             if pos < 0 or pos >= length:
                 continue
-            ordered_token_ids = self._ordered_anchor_view(token_memory_state, batch_idx, length)[0]
+            ordered_token_ids = self._ordered_anchor_token_ids(token_memory_state, batch_idx, length)
             if pos >= ordered_token_ids.size(0):
                 continue
             next_ids[batch_idx, 0] = ordered_token_ids[pos]
@@ -7301,7 +7364,7 @@ class PrismalWaveModel(nn.Module):
                 cursor_length[batch_idx] = 0
                 cursor_tag[batch_idx] = 0
                 continue
-            ordered_token_ids = self._ordered_anchor_view(token_memory_state, batch_idx, length)[0]
+            ordered_token_ids = self._ordered_anchor_token_ids(token_memory_state, batch_idx, length)
             if pos >= ordered_token_ids.size(0):
                 cursor_active[batch_idx] = False
                 cursor_pos[batch_idx] = -1
@@ -7323,7 +7386,7 @@ class PrismalWaveModel(nn.Module):
             next_offset = int(cursor_offset[batch_idx].item()) + 1
             next_pos = pos + 1
             span_len = int(cursor_length[batch_idx].item())
-            if next_offset >= span_len or next_pos >= token_ids.size(1):
+            if next_offset >= span_len or next_pos >= ordered_token_ids.size(0):
                 cursor_active[batch_idx] = False
                 cursor_pos[batch_idx] = -1
                 cursor_span_id[batch_idx] = 0
@@ -9817,7 +9880,8 @@ class PrismalWaveModel(nn.Module):
         generated_relations = signature_relation_ids.clone() if signature_relation_ids is not None else torch.zeros_like(generated)
         generated_parents = parent_signature_ids.clone() if parent_signature_ids is not None else generated_signatures.clone()
         carried_token_memory_state = token_memory_state
-        anchor_token_memory_state = token_memory_state
+        # Detach force-rail from the ring state that probe/prefill will mutate in place.
+        prompt_anchor_state = self._snapshot_anchor_force_rail(token_memory_state)
         min_new_tokens = max(0, int(min_new_tokens))
         top_p = float(max(0.0, min(1.0, top_p)))
 
@@ -9839,7 +9903,6 @@ class PrismalWaveModel(nn.Module):
         if base_slots is None:
             base_slots = self.router.init_slots(generated.size(0), generated.device)
         prompt_logits = probe_output.logits[:, -1, :]
-        prompt_anchor_state = token_memory_state
 
         beams = [
             {
@@ -9941,6 +10004,7 @@ class PrismalWaveModel(nn.Module):
                                 logits = torch.full_like(logits, float("-inf"))
                                 logits.scatter_(1, sorted_idx, sorted_logits)
                             logits, _ = self._sanitize_sampling_logits(logits)
+                            logits, anchor_forced = _force_anchor_logits(logits, beam.get("anchor_state"))
                             log_probs = F.log_softmax(logits, dim=-1)
                             candidate_k = 1 if anchor_forced else min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
                             top_log_probs, top_token_ids = torch.topk(log_probs, k=candidate_k, dim=-1)
@@ -9968,7 +10032,12 @@ class PrismalWaveModel(nn.Module):
                                 new_relations = torch.cat([beam["relations"], next_relation], dim=-1)
                                 new_parents = torch.cat([beam["parents"], next_parent], dim=-1)
                                 finished = bool(step_idx + 1 >= min_new_tokens and torch.all(next_id.squeeze(-1) == self.cfg.eos_id))
-                                next_memory_state = self._advance_token_memory_anchor_state(beam.get("anchor_state"), next_id)
+                                next_anchor_state = self._advance_token_memory_anchor_state(beam.get("anchor_state"), next_id)
+                                attention_memory_state = (
+                                    output.token_memory_state
+                                    if getattr(output, "token_memory_state", None) is not None
+                                    else beam.get("memory_state")
+                                )
                                 candidates.append(
                                     {
                                         "generated": new_generated,
@@ -9979,14 +10048,15 @@ class PrismalWaveModel(nn.Module):
                                         "parents": new_parents,
                                         "slots": next_slots,
                                         "lattice_state": output.signature_lattice_state,
-                                        "memory_state": next_memory_state if next_memory_state is not None else output.token_memory_state,
+                                        "memory_state": attention_memory_state,
+                                        "anchor_state": next_anchor_state if next_anchor_state is not None else beam.get("anchor_state"),
                                         "score": float(beam["score"]) + next_logprob + self.cfg.beam_signature_weight * quality,
                                         "finished": finished,
                                         "prefill_done": True,
                                         "prompt_logits": beam["prompt_logits"],
                                         "committed_path_index": next_committed_path_index,
                                     }
-                            )
+                                )
                             continue
                     if step_idx > 0 and step_idx % relay_interval == 0:
                         output = self.forward(
@@ -10060,6 +10130,8 @@ class PrismalWaveModel(nn.Module):
                     logits = torch.full_like(logits, float("-inf"))
                     logits.scatter_(1, sorted_idx, sorted_logits)
                 logits, _ = self._sanitize_sampling_logits(logits)
+                # Re-apply force after filters so safety masks cannot override an active rail.
+                logits, anchor_forced = _force_anchor_logits(logits, beam.get("anchor_state"))
                 log_probs = F.log_softmax(logits, dim=-1)
                 candidate_k = 1 if anchor_forced else min(max(beam_size * 2, top_k if top_k > 0 else beam_size), log_probs.size(-1))
                 top_log_probs, top_token_ids = torch.topk(log_probs, k=candidate_k, dim=-1)
@@ -10088,7 +10160,11 @@ class PrismalWaveModel(nn.Module):
                     new_parents = torch.cat([beam["parents"], next_parent], dim=-1)
                     finished = bool(step_idx + 1 >= min_new_tokens and torch.all(next_id.squeeze(-1) == self.cfg.eos_id))
                     next_anchor_state = self._advance_token_memory_anchor_state(beam.get("anchor_state"), next_id)
-                    next_memory_state = self._advance_token_memory_anchor_state(beam.get("anchor_state"), next_id)
+                    attention_memory_state = (
+                        output.token_memory_state
+                        if getattr(output, "token_memory_state", None) is not None
+                        else beam.get("memory_state")
+                    )
                     candidates.append(
                         {
                             "generated": new_generated,
@@ -10099,7 +10175,7 @@ class PrismalWaveModel(nn.Module):
                             "parents": new_parents,
                             "slots": next_slots,
                             "lattice_state": output.signature_lattice_state,
-                            "memory_state": next_memory_state if next_memory_state is not None else output.token_memory_state,
+                            "memory_state": attention_memory_state,
                             "anchor_state": next_anchor_state if next_anchor_state is not None else beam.get("anchor_state"),
                             "score": float(beam["score"]) + next_logprob + self.cfg.beam_signature_weight * quality,
                             "finished": finished,
@@ -10820,7 +10896,9 @@ class PrismalWaveModel(nn.Module):
         carried_slots = slot_state
         carried_lattice_state = signature_lattice_state
         carried_token_memory_state = token_memory_state
-        anchor_token_memory_state = token_memory_state
+        # Force-rail must be snapshotted before prefill: ring appends share tensors and
+        # will deactivate/overwrite the cursor when the prompt is longer than the window.
+        anchor_token_memory_state = self._snapshot_anchor_force_rail(token_memory_state)
         committed_path_index: Optional[int] = None
         min_new_tokens = max(0, int(min_new_tokens))
         top_p = float(max(0.0, min(1.0, top_p)))

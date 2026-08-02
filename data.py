@@ -33,6 +33,9 @@ except Exception:  # pragma: no cover - optional dependency
 
 WORD_RE = re.compile(r"[A-Za-z0-9_']+|[^\w\s]", re.UNICODE)
 SEGMENT_RE = re.compile(r"[A-Za-z0-9_']+|\s+|[^\w\s]", re.UNICODE)
+STRUCTURE_MARKER_RE = re.compile(
+    r"(<BOI>|<EOI>|<BOO>|<EOO>|<BOP>|<EOP>|<BLO>|<LINE>|<EOL>|<CAP>|<UPPER>|<SIG:OTHER>)"
+)
 ANSWER_MARKER_RE = re.compile(
     r'(?:"?(?:response|answer|output|completion|target)"?\s*:\s*)',
     re.IGNORECASE,
@@ -41,6 +44,23 @@ CONTROL_LINE_RE = re.compile(
     r"^(instruction|context|prompt|input|question|response|answer|output|completion|target|text)\s*:",
     re.IGNORECASE,
 )
+STRUCTURE_MARKER_TEXTS = frozenset(
+    {
+        "<BOI>",
+        "<EOI>",
+        "<BOO>",
+        "<EOO>",
+        "<BOP>",
+        "<EOP>",
+        "<BLO>",
+        "<LINE>",
+        "<EOL>",
+        "<CAP>",
+        "<UPPER>",
+        "<SIG:OTHER>",
+    }
+)
+BOUNDARY_MARKER_TEXTS = frozenset({"<BOI>", "<EOI>", "<BOO>", "<EOO>", "<BOP>", "<EOP>"})
 MAX_DYNAMIC_LINE_TOKEN_CHARS = 240
 CONTROL_TOKEN_TEXTS = {
     "instruction",
@@ -1179,7 +1199,8 @@ class PrismalTokenizer:
             "<BOP>": add_unit("<BOP>", "structure", render="", signature="boundary"),
             "<EOP>": add_unit("<EOP>", "structure", render="", signature="boundary"),
             "<BLO>": add_unit("<BLO>", "structure", render="", signature="line"),
-            "<LINE>": add_unit("<LINE>", "structure", render="\n", signature="line"),
+            # LINE is a structural open marker (no text). EOL is the sole newline emitter.
+            "<LINE>": add_unit("<LINE>", "structure", render="", signature="line"),
             "<EOL>": add_unit("<EOL>", "structure", render="\n", signature="newline"),
             "<SPACE>": add_unit("<SPACE>", "space", render=" ", signature="<SPACE>"),
             "<TAB>": add_unit("<TAB>", "space", render="\t", signature="<SPACE>"),
@@ -1972,39 +1993,90 @@ class PrismalTokenizer:
             )
         return token_ids, signature_ids, signature_level_ids, signature_relation_ids, parent_signature_ids, signature_family_ids
 
-    def encode_hierarchy_bundle(self, text: str, add_special_tokens: bool = True, span_role: str = "input") -> HierarchyEncoding:
-        token_ids: List[int] = []
-        signature_ids: List[int] = []
-        signature_level_ids: List[int] = []
-        signature_relation_ids: List[int] = []
-        parent_signature_ids: List[int] = []
-        signature_family_ids: List[int] = []
-        span_role = "output" if str(span_role).lower() == "output" else "input"
+    def _structure_marker_signature_id(self, marker: str) -> int:
+        mapping = {
+            "<BOI>": self.signature_boi_id,
+            "<EOI>": self.signature_eoi_id,
+            "<BOO>": self.signature_boo_id,
+            "<EOO>": self.signature_eoo_id,
+            "<BOP>": self.signature_bop_id,
+            "<EOP>": self.signature_eop_id,
+            "<BLO>": self.signature_blo_id,
+        }
+        if marker in mapping:
+            return int(mapping[marker])
+        if marker in {"<LINE>", "<EOL>"}:
+            return int(self.signature_blo_id)
+        unit_id = self.special_tokens.get(marker)
+        if unit_id is not None:
+            unit = self.construction_units[unit_id]
+            return int(self.signature_id_for_code(unit.signature or marker))
+        return int(self.signature_special_ids.get("<OTHER>", 0))
 
-        if add_special_tokens:
-            token_ids.append(self.bos_id)
-            signature_ids.append(self.signature_bos_id)
-            signature_level_ids.append(self.signature_level_to_id["special"])
-            signature_relation_ids.append(self.signature_relation_to_id["special"])
-            parent_signature_ids.append(self.signature_bos_id)
-            signature_family_ids.append(self.signature_family_to_id["special"])
+    def _structure_marker_family_id(self, marker: str) -> int:
+        if marker in BOUNDARY_MARKER_TEXTS:
+            return int(self.signature_family_to_id.get("boundary", self.signature_family_to_id.get("special", 0)))
+        if marker in {"<BLO>", "<LINE>", "<EOL>"}:
+            return int(self.signature_family_to_id.get("line", self.signature_family_to_id.get("special", 0)))
+        if marker in {"<CAP>", "<UPPER>"}:
+            return int(self.signature_family_to_id.get("special", 0))
+        return int(self.signature_family_to_id.get("special", 0))
 
-            start_text = "<BOO>" if span_role == "output" else "<BOI>"
-            start_sig = self.signature_boo_id if span_role == "output" else self.signature_boi_id
-            if start_text in self.special_tokens:
-                token_ids.append(self.special_tokens[start_text])
-                signature_ids.append(start_sig)
-                signature_level_ids.append(self.signature_level_to_id["special"])
-                signature_relation_ids.append(self.signature_relation_to_id["special"])
-                parent_signature_ids.append(start_sig)
-                signature_family_ids.append(self.signature_family_to_id["boundary"])
+    def _append_structure_marker_frame(
+        self,
+        marker: str,
+        *,
+        token_ids: List[int],
+        signature_ids: List[int],
+        signature_level_ids: List[int],
+        signature_relation_ids: List[int],
+        parent_signature_ids: List[int],
+        signature_family_ids: List[int],
+    ) -> bool:
+        token_id = self.special_tokens.get(marker)
+        if token_id is None:
+            return False
+        sig_id = self._structure_marker_signature_id(marker)
+        level_key = "line" if marker in {"<LINE>", "<EOL>"} else "special"
+        token_ids.append(int(token_id))
+        signature_ids.append(sig_id)
+        signature_level_ids.append(self.signature_level_to_id[level_key])
+        signature_relation_ids.append(self.signature_relation_to_id["special" if marker not in {"<LINE>", "<EOL>"} else "containment"])
+        parent_signature_ids.append(sig_id)
+        signature_family_ids.append(self._structure_marker_family_id(marker))
+        return True
 
+    def _encode_plain_lines_into(
+        self,
+        text: str,
+        *,
+        token_ids: List[int],
+        signature_ids: List[int],
+        signature_level_ids: List[int],
+        signature_relation_ids: List[int],
+        parent_signature_ids: List[int],
+        signature_family_ids: List[int],
+    ) -> None:
+        if not text:
+            return
         lines = text.splitlines(keepends=True) or [text]
         for raw_line in lines:
             line = raw_line.rstrip("\n")
             if not (line or raw_line.endswith("\n")):
                 continue
-            if not line.strip():
+            stripped = line.strip()
+            if stripped in STRUCTURE_MARKER_TEXTS and stripped in self.special_tokens:
+                self._append_structure_marker_frame(
+                    stripped,
+                    token_ids=token_ids,
+                    signature_ids=signature_ids,
+                    signature_level_ids=signature_level_ids,
+                    signature_relation_ids=signature_relation_ids,
+                    parent_signature_ids=parent_signature_ids,
+                    signature_family_ids=signature_family_ids,
+                )
+                continue
+            if not stripped:
                 blo_token = self.special_tokens.get("<BLO>")
                 if blo_token is not None:
                     token_ids.append(blo_token)
@@ -2056,7 +2128,9 @@ class PrismalTokenizer:
                     signature_level_ids.append(level_id)
                     signature_relation_ids.append(relation_id)
                     parent_signature_ids.append(parent_id)
-                    signature_family_ids.append(self.signature_family_id_for_code(self._signature_id_to_code.get(sig_piece, line_code)))
+                    signature_family_ids.append(
+                        self.signature_family_id_for_code(self._signature_id_to_code.get(sig_piece, line_code))
+                    )
 
             token_ids.append(self.special_tokens["<EOL>"])
             signature_ids.append(line_sig_id)
@@ -2065,7 +2139,107 @@ class PrismalTokenizer:
             parent_signature_ids.append(line_sig_id)
             signature_family_ids.append(self.signature_family_id_for_code(line_code))
 
-        if add_special_tokens:
+    def _encode_structure_aware_body(
+        self,
+        text: str,
+        *,
+        token_ids: List[int],
+        signature_ids: List[int],
+        signature_level_ids: List[int],
+        signature_relation_ids: List[int],
+        parent_signature_ids: List[int],
+        signature_family_ids: List[int],
+    ) -> None:
+        """Encode text, promoting atomic structure markers to special token IDs."""
+
+        if not text:
+            return
+        if not STRUCTURE_MARKER_RE.search(text):
+            self._encode_plain_lines_into(
+                text,
+                token_ids=token_ids,
+                signature_ids=signature_ids,
+                signature_level_ids=signature_level_ids,
+                signature_relation_ids=signature_relation_ids,
+                parent_signature_ids=parent_signature_ids,
+                signature_family_ids=signature_family_ids,
+            )
+            return
+
+        parts = STRUCTURE_MARKER_RE.split(text)
+        for part in parts:
+            if not part:
+                continue
+            if part in STRUCTURE_MARKER_TEXTS:
+                self._append_structure_marker_frame(
+                    part,
+                    token_ids=token_ids,
+                    signature_ids=signature_ids,
+                    signature_level_ids=signature_level_ids,
+                    signature_relation_ids=signature_relation_ids,
+                    parent_signature_ids=parent_signature_ids,
+                    signature_family_ids=signature_family_ids,
+                )
+                continue
+            self._encode_plain_lines_into(
+                part,
+                token_ids=token_ids,
+                signature_ids=signature_ids,
+                signature_level_ids=signature_level_ids,
+                signature_relation_ids=signature_relation_ids,
+                parent_signature_ids=parent_signature_ids,
+                signature_family_ids=signature_family_ids,
+            )
+
+    def encode_hierarchy_bundle(self, text: str, add_special_tokens: bool = True, span_role: str = "input") -> HierarchyEncoding:
+        token_ids: List[int] = []
+        signature_ids: List[int] = []
+        signature_level_ids: List[int] = []
+        signature_relation_ids: List[int] = []
+        parent_signature_ids: List[int] = []
+        signature_family_ids: List[int] = []
+        span_role = "output" if str(span_role).lower() == "output" else "input"
+
+        # When the payload already carries explicit span markers, do not wrap again.
+        text_has_span_markers = any(marker in text for marker in ("<BOI>", "<EOI>", "<BOO>", "<EOO>"))
+        wrap_specials = bool(add_special_tokens) and not text_has_span_markers
+
+        if wrap_specials:
+            token_ids.append(self.bos_id)
+            signature_ids.append(self.signature_bos_id)
+            signature_level_ids.append(self.signature_level_to_id["special"])
+            signature_relation_ids.append(self.signature_relation_to_id["special"])
+            parent_signature_ids.append(self.signature_bos_id)
+            signature_family_ids.append(self.signature_family_to_id["special"])
+
+            start_text = "<BOO>" if span_role == "output" else "<BOI>"
+            start_sig = self.signature_boo_id if span_role == "output" else self.signature_boi_id
+            if start_text in self.special_tokens:
+                token_ids.append(self.special_tokens[start_text])
+                signature_ids.append(start_sig)
+                signature_level_ids.append(self.signature_level_to_id["special"])
+                signature_relation_ids.append(self.signature_relation_to_id["special"])
+                parent_signature_ids.append(start_sig)
+                signature_family_ids.append(self.signature_family_to_id["boundary"])
+        elif add_special_tokens and text_has_span_markers:
+            token_ids.append(self.bos_id)
+            signature_ids.append(self.signature_bos_id)
+            signature_level_ids.append(self.signature_level_to_id["special"])
+            signature_relation_ids.append(self.signature_relation_to_id["special"])
+            parent_signature_ids.append(self.signature_bos_id)
+            signature_family_ids.append(self.signature_family_to_id["special"])
+
+        self._encode_structure_aware_body(
+            text,
+            token_ids=token_ids,
+            signature_ids=signature_ids,
+            signature_level_ids=signature_level_ids,
+            signature_relation_ids=signature_relation_ids,
+            parent_signature_ids=parent_signature_ids,
+            signature_family_ids=signature_family_ids,
+        )
+
+        if wrap_specials:
             end_text = "<EOO>" if span_role == "output" else "<EOI>"
             end_sig = self.signature_eoo_id if span_role == "output" else self.signature_eoi_id
             if end_text in self.special_tokens:
@@ -2076,6 +2250,13 @@ class PrismalTokenizer:
                 parent_signature_ids.append(end_sig)
                 signature_family_ids.append(self.signature_family_to_id["boundary"])
 
+            token_ids.append(self.eos_id)
+            signature_ids.append(self.signature_eos_id)
+            signature_level_ids.append(self.signature_level_to_id["special"])
+            signature_relation_ids.append(self.signature_relation_to_id["special"])
+            parent_signature_ids.append(self.signature_eos_id)
+            signature_family_ids.append(self.signature_family_to_id["special"])
+        elif add_special_tokens and text_has_span_markers:
             token_ids.append(self.eos_id)
             signature_ids.append(self.signature_eos_id)
             signature_level_ids.append(self.signature_level_to_id["special"])
@@ -2436,9 +2617,14 @@ class PrismalTokenizer:
                 if unit.text == "<BLO>":
                     parts.append("\n\n")
                     continue
-                if unit.text in {"<BOO>", "<EOO>", "<BOP>", "<EOP>", "<CAP>", "<UPPER>", "<SIG:OTHER>"}:
+                if unit.text == "<EOL>":
+                    parts.append("\n")
                     continue
-                render = getattr(unit, "render", "") or getattr(unit, "text", "")
+                if unit.text in {"<BOI>", "<EOI>", "<BOO>", "<EOO>", "<BOP>", "<EOP>", "<LINE>", "<CAP>", "<UPPER>", "<SIG:OTHER>"}:
+                    continue
+                render = getattr(unit, "render", None)
+                if render is None:
+                    render = getattr(unit, "text", "")
                 if render:
                     parts.append(render)
                 continue
@@ -2476,6 +2662,10 @@ class PrismalTokenizer:
                 unit = self.construction_units[token_id]
                 if unit.text == "<BLO>":
                     parts.append("\n\n")
+                elif unit.text == "<EOL>":
+                    parts.append("\n")
+                elif unit.text in {"<BOI>", "<EOI>", "<BOO>", "<EOO>", "<BOP>", "<EOP>", "<LINE>", "<CAP>", "<UPPER>", "<SIG:OTHER>"}:
+                    continue
                 else:
                     parts.append(unit.render)
             else:
@@ -2494,6 +2684,16 @@ class PrismalTokenizer:
         for unit in self.construction_units:
             if unit.kind == "byte":
                 unit.render = unit.text
+            elif unit.kind in {"structure", "special", "case", "signature"}:
+                # Preserve intentional empty renders (e.g. <LINE>, boundaries, case markers).
+                if unit.text == "<EOL>":
+                    unit.render = "\n"
+                elif unit.text == "<BLO>":
+                    unit.render = ""
+                elif unit.text == "<LINE>":
+                    unit.render = ""
+                elif getattr(unit, "render", None) is None:
+                    unit.render = ""
             elif not getattr(unit, "render", ""):
                 unit.render = unit.text
             if not getattr(unit, "pronunciation", "") and unit.kind in {"word", "phrase", "piece"} and unit.text:
@@ -3004,8 +3204,10 @@ class PrismalTokenizer:
     def generation_suppressed_token_ids(self) -> List[int]:
         suppressed = [self.pad_id, self.bos_id]
         allowed_punct = {".", ",", "?", "!", ":", ";", "'", '"', "-", "_", "(", ")"}
+        # <EOL> is the sole newline emission path at generation time (LINE stays contextual).
+        emit_allowed_structure = {"<BLO>", "<EOL>"}
         for unit_id, unit in enumerate(self.construction_units):
-            if unit.text == "<BLO>":
+            if unit.text in emit_allowed_structure:
                 continue
             if unit.kind in {"special", "structure", "signature", "byte"} and unit_id != self.eos_id:
                 suppressed.append(unit_id)
@@ -3073,34 +3275,161 @@ def _find_answer_start(text: str) -> int | None:
     return start
 
 
+def _unsupervised_structure_token_ids(tokenizer: PrismalTokenizer) -> set[int]:
+    return {
+        token_id
+        for token_id in {
+            tokenizer.special_tokens.get("<BOI>"),
+            tokenizer.special_tokens.get("<EOI>"),
+            tokenizer.special_tokens.get("<BOO>"),
+            tokenizer.special_tokens.get("<EOO>"),
+            tokenizer.special_tokens.get("<BOP>"),
+            tokenizer.special_tokens.get("<EOP>"),
+            tokenizer.special_tokens.get("<BLO>"),
+            tokenizer.special_tokens.get("<LINE>"),
+            tokenizer.special_tokens.get("<EOL>"),
+            tokenizer.special_tokens.get("<SIG:OTHER>"),
+        }
+        if token_id is not None
+    }
+
+
 def _build_loss_mask(tokenizer: PrismalTokenizer, text: str, encoded_tokens: Sequence[int]) -> List[float]:
+    """Build a per-token supervision mask aligned to ``encoded_tokens``.
+
+    Preferred policy: supervise only inside an output span opened by ``<BOO>``
+    and closed by ``<EOO>`` (structure specials themselves stay unsupervised).
+    Fallback: answer-marker text heuristic for free-form corpora without BOO.
+    """
+
+    if not encoded_tokens:
+        return []
+
+    boo_id = tokenizer.special_tokens.get("<BOO>")
+    eoo_id = tokenizer.special_tokens.get("<EOO>")
+    if boo_id is not None and any(int(token_id) == int(boo_id) for token_id in encoded_tokens):
+        mask: List[float] = []
+        in_output = False
+        for token_id in encoded_tokens:
+            token_id = int(token_id)
+            if token_id == int(boo_id):
+                in_output = True
+                mask.append(0.0)
+                continue
+            if eoo_id is not None and token_id == int(eoo_id):
+                in_output = False
+                mask.append(0.0)
+                continue
+            mask.append(1.0 if in_output else 0.0)
+        return mask
+
     answer_start = _find_answer_start(text)
     if answer_start is None:
         return [1.0] * len(encoded_tokens)
 
     prefix_text = text[:answer_start]
     prefix_bundle = tokenizer.encode_hierarchy_bundle(prefix_text, add_special_tokens=False)
-    prefix_bundle = prefix_bundle.trim_trailing_tokens(
-        {
-            token_id
-            for token_id in {
-                tokenizer.special_tokens.get("<BOI>"),
-                tokenizer.special_tokens.get("<EOI>"),
-                tokenizer.special_tokens.get("<BOO>"),
-                tokenizer.special_tokens.get("<EOO>"),
-                tokenizer.special_tokens.get("<BOP>"),
-                tokenizer.special_tokens.get("<EOP>"),
-                tokenizer.special_tokens.get("<BLO>"),
-                tokenizer.special_tokens.get("<EOL>"),
-                tokenizer.special_tokens.get("<LINE>"),
-            }
-            if token_id is not None
-        }
-    )
+    prefix_bundle = prefix_bundle.trim_trailing_tokens(_unsupervised_structure_token_ids(tokenizer))
     prefix_len = min(len(prefix_bundle.token_ids), len(encoded_tokens))
     if prefix_len <= 0 or prefix_len >= len(encoded_tokens):
         return [1.0] * len(encoded_tokens)
     return [0.0] * prefix_len + [1.0] * (len(encoded_tokens) - prefix_len)
+
+
+def _append_boundary_frame(
+    tokenizer: PrismalTokenizer,
+    marker: str,
+    *,
+    encoded: List[int],
+    encoded_signatures: List[int],
+    encoded_levels: List[int],
+    encoded_relations: List[int],
+    encoded_parents: List[int],
+    encoded_families: List[int],
+) -> None:
+    token_id = tokenizer.special_tokens.get(marker)
+    if token_id is None:
+        return
+    sig_id = {
+        "<BOI>": tokenizer.signature_boi_id,
+        "<EOI>": tokenizer.signature_eoi_id,
+        "<BOO>": tokenizer.signature_boo_id,
+        "<EOO>": tokenizer.signature_eoo_id,
+    }.get(marker, tokenizer.signature_boi_id)
+    encoded.append(int(token_id))
+    encoded_signatures.append(int(sig_id))
+    encoded_levels.append(tokenizer.signature_level_to_id["special"])
+    encoded_relations.append(tokenizer.signature_relation_to_id["special"])
+    encoded_parents.append(int(sig_id))
+    encoded_families.append(tokenizer.signature_family_to_id["boundary"])
+
+
+def _ensure_gen_parity_span_wrapper(
+    tokenizer: PrismalTokenizer,
+    encoded: List[int],
+    encoded_signatures: List[int],
+    encoded_levels: List[int],
+    encoded_relations: List[int],
+    encoded_parents: List[int],
+    encoded_families: List[int],
+) -> tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
+    """Ensure train windows expose the same EOI→BOO transition generation uses.
+
+    Plain corpora without markers become: BOI EOI BOO content EOO.
+    Streams that already contain real boundary specials are left unchanged.
+    """
+
+    boi = tokenizer.special_tokens.get("<BOI>")
+    eoi = tokenizer.special_tokens.get("<EOI>")
+    boo = tokenizer.special_tokens.get("<BOO>")
+    eoo = tokenizer.special_tokens.get("<EOO>")
+    boundary_ids = {token_id for token_id in (boi, eoi, boo, eoo) if token_id is not None}
+    if boundary_ids and any(int(token_id) in boundary_ids for token_id in encoded):
+        return encoded, encoded_signatures, encoded_levels, encoded_relations, encoded_parents, encoded_families
+
+    wrapped: List[int] = []
+    wrapped_signatures: List[int] = []
+    wrapped_levels: List[int] = []
+    wrapped_relations: List[int] = []
+    wrapped_parents: List[int] = []
+    wrapped_families: List[int] = []
+    for marker in ("<BOI>", "<EOI>", "<BOO>"):
+        _append_boundary_frame(
+            tokenizer,
+            marker,
+            encoded=wrapped,
+            encoded_signatures=wrapped_signatures,
+            encoded_levels=wrapped_levels,
+            encoded_relations=wrapped_relations,
+            encoded_parents=wrapped_parents,
+            encoded_families=wrapped_families,
+        )
+    wrapped.extend(encoded)
+    wrapped_signatures.extend(encoded_signatures)
+    wrapped_levels.extend(encoded_levels)
+    wrapped_relations.extend(encoded_relations)
+    wrapped_parents.extend(encoded_parents)
+    wrapped_families.extend(encoded_families)
+    _append_boundary_frame(
+        tokenizer,
+        "<EOO>",
+        encoded=wrapped,
+        encoded_signatures=wrapped_signatures,
+        encoded_levels=wrapped_levels,
+        encoded_relations=wrapped_relations,
+        encoded_parents=wrapped_parents,
+        encoded_families=wrapped_families,
+    )
+    return wrapped, wrapped_signatures, wrapped_levels, wrapped_relations, wrapped_parents, wrapped_families
+
+
+def _structure_boundary_starts(encoded: Sequence[int], tokenizer: PrismalTokenizer) -> List[int]:
+    structure_ids = _unsupervised_structure_token_ids(tokenizer)
+    starts = [0]
+    for index, token_id in enumerate(encoded):
+        if int(token_id) in structure_ids and index not in starts:
+            starts.append(index)
+    return starts
 
 
 def _build_window_samples_from_text(
@@ -3121,28 +3450,22 @@ def _build_window_samples_from_text(
         merged,
         add_special_tokens=False,
     )
-    if not any(marker in merged for marker in ("<BOI>", "<EOI>", "<BOO>", "<EOO>")):
-        boi_token = tokenizer.special_tokens.get("<BOI>")
-        eoi_token = tokenizer.special_tokens.get("<EOI>")
-        if boi_token is not None and eoi_token is not None:
-            encoded = [boi_token] + encoded + [eoi_token]
-            encoded_signatures = [tokenizer.signature_boi_id] + encoded_signatures + [tokenizer.signature_eoi_id]
-            encoded_levels = [
-                tokenizer.signature_level_to_id["special"],
-                *encoded_levels,
-                tokenizer.signature_level_to_id["special"],
-            ]
-            encoded_relations = [
-                tokenizer.signature_relation_to_id["special"],
-                *encoded_relations,
-                tokenizer.signature_relation_to_id["special"],
-            ]
-            encoded_parents = [tokenizer.signature_boi_id] + encoded_parents + [tokenizer.signature_eoi_id]
-            encoded_families = [
-                tokenizer.signature_family_to_id["boundary"],
-                *encoded_families,
-                tokenizer.signature_family_to_id["boundary"],
-            ]
+    (
+        encoded,
+        encoded_signatures,
+        encoded_levels,
+        encoded_relations,
+        encoded_parents,
+        encoded_families,
+    ) = _ensure_gen_parity_span_wrapper(
+        tokenizer,
+        encoded,
+        encoded_signatures,
+        encoded_levels,
+        encoded_relations,
+        encoded_parents,
+        encoded_families,
+    )
     if len(encoded) < 4:
         (
             encoded,
@@ -3152,41 +3475,29 @@ def _build_window_samples_from_text(
             encoded_parents,
             encoded_families,
         ) = tokenizer.encode_hierarchy(merged * 4, add_special_tokens=False)
+        (
+            encoded,
+            encoded_signatures,
+            encoded_levels,
+            encoded_relations,
+            encoded_parents,
+            encoded_families,
+        ) = _ensure_gen_parity_span_wrapper(
+            tokenizer,
+            encoded,
+            encoded_signatures,
+            encoded_levels,
+            encoded_relations,
+            encoded_parents,
+            encoded_families,
+        )
     if len(encoded) < 2:
         return samples
 
-    hierarchy_vectors = _build_hierarchy_vector_tensor(
-        torch.tensor(encoded, dtype=torch.long),
-        torch.tensor(encoded_signatures, dtype=torch.long),
-        torch.tensor(encoded_levels, dtype=torch.long),
-        torch.tensor(encoded_relations, dtype=torch.long),
-        torch.tensor(encoded_parents, dtype=torch.long),
-        torch.tensor(encoded_families, dtype=torch.long),
-        token_vocab_size=max(tokenizer.vocab_size, 1),
-        signature_vocab_size=max(tokenizer.signature_vocab_size, 1),
-        level_vocab_size=max(tokenizer.signature_level_vocab_size, 1),
-        relation_vocab_size=max(tokenizer.signature_relation_vocab_size, 1),
-        family_vocab_size=max(tokenizer.signature_family_vocab_size, 1),
-        dtype=hierarchy_vector_torch_dtype(hierarchy_vector_dtype),
-        low_rank_enabled=low_rank_enabled,
-        low_rank_dim=low_rank_dim,
-    )
-
     token_loss_mask = _build_loss_mask(tokenizer, merged, encoded)
-    unsupervised_token_ids = {
-        tokenizer.special_tokens.get("<BOI>"),
-        tokenizer.special_tokens.get("<EOI>"),
-        tokenizer.special_tokens.get("<BOO>"),
-        tokenizer.special_tokens.get("<EOO>"),
-        tokenizer.special_tokens.get("<BOP>"),
-        tokenizer.special_tokens.get("<EOP>"),
-        tokenizer.special_tokens.get("<BLO>"),
-        tokenizer.special_tokens.get("<LINE>"),
-        tokenizer.special_tokens.get("<EOL>"),
-        tokenizer.special_tokens.get("<SIG:OTHER>"),
-    }
+    unsupervised_token_ids = _unsupervised_structure_token_ids(tokenizer)
     token_loss_mask = [
-        0.0 if token_id in unsupervised_token_ids else float(mask)
+        0.0 if int(token_id) in unsupervised_token_ids else float(mask)
         for token_id, mask in zip(encoded, token_loss_mask)
     ]
 
@@ -3204,6 +3515,19 @@ def _build_window_samples_from_text(
             return False
         if not any(float(value) > 0.0 for value in mask_chunk):
             return False
+        # Prefer windows that keep an open output span when they supervise tokens.
+        boo_id = tokenizer.special_tokens.get("<BOO>")
+        eoo_id = tokenizer.special_tokens.get("<EOO>")
+        if boo_id is not None and any(float(value) > 0.0 for value in mask_chunk):
+            has_boo = any(int(token_id) == int(boo_id) for token_id in chunk)
+            first_sup = next((idx for idx, value in enumerate(mask_chunk) if float(value) > 0.0), None)
+            if first_sup is not None and not has_boo and start > 0:
+                # Try to back up to the nearest BOO so the supervised region has a span open.
+                for back in range(start - 1, -1, -1):
+                    if int(encoded[back]) == int(boo_id):
+                        return append_window(back, chunk_len + (start - back))
+                    if eoo_id is not None and int(encoded[back]) == int(eoo_id):
+                        break
         ids = [tokenizer.bos_id] + chunk + [tokenizer.eos_id]
         sig_ids = [tokenizer.signature_bos_id] + sig_chunk + [tokenizer.signature_eos_id]
         lvl_ids = [tokenizer.signature_level_to_id["special"]] + lvl_chunk + [tokenizer.signature_level_to_id["special"]]
@@ -3212,7 +3536,7 @@ def _build_window_samples_from_text(
         family_ids = [tokenizer.signature_family_to_id["special"]] + family_chunk + [tokenizer.signature_family_to_id["special"]]
         eos_loss = 1.0 if start + len(chunk) >= len(encoded) else 0.0
         loss_mask = [0.0] + mask_chunk + [eos_loss]
-        hierarchy_vectors = _build_hierarchy_vector_tensor(
+        window_hierarchy = _build_hierarchy_vector_tensor(
             torch.tensor(ids, dtype=torch.long),
             torch.tensor(sig_ids, dtype=torch.long),
             torch.tensor(lvl_ids, dtype=torch.long),
@@ -3237,12 +3561,13 @@ def _build_window_samples_from_text(
                 signature_relation_ids=torch.tensor(rel_ids[:-1], dtype=torch.long),
                 parent_signature_ids=torch.tensor(parent_ids[:-1], dtype=torch.long),
                 signature_family_ids=torch.tensor(family_ids[:-1], dtype=torch.long),
-                hierarchy_vectors=hierarchy_vectors[:-1],
+                hierarchy_vectors=window_hierarchy[:-1],
                 loss_mask=torch.tensor(loss_mask[1:], dtype=torch.float32),
             )
         )
         return True
 
+    boundary_starts = _structure_boundary_starts(encoded, tokenizer)
     if seq_len <= 0:
         chunk_len = max(64, min(len(encoded), 256))
         stride = max(1, chunk_len // 2)
@@ -3250,18 +3575,24 @@ def _build_window_samples_from_text(
         anchored_starts: set[int] = set()
         if supervised_indices:
             answer_token_start = supervised_indices[0]
+            boo_id = tokenizer.special_tokens.get("<BOO>")
+            answer_start = 0
+            if boo_id is not None:
+                for idx in range(answer_token_start, -1, -1):
+                    if int(encoded[idx]) == int(boo_id):
+                        answer_start = idx
+                        break
             if answer_token_start >= chunk_len - 8:
                 answer_context_tail = 128
                 answer_chunk_len = min(len(encoded), max(chunk_len, min(1024, answer_token_start + answer_context_tail)))
-                if answer_chunk_len >= len(encoded) or answer_token_start + answer_context_tail <= answer_chunk_len:
-                    answer_start = 0
-                else:
-                    answer_start = max(0, answer_token_start - max(0, answer_chunk_len - answer_context_tail))
-                if append_window(answer_start, answer_chunk_len):
+                if answer_chunk_len < len(encoded) and answer_token_start + answer_context_tail > answer_chunk_len:
+                    answer_start = max(answer_start, answer_token_start - max(0, answer_chunk_len - answer_context_tail))
+                if append_window(answer_start, max(chunk_len, min(len(encoded) - answer_start, answer_chunk_len if answer_token_start >= chunk_len - 8 else chunk_len))):
                     anchored_starts.add(answer_start)
                     if max_samples and len(samples) >= max_samples:
                         return samples
-        for start in range(0, max(1, len(encoded) - 1), stride):
+        candidate_starts = sorted(set(boundary_starts) | set(range(0, max(1, len(encoded) - 1), stride)))
+        for start in candidate_starts:
             if start in anchored_starts:
                 continue
             append_window(start, chunk_len)
@@ -3270,7 +3601,8 @@ def _build_window_samples_from_text(
     else:
         chunk_len = max(4, seq_len - 1)
         stride = max(1, chunk_len // 2)
-        for start in range(0, max(1, len(encoded) - 1), stride):
+        candidate_starts = sorted(set(boundary_starts) | set(range(0, max(1, len(encoded) - 1), stride)))
+        for start in candidate_starts:
             append_window(start, chunk_len)
             if max_samples and len(samples) >= max_samples:
                 break

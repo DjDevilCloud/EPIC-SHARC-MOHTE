@@ -751,7 +751,7 @@ class SmokeTests(unittest.TestCase):
         self.assertTrue(clone.use_fst)
         self.assertEqual(clone.fst_refresh_interval, cfg.fst_refresh_interval)
         self.assertEqual(clone.fst_max_prompt_chars, cfg.fst_max_prompt_chars)
-        self.assertTrue(clone.fst_use_training_prefix)
+        self.assertFalse(clone.fst_use_training_prefix)
         self.assertTrue(clone.fst_use_generation_prefix)
         self.assertEqual(clone.grad_clip_muon, cfg.grad_clip_muon)
         self.assertEqual(clone.grad_clip_scalar, cfg.grad_clip_scalar)
@@ -2111,6 +2111,18 @@ class SmokeTests(unittest.TestCase):
         literal_bundle = tokenizer.encode_hierarchy_bundle('"zx-19k"', add_special_tokens=False)
         self.assertIn('"zx-19k"', prompt)
         self.assertGreater(len(literal_bundle.token_ids), 0)
+        # Anchor rails copy content tokens; LINE/EOL are structural frames (LINE is gen-suppressed).
+        structure_ids = {
+            tokenizer.special_tokens.get("<LINE>"),
+            tokenizer.special_tokens.get("<EOL>"),
+            tokenizer.special_tokens.get("<BLO>"),
+            tokenizer.special_tokens.get("<BOI>"),
+            tokenizer.special_tokens.get("<EOI>"),
+            tokenizer.special_tokens.get("<BOO>"),
+            tokenizer.special_tokens.get("<EOO>"),
+        }
+        content_literal_ids = [token_id for token_id in literal_bundle.token_ids if token_id not in structure_ids]
+        self.assertGreater(len(content_literal_ids), 0)
 
         input_ids = torch.tensor([prompt_bundle.token_ids], dtype=torch.long)
         signature_ids = torch.tensor([prompt_bundle.signature_ids], dtype=torch.long)
@@ -2120,7 +2132,7 @@ class SmokeTests(unittest.TestCase):
         signature_family_ids = torch.tensor([prompt_bundle.signature_family_ids], dtype=torch.long)
 
         anchor_state = model.token_memory_attention.init_state(1, input_ids.device, torch.float32)
-        literal_ids = torch.tensor(literal_bundle.token_ids, dtype=torch.long)
+        literal_ids = torch.tensor(content_literal_ids, dtype=torch.long)
         literal_len = literal_ids.numel()
         anchor_state.token_ids[0, :literal_len] = literal_ids
         anchor_state.lengths[0] = literal_len
@@ -2207,6 +2219,17 @@ class SmokeTests(unittest.TestCase):
         literal_bundle = tokenizer.encode_hierarchy_bundle("zx-19k", add_special_tokens=False)
         self.assertIn("zx-19k", prompt)
         self.assertGreater(len(literal_bundle.token_ids), 0)
+        structure_ids = {
+            tokenizer.special_tokens.get("<LINE>"),
+            tokenizer.special_tokens.get("<EOL>"),
+            tokenizer.special_tokens.get("<BLO>"),
+            tokenizer.special_tokens.get("<BOI>"),
+            tokenizer.special_tokens.get("<EOI>"),
+            tokenizer.special_tokens.get("<BOO>"),
+            tokenizer.special_tokens.get("<EOO>"),
+        }
+        content_literal_ids = [token_id for token_id in literal_bundle.token_ids if token_id not in structure_ids]
+        self.assertGreater(len(content_literal_ids), 0)
 
         input_ids = torch.tensor([prompt_bundle.token_ids], dtype=torch.long)
         signature_ids = torch.tensor([prompt_bundle.signature_ids], dtype=torch.long)
@@ -2216,7 +2239,7 @@ class SmokeTests(unittest.TestCase):
         signature_family_ids = torch.tensor([prompt_bundle.signature_family_ids], dtype=torch.long)
 
         anchor_state = model.token_memory_attention.init_state(1, input_ids.device, torch.float32)
-        literal_ids = torch.tensor(literal_bundle.token_ids, dtype=torch.long)
+        literal_ids = torch.tensor(content_literal_ids, dtype=torch.long)
         literal_len = literal_ids.numel()
         anchor_state.token_ids[0, :literal_len] = literal_ids
         anchor_state.lengths[0] = literal_len
@@ -2257,6 +2280,119 @@ class SmokeTests(unittest.TestCase):
         )
 
         self.assertEqual(int(generated[0, input_ids.size(1)].item()), int(literal_ids[0].item()))
+
+    def test_anchor_rail_force_copy_emits_full_literal_and_survives_prefill(self) -> None:
+        """Force-rail must stay active across prefill even when prompt length > memory window."""
+
+        tokenizer = PrismalTokenizer()
+        cfg = PrismalWaveConfig()
+        cfg.base_vocab_size = tokenizer.base_vocab_size
+        cfg.vocab_size = tokenizer.vocab_size
+        cfg.signature_vocab_size = tokenizer.signature_vocab_size
+        cfg.signature_level_vocab_size = tokenizer.signature_level_vocab_size
+        cfg.signature_relation_vocab_size = tokenizer.signature_relation_vocab_size
+        cfg.signature_bucket_vocab_size = tokenizer.signature_family_vocab_size
+        cfg.d_model = 32
+        cfg.ff_mult = 2
+        cfg.n_layers = 1
+        cfg.n_emitters = 8
+        cfg.n_slots = 8
+        cfg.n_paths = 1
+        cfg.top_k_emitters = 2
+        cfg.top_k_slots = 2
+        cfg.use_factorized_embedding = True
+        cfg.factorized_embedding_dim = 16
+        cfg.use_torus_core = True
+        cfg.use_hmote = False
+        cfg.use_recursive_hmoe = False
+        cfg.use_signature_lattice_attention = False
+        cfg.use_token_memory_cross_attention = True
+        cfg.use_token_memory_generation_cache = True
+        cfg.token_memory_window = 32
+        cfg.token_memory_top_k = 2
+        cfg.token_memory_weight = 0.5
+        cfg.token_memory_copy_bias = 0.0
+        cfg.token_memory_copy_min_confidence = 0.0
+        cfg.use_turbo_quantization = False
+        cfg.use_bitsandbytes_leaf_precision = False
+        cfg.use_speculative_decoding = False
+        cfg.use_gradient_checkpointing = False
+        cfg.dropout = 0.0
+        cfg.position_embedding_init_size = 32
+        cfg.use_torus_race_lanes = False
+
+        model = PrismalWaveModel(cfg)
+        model.eval()
+
+        prompt = "please repeat the id zx-19k exactly."
+        prompt_bundle = tokenizer.prepare_generation_hierarchy(prompt)
+        self.assertGreater(len(prompt_bundle.token_ids), int(cfg.token_memory_window))
+
+        structure_ids = {
+            tokenizer.special_tokens.get("<LINE>"),
+            tokenizer.special_tokens.get("<EOL>"),
+            tokenizer.special_tokens.get("<BLO>"),
+            tokenizer.special_tokens.get("<BOI>"),
+            tokenizer.special_tokens.get("<EOI>"),
+            tokenizer.special_tokens.get("<BOO>"),
+            tokenizer.special_tokens.get("<EOO>"),
+        }
+        content_literal_ids = [
+            token_id
+            for token_id in tokenizer.encode_hierarchy_bundle("zx-19k", add_special_tokens=False).token_ids
+            if token_id not in structure_ids
+        ]
+        self.assertGreaterEqual(len(content_literal_ids), 2)
+
+        input_ids = torch.tensor([prompt_bundle.token_ids], dtype=torch.long)
+        anchor_state = model.token_memory_attention.init_state(1, input_ids.device, torch.float32)
+        literal_ids = torch.tensor(content_literal_ids, dtype=torch.long)
+        literal_len = literal_ids.numel()
+        anchor_state.token_ids[0, :literal_len] = literal_ids
+        anchor_state.lengths[0] = literal_len
+        anchor_state.anchor_token_ids[0, :literal_len] = literal_ids
+        anchor_state.anchor_span_ids[0, :literal_len] = 1
+        anchor_state.anchor_offsets[0, :literal_len] = torch.arange(literal_len, dtype=torch.long)
+        anchor_state.anchor_lengths[0, :literal_len] = literal_len
+        anchor_state.anchor_tags[0, :literal_len] = 0x0BADC0DE
+        anchor_state.anchor_flags[0, :literal_len] = 1
+        anchor_state.anchor_span_starts[0, :literal_len] = 0
+        anchor_state.anchor_cursor_active[0] = True
+        anchor_state.anchor_cursor_pos[0] = 0
+        anchor_state.anchor_cursor_span_id[0] = 1
+        anchor_state.anchor_cursor_offset[0] = 0
+        anchor_state.anchor_cursor_length[0] = literal_len
+        anchor_state.anchor_cursor_tag[0] = 0x0BADC0DE
+
+        # Snapshot must preserve the rail even if the live ring is later mutated.
+        snapshot = model._snapshot_anchor_force_rail(anchor_state)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertTrue(bool(snapshot.anchor_cursor_active.any().item()))
+        forced = model._token_memory_anchor_next_ids(snapshot, device=input_ids.device)
+        self.assertIsNotNone(forced)
+        assert forced is not None
+        self.assertEqual(int(forced[0, 0].item()), int(literal_ids[0].item()))
+
+        generated = model.generate(
+            input_ids,
+            signature_family_ids=torch.tensor([prompt_bundle.signature_family_ids], dtype=torch.long),
+            signature_ids=torch.tensor([prompt_bundle.signature_ids], dtype=torch.long),
+            signature_level_ids=torch.tensor([prompt_bundle.signature_level_ids], dtype=torch.long),
+            signature_relation_ids=torch.tensor([prompt_bundle.signature_relation_ids], dtype=torch.long),
+            parent_signature_ids=torch.tensor([prompt_bundle.parent_signature_ids], dtype=torch.long),
+            max_new_tokens=literal_len,
+            min_new_tokens=literal_len,
+            beam_size=1,
+            top_k=0,
+            top_p=1.0,
+            temperature=1.0,
+            use_speculative_decoding=False,
+            suppressed_token_ids=tokenizer.generation_suppressed_token_ids(),
+            token_memory_state=anchor_state,
+        )
+        continuation = generated[0, input_ids.size(1) :].tolist()
+        self.assertEqual(continuation, content_literal_ids)
 
     def test_token_copy_aliases_sync_to_canonical_names(self) -> None:
         cfg = PrismalWaveConfig(
