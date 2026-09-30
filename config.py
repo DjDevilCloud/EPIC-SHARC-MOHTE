@@ -169,6 +169,7 @@ class PrismalWaveConfig:
     residency_head_hidden_dim: int = 64
     learned_residency_weight: float = 0.1
     use_residency_with_reinforcement: bool = True
+    disable_auxlosses: bool = False
     use_token_memory_cross_attention: bool = False
     use_token_memory_generation_cache: bool = False
     use_token_memory_copy_during_training: bool = False

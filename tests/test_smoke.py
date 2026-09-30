@@ -19,7 +19,16 @@ if str(ROOT) not in sys.path:
 from config import PrismalWaveConfig
 from config import load_config
 from cli import build_parser, _build_config, _resolve_tokenizer_bootstrap
-from data import MemmapTokenDataset, PrismalTokenizer, WindowSample, iter_text_corpus, stream_pretokenized_windows
+from data import (
+    MemmapTokenDataset,
+    PrismalTokenizer,
+    WindowSample,
+    _build_loss_mask,
+    _build_window_samples_from_text,
+    _compose_record_text,
+    iter_text_corpus,
+    stream_pretokenized_windows,
+)
 from model import PrismalTorusCore, PrismalWaveModel
 from muon_optim import PrecisionAdaptiveHierarchicalOptimizer
 from quantization import QuantizationConfig
@@ -174,6 +183,83 @@ class SmokeTests(unittest.TestCase):
         }
         self.assertEqual(len(lengths), 1)
         self.assertTrue(any(tokenizer.token_kind_by_id.get(token_id) == "byte" for token_id in bundle.token_ids))
+
+    def test_nvidia_role_boundaries_supervise_assistant_only(self) -> None:
+        raw = "<extra_id_1>User\nExplain the task.\n<extra_id_1>Assistant\nHere is the answer."
+        text = _compose_record_text({"id": "sample-1", "text": raw, "metadata": {"category": "math"}})
+        self.assertIn("<BOI>", text)
+        self.assertIn("<EOI>", text)
+        self.assertIn("<BOO>", text)
+        self.assertIn("<EOO>", text)
+
+        tokenizer = PrismalTokenizer()
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        loss_mask = _build_loss_mask(tokenizer, text, encoded)
+        boo = tokenizer.special_tokens["<BOO>"]
+        eoo = tokenizer.special_tokens["<EOO>"]
+        assistant_start = encoded.index(boo)
+        answer_end = encoded.index(eoo, assistant_start)
+        self.assertEqual(sum(loss_mask[: assistant_start + 1]), 0.0)
+        self.assertGreater(sum(loss_mask[assistant_start + 1 : answer_end]), 0.0)
+        self.assertEqual(loss_mask[answer_end], 0.0)
+
+        prompt = raw.split("<extra_id_1>User\n", 1)[1].split("<extra_id_1>Assistant\n", 1)[0].strip()
+        full_bundle = tokenizer.encode_hierarchy_bundle(text, add_special_tokens=False)
+        generation_bundle = tokenizer.prepare_generation_hierarchy(prompt)
+        prefix_len = assistant_start + 1
+        self.assertEqual(
+            generation_bundle.token_ids,
+            [tokenizer.bos_id, *full_bundle.token_ids[:prefix_len], tokenizer.special_tokens["<LINE>"]],
+        )
+        self.assertEqual(
+            generation_bundle.signature_ids,
+            [tokenizer.signature_bos_id, *full_bundle.signature_ids[:prefix_len], tokenizer.signature_blo_id],
+        )
+        self.assertEqual(
+            generation_bundle.signature_level_ids,
+            [
+                tokenizer.signature_level_to_id["special"],
+                *full_bundle.signature_level_ids[:prefix_len],
+                tokenizer.signature_level_to_id["line"],
+            ],
+        )
+        self.assertEqual(
+            generation_bundle.signature_relation_ids,
+            [
+                tokenizer.signature_relation_to_id["special"],
+                *full_bundle.signature_relation_ids[:prefix_len],
+                tokenizer.signature_relation_to_id["containment"],
+            ],
+        )
+        self.assertEqual(
+            generation_bundle.parent_signature_ids,
+            [tokenizer.signature_bos_id, *full_bundle.parent_signature_ids[:prefix_len], tokenizer.signature_blo_id],
+        )
+        self.assertEqual(
+            generation_bundle.signature_family_ids,
+            [
+                tokenizer.signature_family_to_id["special"],
+                *full_bundle.signature_family_ids[:prefix_len],
+                tokenizer.signature_family_to_id["line"],
+            ],
+        )
+        suppressed = set(tokenizer.generation_suppressed_token_ids())
+        for punctuation in ("\\", "{", "}", "#"):
+            self.assertNotIn(tokenizer.construction_text_to_id[punctuation], suppressed)
+
+    def test_cli_default_auxiliary_loss_setting_is_defined(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["train", "--data", "demo/corpus", "--save-dir", "tmp/run"])
+        cfg = _build_config(args)
+        self.assertFalse(args.disable_auxlosses)
+        self.assertFalse(cfg.disable_auxlosses)
+
+    def test_supervised_windows_respect_sequence_length(self) -> None:
+        tokenizer = PrismalTokenizer()
+        text = "<BOI> prompt <EOI> <BOO> " + ("assistant output " * 80) + "<EOO>"
+        windows = _build_window_samples_from_text(tokenizer, text, seq_len=16)
+        self.assertTrue(windows)
+        self.assertTrue(all(sample.input_ids.numel() <= 16 for sample in windows))
 
     def test_pretokenized_bootstrap_uses_bundle_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

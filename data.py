@@ -654,6 +654,10 @@ def _compose_structured_qa_record(
 
 def _compose_record_text(payload: Dict[str, Any]) -> str:
     raw_text = _clean_record_value(payload.get("text") or payload.get("content"))
+    if raw_text:
+        normalized_raw_text = _normalize_role_marked_text(raw_text)
+        if normalized_raw_text != raw_text:
+            return normalized_raw_text
     if len(payload) == 1 and raw_text:
         return raw_text
 
@@ -730,6 +734,37 @@ def _compose_record_text(payload: Dict[str, Any]) -> str:
     return raw_text
 
 
+_ROLE_MARKER_RE = re.compile(r"<extra_id_1>(User|Assistant)\s*\r?\n", re.IGNORECASE)
+
+
+def _normalize_role_marked_text(text: str) -> str:
+    """Convert NVIDIA-style User/Assistant records to supervised span markers.
+
+    These records otherwise look like ordinary text to the tokenizer, causing
+    next-token training to include the user prompt in the loss. Explicit spans
+    let the existing loss-mask path supervise assistant turns only.
+    """
+
+    matches = list(_ROLE_MARKER_RE.finditer(text))
+    if len(matches) < 2 or not any(match.group(1).lower() == "user" for match in matches) or not any(
+        match.group(1).lower() == "assistant" for match in matches
+    ):
+        return text
+
+    spans: List[str] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        content = text[match.end() : end].strip()
+        if not content:
+            continue
+        role = match.group(1).lower()
+        if role == "user":
+            spans.append(f"<BOI>{content}<EOI>")
+        elif role == "assistant":
+            spans.append(f"<BOO>{content}<EOO>")
+    return "".join(spans) if spans else text
+
+
 def iter_text_corpus(source: str | Path) -> Iterator[str]:
     path = Path(source)
     if not path.exists():
@@ -743,7 +778,7 @@ def iter_text_corpus(source: str | Path) -> Iterator[str]:
             if suffix in {".txt", ".md", ".markdown", ".rst"}:
                 text = subpath.read_text(encoding="utf-8", errors="ignore").strip()
                 if text:
-                    yield text
+                    yield _normalize_role_marked_text(text)
             elif suffix == ".jsonl":
                 yield from iter_text_corpus(subpath)
             elif suffix == ".parquet":
@@ -760,7 +795,7 @@ def iter_text_corpus(source: str | Path) -> Iterator[str]:
 
     text = path.read_text(encoding="utf-8", errors="ignore").strip()
     if text:
-        yield text
+        yield _normalize_role_marked_text(text)
 
 
 def _chunk_text_iterable(texts: Iterable[str], chunk_size: int) -> Iterator[list[str]]:
@@ -792,7 +827,7 @@ def _iter_jsonl_texts(path: Path) -> Iterator[str]:
                 if merged:
                     yield merged
             elif isinstance(payload, str) and payload.strip():
-                yield payload.strip()
+                yield _normalize_role_marked_text(payload.strip())
 
 
 def _iter_parquet_texts(path: Path) -> Iterator[str]:
@@ -830,7 +865,7 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
                     for value in batch.column(0).to_pylist():
                         merged = _clean_record_value(value)
                         if merged:
-                            yield merged
+                            yield _normalize_role_marked_text(merged)
                 return
 
             for batch in parquet_file.iter_batches(columns=available_columns):
@@ -863,7 +898,7 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
         for value in df[available_columns[0]].tolist():
             merged = _clean_record_value(value)
             if merged:
-                yield merged
+                yield _normalize_role_marked_text(merged)
         return
 
     # `itertuples()` keeps the scan much lighter while preserving the same payload shape.
@@ -2331,6 +2366,17 @@ class PrismalTokenizer:
         signature_relation_ids.append(self.signature_relation_to_id["special"])
         parent_signature_ids.append(self.signature_boo_id)
         signature_family_ids.append(self.signature_family_to_id["boundary"])
+        # Training text passes through the structure-aware encoder, which emits
+        # a <LINE> frame before the first output line. That marker is masked as
+        # a target and suppressed during generation, so seed it in the prompt
+        # with a neutral line signature to keep the first generated text token
+        # on the same boundary as teacher-forced training.
+        token_ids.append(self.special_tokens["<LINE>"])
+        signature_ids.append(self.signature_blo_id)
+        signature_level_ids.append(self.signature_level_to_id["line"])
+        signature_relation_ids.append(self.signature_relation_to_id["containment"])
+        parent_signature_ids.append(self.signature_blo_id)
+        signature_family_ids.append(self.signature_family_to_id["line"])
         hierarchy_vectors = _build_hierarchy_vector_tensor(
             torch.tensor(token_ids, dtype=torch.long),
             torch.tensor(signature_ids, dtype=torch.long),
@@ -3203,7 +3249,15 @@ class PrismalTokenizer:
 
     def generation_suppressed_token_ids(self) -> List[int]:
         suppressed = [self.pad_id, self.bos_id]
-        allowed_punct = {".", ",", "?", "!", ":", ";", "'", '"', "-", "_", "(", ")"}
+        # Keep printable punctuation available to the model. Math, code, and
+        # structured answers commonly need braces, backslashes, hashes, and
+        # operators; suppressing those made valid supervised targets impossible
+        # to emit even when they were the highest-scoring next token.
+        allowed_punct = {
+            ".", ",", "?", "!", ":", ";", "'", '"', "-", "_", "(", ")",
+            "[", "]", "{", "}", "\\", "/", "$", "#", "=", "+", "*", "%",
+            "&", "@", "<", ">", "|", "~", "`",
+        }
         # <EOL> is the sole newline emission path at generation time (LINE stays contextual).
         emit_allowed_structure = {"<BLO>", "<EOL>"}
         for unit_id, unit in enumerate(self.construction_units):
@@ -3515,19 +3569,9 @@ def _build_window_samples_from_text(
             return False
         if not any(float(value) > 0.0 for value in mask_chunk):
             return False
-        # Prefer windows that keep an open output span when they supervise tokens.
-        boo_id = tokenizer.special_tokens.get("<BOO>")
-        eoo_id = tokenizer.special_tokens.get("<EOO>")
-        if boo_id is not None and any(float(value) > 0.0 for value in mask_chunk):
-            has_boo = any(int(token_id) == int(boo_id) for token_id in chunk)
-            first_sup = next((idx for idx, value in enumerate(mask_chunk) if float(value) > 0.0), None)
-            if first_sup is not None and not has_boo and start > 0:
-                # Try to back up to the nearest BOO so the supervised region has a span open.
-                for back in range(start - 1, -1, -1):
-                    if int(encoded[back]) == int(boo_id):
-                        return append_window(back, chunk_len + (start - back))
-                    if eoo_id is not None and int(encoded[back]) == int(eoo_id):
-                        break
+        # Loss masks are computed for the complete record before chunking, so a
+        # supervised continuation window does not need to grow backward to its
+        # <BOO> marker. Keeping the original chunk length enforces seq_len.
         ids = [tokenizer.bos_id] + chunk + [tokenizer.eos_id]
         sig_ids = [tokenizer.signature_bos_id] + sig_chunk + [tokenizer.signature_eos_id]
         lvl_ids = [tokenizer.signature_level_to_id["special"]] + lvl_chunk + [tokenizer.signature_level_to_id["special"]]
