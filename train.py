@@ -173,7 +173,7 @@ def _tokenizer_cache_key(
     hierarchy_vector_low_rank_dim: int,
 ) -> str:
     payload = {
-        "cache_version": 2,
+        "cache_version": 3,
         "base_tokenizer": base_tokenizer_fingerprint,
         "source": _tokenizer_source_fingerprint(source),
         "settings": {
@@ -836,7 +836,7 @@ def build_tokenizer_from_source(
     )
     try:
         cache_payload = {
-            "cache_version": 2,
+            "cache_version": 3,
             "source": str(Path(source).resolve()),
             "base_tokenizer": base_fingerprint,
             "settings": {

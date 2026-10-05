@@ -1,1 +1,4 @@
 agent.exe
+*.pyc
+/checkpoints/nvidia_tiny_prototype
+/checkpoints/nvidia_tiny_prototype

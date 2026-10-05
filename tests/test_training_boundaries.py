@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import sys
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,6 +18,7 @@ if str(ROOT) not in sys.path:
 from config import PrismalWaveConfig
 from data import (
     PrismalTokenizer,
+    StreamingTextCorpusDataset,
     _build_loss_mask,
     _build_window_samples_from_text,
     _compose_structured_qa_record,
@@ -87,15 +90,56 @@ class TrainingBoundaryTests(unittest.TestCase):
         first_sup = next(i for i, value in enumerate(mask) if float(value) > 0.0)
         # Supervised target should be response content, not the instruction.
         label_name = self._token_names(tokenizer, [labels[first_sup]])[0]
-        self.assertNotIn(label_name, {"<BOI>", "<EOI>", "<BOO>", "<EOO>", "<LINE>", "<EOL>"})
-        # Context around the flip should include BOO before supervised content.
+        self.assertNotIn(label_name, {"<BOI>", "<EOI>", "<BOO>"})
+        # Context around the flip should include BOO before supervised output.
         names = self._token_names(tokenizer, inputs)
         self.assertIn("<BOO>", names[: first_sup + 1])
-        # Input-span specials must be unsupervised as targets.
+        # Input-span specials must be unsupervised as targets. EOO is the
+        # learned output terminator, so it is intentionally supervised.
         for index, token_id in enumerate(labels):
             name = self._token_names(tokenizer, [token_id])[0]
-            if name in {"<BOI>", "<EOI>", "<BOO>", "<EOO>", "<LINE>", "<EOL>", "<BLO>"}:
+            if name in {"<BOI>", "<EOI>", "<BOO>", "<BLO>"}:
                 self.assertEqual(float(mask[index]), 0.0, msg=f"structure target {name} supervised at {index}")
+        eoo_targets = [i for i, token_id in enumerate(labels) if self._token_names(tokenizer, [token_id])[0] == "<EOO>"]
+        self.assertTrue(eoo_targets)
+        self.assertTrue(any(float(mask[i]) > 0.0 for i in eoo_targets))
+
+    def test_output_line_and_end_markers_are_supervised(self) -> None:
+        tokenizer = PrismalTokenizer()
+        text = _compose_structured_qa_record(
+            instruction="Give two lines.", context="", response="First line.\nSecond line.", style="instruction"
+        )
+        samples = _build_window_samples_from_text(tokenizer, text, seq_len=0)
+        targets = {}
+        for sample in samples:
+            for token_id, mask in zip(sample.labels.tolist(), sample.loss_mask.tolist()):
+                name = self._token_names(tokenizer, [token_id])[0]
+                if name in {"<LINE>", "<EOL>", "<EOO>"}:
+                    targets.setdefault(name, []).append(float(mask))
+        for marker in ("<EOL>", "<EOO>"):
+            self.assertTrue(targets.get(marker), msg=f"missing {marker} target")
+            self.assertTrue(any(value > 0.0 for value in targets[marker]), msg=f"{marker} is not supervised")
+        self.assertTrue(targets.get("<LINE>"))
+        self.assertEqual(targets["<LINE>"][0], 0.0, "the seeded first line frame must remain contextual")
+        self.assertTrue(any(value > 0.0 for value in targets["<LINE>"][1:]), "later line frames must be generated")
+
+    def test_streaming_sample_order_is_reproducible_from_seed(self) -> None:
+        tokenizer = PrismalTokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "records.jsonl"
+            source.write_text(
+                "\n".join(
+                    json.dumps({"text": f"<BOI>Question {i}<EOI><BOO>Answer {i} with more context.<EOO>"})
+                    for i in range(12)
+                ),
+                encoding="utf-8",
+            )
+            datasets = [
+                StreamingTextCorpusDataset(source, tokenizer, seq_len=32, max_samples=8, seed=123)
+                for _ in range(2)
+            ]
+            samples = [[sample.input_ids.tolist() for sample in dataset] for dataset in datasets]
+        self.assertEqual(samples[0], samples[1])
 
     def test_loss_mask_label_shift_alignment(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -135,7 +179,8 @@ class TrainingBoundaryTests(unittest.TestCase):
         eol = tokenizer.special_tokens["<EOL>"]
         line = tokenizer.special_tokens["<LINE>"]
         self.assertNotIn(eol, suppressed)
-        self.assertIn(line, suppressed)
+        self.assertNotIn(line, suppressed)
+        self.assertNotIn(tokenizer.special_tokens["<EOO>"], suppressed)
 
     def test_fst_training_prefix_default_off_and_content_only(self) -> None:
         cfg = PrismalWaveConfig()

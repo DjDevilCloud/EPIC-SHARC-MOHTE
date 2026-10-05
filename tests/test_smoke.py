@@ -201,7 +201,7 @@ class SmokeTests(unittest.TestCase):
         answer_end = encoded.index(eoo, assistant_start)
         self.assertEqual(sum(loss_mask[: assistant_start + 1]), 0.0)
         self.assertGreater(sum(loss_mask[assistant_start + 1 : answer_end]), 0.0)
-        self.assertEqual(loss_mask[answer_end], 0.0)
+        self.assertEqual(loss_mask[answer_end], 1.0)
 
         prompt = raw.split("<extra_id_1>User\n", 1)[1].split("<extra_id_1>Assistant\n", 1)[0].strip()
         full_bundle = tokenizer.encode_hierarchy_bundle(text, add_special_tokens=False)
@@ -246,6 +246,32 @@ class SmokeTests(unittest.TestCase):
         suppressed = set(tokenizer.generation_suppressed_token_ids())
         for punctuation in ("\\", "{", "}", "#"):
             self.assertNotIn(tokenizer.construction_text_to_id[punctuation], suppressed)
+
+    def test_nvidia_messages_array_is_converted_to_supervised_spans(self) -> None:
+        text = _compose_record_text(
+            {
+                "messages": [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "What is 2 + 2?"},
+                    {"role": "assistant", "content": "4"},
+                ],
+                "reasoning": "off",
+            }
+        )
+        self.assertIn("<BOI>System: Be concise.<EOI>", text)
+        self.assertIn("<BOI>What is 2 + 2?<EOI>", text)
+        self.assertIn("<BOO>4<EOO>", text)
+        self.assertNotIn("'role'", text)
+        self.assertNotIn("reasoning", text)
+
+        tokenizer = PrismalTokenizer()
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        mask = _build_loss_mask(tokenizer, text, encoded)
+        boo_index = encoded.index(tokenizer.special_tokens["<BOO>"])
+        eoo_index = encoded.index(tokenizer.special_tokens["<EOO>"])
+        self.assertEqual(sum(mask[: boo_index + 1]), 0.0)
+        self.assertGreater(sum(mask[boo_index + 1 : eoo_index]), 0.0)
+        self.assertEqual(mask[eoo_index], 1.0)
 
     def test_cli_default_auxiliary_loss_setting_is_defined(self) -> None:
         parser = build_parser()

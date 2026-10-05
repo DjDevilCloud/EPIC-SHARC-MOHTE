@@ -658,6 +658,27 @@ def _compose_record_text(payload: Dict[str, Any]) -> str:
         normalized_raw_text = _normalize_role_marked_text(raw_text)
         if normalized_raw_text != raw_text:
             return normalized_raw_text
+    # Chat datasets such as NVIDIA ReasoningOff store turns as a ``messages``
+    # array. Treat each assistant turn as a target span and all other roles as
+    # input context; stringifying the list here would train on Python dict reprs.
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        spans: List[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = _clean_record_value(message.get("role")).lower()
+            content = _clean_record_value(message.get("content"))
+            if not content:
+                continue
+            if role == "assistant":
+                spans.append(f"<BOO>{content}<EOO>")
+            else:
+                if role and role != "user":
+                    content = f"{role.title()}: {content}"
+                spans.append(f"<BOI>{content}<EOI>")
+        if spans:
+            return "".join(spans)
     if len(payload) == 1 and raw_text:
         return raw_text
 
@@ -2366,11 +2387,9 @@ class PrismalTokenizer:
         signature_relation_ids.append(self.signature_relation_to_id["special"])
         parent_signature_ids.append(self.signature_boo_id)
         signature_family_ids.append(self.signature_family_to_id["boundary"])
-        # Training text passes through the structure-aware encoder, which emits
-        # a <LINE> frame before the first output line. That marker is masked as
-        # a target and suppressed during generation, so seed it in the prompt
-        # with a neutral line signature to keep the first generated text token
-        # on the same boundary as teacher-forced training.
+        # Training emits a <LINE> frame before the first output line. Seed its
+        # neutral form here: the first frame is contextual, while subsequent
+        # line frames are supervised and generated after each <EOL>.
         token_ids.append(self.special_tokens["<LINE>"])
         signature_ids.append(self.signature_blo_id)
         signature_level_ids.append(self.signature_level_to_id["line"])
@@ -3258,8 +3277,9 @@ class PrismalTokenizer:
             "[", "]", "{", "}", "\\", "/", "$", "#", "=", "+", "*", "%",
             "&", "@", "<", ">", "|", "~", "`",
         }
-        # <EOL> is the sole newline emission path at generation time (LINE stays contextual).
-        emit_allowed_structure = {"<BLO>", "<EOL>"}
+        # The first LINE frame is seeded in the prompt; later LINE frames are
+        # generated after EOL. EOL renders a newline and EOO closes the span.
+        emit_allowed_structure = {"<BLO>", "<LINE>", "<EOL>", "<EOO>"}
         for unit_id, unit in enumerate(self.construction_units):
             if unit.text in emit_allowed_structure:
                 continue
@@ -3351,8 +3371,8 @@ def _unsupervised_structure_token_ids(tokenizer: PrismalTokenizer) -> set[int]:
 def _build_loss_mask(tokenizer: PrismalTokenizer, text: str, encoded_tokens: Sequence[int]) -> List[float]:
     """Build a per-token supervision mask aligned to ``encoded_tokens``.
 
-    Preferred policy: supervise only inside an output span opened by ``<BOO>``
-    and closed by ``<EOO>`` (structure specials themselves stay unsupervised).
+    Preferred policy: supervise output content and its newline/end markers inside
+    an output span opened by ``<BOO>`` and closed by ``<EOO>``.
     Fallback: answer-marker text heuristic for free-form corpora without BOO.
     """
 
@@ -3372,7 +3392,8 @@ def _build_loss_mask(tokenizer: PrismalTokenizer, text: str, encoded_tokens: Seq
                 continue
             if eoo_id is not None and token_id == int(eoo_id):
                 in_output = False
-                mask.append(0.0)
+                # The model must learn when the assistant span is complete.
+                mask.append(1.0)
                 continue
             mask.append(1.0 if in_output else 0.0)
         return mask
@@ -3550,10 +3571,30 @@ def _build_window_samples_from_text(
 
     token_loss_mask = _build_loss_mask(tokenizer, merged, encoded)
     unsupervised_token_ids = _unsupervised_structure_token_ids(tokenizer)
-    token_loss_mask = [
-        0.0 if int(token_id) in unsupervised_token_ids else float(mask)
-        for token_id, mask in zip(encoded, token_loss_mask)
-    ]
+    output_structure_ids = {tokenizer.special_tokens.get(marker) for marker in ("<LINE>", "<EOL>", "<EOO>")}
+    boo_id = tokenizer.special_tokens.get("<BOO>")
+    eoo_id = tokenizer.special_tokens.get("<EOO>")
+    line_id = tokenizer.special_tokens.get("<LINE>")
+    in_output = False
+    output_line_seen = False
+    filtered_loss_mask: List[float] = []
+    for token_id, mask in zip(encoded, token_loss_mask):
+        token_id = int(token_id)
+        if boo_id is not None and token_id == int(boo_id):
+            in_output = True
+            output_line_seen = False
+        if eoo_id is not None and token_id == int(eoo_id):
+            in_output = False
+        is_seeded_output_line = in_output and line_id is not None and token_id == int(line_id) and not output_line_seen
+        if in_output and line_id is not None and token_id == int(line_id):
+            output_line_seen = True
+        if is_seeded_output_line:
+            filtered_loss_mask.append(0.0)
+        elif token_id in unsupervised_token_ids and token_id not in output_structure_ids:
+            filtered_loss_mask.append(0.0)
+        else:
+            filtered_loss_mask.append(float(mask))
+    token_loss_mask = filtered_loss_mask
 
     def append_window(start: int, chunk_len: int) -> bool:
         start = max(0, int(start))
@@ -3738,7 +3779,11 @@ class StreamingTextCorpusDataset(IterableDataset):
         self.split = split
         self.val_fraction = float(val_fraction)
         self.seed = int(seed)
-        self.sample_seed = int(sample_seed) if sample_seed is not None else random.SystemRandom().randrange(1 << 63)
+        if sample_seed is not None:
+            self.sample_seed = int(sample_seed)
+        else:
+            split_offset = {"train": 0, "val": 1, "all": 2}.get(self.split, 3)
+            self.sample_seed = self.seed * 4 + split_offset
         self.shuffle_buffer_size = max(
             1,
             int(shuffle_buffer_size) if shuffle_buffer_size is not None else min(max(self.max_samples, 1), 64) if self.max_samples else 1024,
