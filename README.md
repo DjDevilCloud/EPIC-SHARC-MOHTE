@@ -90,18 +90,21 @@ The default runtime configuration lives in [`config.py`](./config.py) via `Prism
 
 Key defaults:
 
-- `d_model = 1024`
+- `d_model = 128`
 - `n_layers = 1`
-- `n_emitters = 64`
-- `n_slots = 2048`
+- `n_emitters = 256`
+- `n_slots = 128`
 - `n_paths = 1`
 - `emitter_hierarchy_score_weight = 0.25`
 - `use_factorized_embedding = true`
 - `use_turbo_quantization = false`
 - `use_torus_core = true`
 - `Torus_SHARC_Router = true`
-- `use_hmote = true`
-- `use_recursive_hmoe = true`
+- `use_hmote = false`
+- `use_recursive_hmoe = false`
+- `hierarchical_nest_depth = 1`
+- `torus_chunk_len = 1`
+- `signature_lattice_chunk_len = 1`
 - `use_signature_lattice_attention = true`
 - `use_signature_lattice_generation_cache = true`
 - `use_sparse_emitter_routing = true`
@@ -110,6 +113,8 @@ Key defaults:
 - `use_speculative_decoding = true`
 
 Set `--no-sparse-emitter-routing` if you want the older dense emitter scoring path for ablations.
+
+Training and generation share a token-by-token output hierarchy transition. Prompt spans may retain complete observed signatures; answer features use only the emitted prefix. Hierarchy normalization capacities are frozen after tokenizer fitting and saved with the checkpoint. Legacy pretokenized arrays must be rebuilt for this protocol. See [`CAUSAL_PROTOCOL_RESTORATION.md`](./review_artifacts/CAUSAL_PROTOCOL_RESTORATION.md) for the changes and checks.
 
 Precision support is backend-specific:
 

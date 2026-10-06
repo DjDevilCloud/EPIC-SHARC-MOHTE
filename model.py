@@ -2477,22 +2477,22 @@ class SignatureEmitterRegistry(nn.Module):
         max_id = int(unique_ids.max().item())
         if buffer_name == "family_activity":
             if self.training and self.capacity_growth_locked and max_id >= self.family_embedding.num_embeddings:
-                unique_ids = unique_ids.clamp(max=max(0, self.family_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry family capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(max_id, 0, 0)
         elif buffer_name == "relation_activity":
             if self.training and self.capacity_growth_locked and max_id >= self.relation_embedding.num_embeddings:
-                unique_ids = unique_ids.clamp(max=max(0, self.relation_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry relation capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(0, max_id, 0)
         elif buffer_name == "parent_activity":
             if self.training and self.capacity_growth_locked and max_id >= self.parent_embedding.num_embeddings:
-                unique_ids = unique_ids.clamp(max=max(0, self.parent_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry parent capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(max_id, 0, 0)
         else:
             if self.training and self.capacity_growth_locked and max_id >= self.level_embedding.num_embeddings:
-                unique_ids = unique_ids.clamp(max=max(0, self.level_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry level capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(0, 0, max_id)
         activity: torch.Tensor = getattr(self, buffer_name)
@@ -2538,7 +2538,7 @@ class SignatureEmitterRegistry(nn.Module):
         if family_ids.numel() > 0:
             max_family_id = int(family_ids.max().item())
             if self.training and self.capacity_growth_locked and max_family_id >= self.family_embedding.num_embeddings:
-                family_ids = family_ids.clamp(max=max(0, self.family_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry family capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(max_family_id, 0, 0)
         embed = self.family_embedding(family_ids)
@@ -2555,7 +2555,7 @@ class SignatureEmitterRegistry(nn.Module):
         if level_ids.numel() > 0:
             max_level_id = int(level_ids.max().item())
             if self.training and self.capacity_growth_locked and max_level_id >= self.level_embedding.num_embeddings:
-                level_ids = level_ids.clamp(max=max(0, self.level_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry level capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(0, 0, max_level_id)
         embed = self.level_embedding(level_ids.clamp(min=0))
@@ -2569,7 +2569,7 @@ class SignatureEmitterRegistry(nn.Module):
         if relation_ids.numel() > 0:
             max_relation_id = int(relation_ids.max().item())
             if self.training and self.capacity_growth_locked and max_relation_id >= self.relation_embedding.num_embeddings:
-                relation_ids = relation_ids.clamp(max=max(0, self.relation_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry relation capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(0, max_relation_id, 0)
         embed = self.relation_embedding(relation_ids.clamp(min=0))
@@ -2584,7 +2584,7 @@ class SignatureEmitterRegistry(nn.Module):
         if parent_ids.numel() > 0:
             max_parent_id = int(parent_ids.max().item())
             if self.training and self.capacity_growth_locked and max_parent_id >= self.parent_embedding.num_embeddings:
-                parent_ids = parent_ids.clamp(max=max(0, self.parent_embedding.num_embeddings - 1))
+                raise RuntimeError("Registry parent capacity is locked; prepare capacity before training.")
             else:
                 self._ensure_capacity(max_parent_id, 0, 0)
         embed = self.parent_embedding(parent_ids.clamp(min=0))
@@ -3430,26 +3430,25 @@ class PrismalTorusCore(nn.Module):
             )
             return step_output.unsqueeze(1), current_state, stats
 
-        step_hidden = hidden_chunk[:, 0, :]
-        step_registry_context = registry_context[:, 0, :] if registry_context is not None and registry_context.dim() == 3 else registry_context
-        step_family_context = family_context[:, 0, :] if family_context is not None and family_context.dim() == 3 else family_context
-        step_level_context = level_context[:, 0, :] if level_context is not None and level_context.dim() == 3 else level_context
-        step_relation_context = relation_context[:, 0, :] if relation_context is not None and relation_context.dim() == 3 else relation_context
-        step_parent_context = parent_context[:, 0, :] if parent_context is not None and parent_context.dim() == 3 else parent_context
-        step_output, current_state, stats = self.step(
-            step_hidden,
-            current_state,
-            path_index=path_index,
-            step_index=step_index_offset,
-            relay_mode=relay_mode,
-            registry_context=step_registry_context,
-            family_context=step_family_context,
-            level_context=step_level_context,
-            relation_context=step_relation_context,
-            parent_context=step_parent_context,
-        )
-        chunk_output = hidden_chunk + (step_output - step_hidden).unsqueeze(1)
-        return chunk_output, current_state, dict(stats)
+        # Chunking schedules a causal scan; it must not change the recurrence.
+        def at(context: Optional[torch.Tensor], index: int) -> Optional[torch.Tensor]:
+            return context[:, index, :] if context is not None and context.dim() == 3 else context
+
+        outputs: List[torch.Tensor] = []
+        stat_terms: Dict[str, List[torch.Tensor]] = {}
+        for index in range(chunk_len):
+            step_output, current_state, stats = self.step(
+                hidden_chunk[:, index, :], current_state,
+                path_index=path_index, step_index=step_index_offset + index,
+                relay_mode=relay_mode, registry_context=at(registry_context, index),
+                family_context=at(family_context, index), level_context=at(level_context, index),
+                relation_context=at(relation_context, index), parent_context=at(parent_context, index),
+            )
+            outputs.append(step_output)
+            for name, value in stats.items():
+                stat_terms.setdefault(name, []).append(value)
+        averaged_stats = {name: torch.stack(values).mean(dim=0) for name, values in stat_terms.items()}
+        return torch.stack(outputs, dim=1), current_state, averaged_stats
 
     def chunk_solver_step(
         self,
@@ -3474,7 +3473,7 @@ class PrismalTorusCore(nn.Module):
         chunk_len = hidden_chunk.size(1)
         chunk_hidden_dim = hidden_chunk.size(-1)
         substeps = max(1, min(chunk_len, int(getattr(self.cfg, "chunk_solver_training_substeps", 8))))
-        micro_len = max(1, math.ceil(chunk_len / substeps))
+        micro_len = 1  # Solver scheduling must not change the token recurrence.
         max_iterations = max(1, int(getattr(self.cfg, "chunk_solver_training_iterations", 1)))
         relaxation = float(getattr(self.cfg, "chunk_solver_training_relaxation", 1.0))
         audit_every = max(1, int(getattr(self.cfg, "chunk_solver_training_audit_every", 16)))
@@ -3510,7 +3509,7 @@ class PrismalTorusCore(nn.Module):
         for micro_start in range(0, chunk_len, micro_len):
             micro_end = min(chunk_len, micro_start + micro_len)
             micro_hidden = hidden_chunk[:, micro_start:micro_end, :]
-            micro_step_index = micro_start // micro_len
+            micro_step_index = step_index_offset + micro_start
             use_exact_solver = (micro_step_index % audit_every) == 0
             if use_exact_solver:
                 # Anchor the exact audit pass on the first token only. Using
@@ -4261,10 +4260,14 @@ class SignatureLatticeAttention(nn.Module):
         relation_bias_all = self.relation_bias(relation_ids)
         outputs: List[torch.Tensor] = []
         gate_terms: List[torch.Tensor] = [] if collect_telemetry else []
-        num_chunks = (seq_len + self.chunk_len - 1) // self.chunk_len
-        for chunk_index in range(num_chunks):
-            chunk_start = chunk_index * self.chunk_len
-            chunk_end = min(seq_len, chunk_start + self.chunk_len)
+        # Every token reads/writes the lattice. A scheduling chunk never skips
+        # tokens or broadcasts another token's cache update.
+        token_positions = (
+            position for start in range(0, seq_len, self.chunk_len)
+            for position in range(start, min(seq_len, start + self.chunk_len))
+        )
+        for chunk_start in token_positions:
+            chunk_end = chunk_start + 1
             h = hidden[:, chunk_start, :]
             q = q_all[:, chunk_start, :] + level_bias_all[:, chunk_start, :] + relation_bias_all[:, chunk_start, :]
             candidate_ids = torch.stack(
@@ -4297,7 +4300,7 @@ class SignatureLatticeAttention(nn.Module):
             decay_scale = lattice_state.cache_decay_scale * self.decay
             update = write_value.unsqueeze(1).expand(-1, write_ids.size(1), -1) / float(write_ids.size(1))
             cache_update = update / decay_scale.clamp_min(1e-12)
-            cache.scatter_add_(
+            cache = cache.scatter_add(
                 1,
                 write_ids.unsqueeze(-1).expand(-1, -1, self.r),
                 cache_update,
@@ -5319,6 +5322,15 @@ class PrismalEmitterRouter(nn.Module):
         parent_signature_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.training and self.capacity_growth_locked:
+            for name, ids, embedding in (
+                ("signature", signature_ids, self.signature_embedding),
+                ("family", signature_family_ids, self.family_embedding),
+                ("level", signature_level_ids, self.level_embedding),
+                ("relation", signature_relation_ids, self.relation_embedding),
+                ("parent", parent_signature_ids, self.parent_embedding),
+            ):
+                if ids is not None and ids.numel() > 0 and int(ids.max().item()) >= embedding.num_embeddings:
+                    raise RuntimeError(f"Router {name} capacity is locked; prepare capacity before training.")
             if signature_ids is not None and signature_ids.numel() > 0:
                 signature_ids = signature_ids.clamp(max=max(0, self.signature_embedding.num_embeddings - 1))
             if signature_family_ids is not None and signature_family_ids.numel() > 0:
@@ -7134,10 +7146,6 @@ class PrismalWaveModel(nn.Module):
                 return torch.float32
             return compute_dtype
 
-        if source_dtype is not None and torch.is_floating_point(torch.empty((), dtype=source_dtype)):
-            if not is_float8_dtype(source_dtype):
-                return source_dtype
-
         projection = self.hierarchy_vector_projection
         weight = getattr(projection, "weight", None)
         if torch.is_tensor(weight) and weight.is_floating_point():
@@ -7152,6 +7160,11 @@ class PrismalWaveModel(nn.Module):
         *,
         device: torch.device,
     ) -> torch.Tensor:
+        # The storage rounding is part of the feature contract, including when
+        # callers provide FP32 features or decoding reconstructs them from IDs.
+        storage_dtype = getattr(torch, str(getattr(self.cfg, "hierarchy_vector_dtype", "float32")), torch.float32)
+        if hierarchy_vectors.dtype != storage_dtype:
+            hierarchy_vectors = hierarchy_vectors.to(dtype=storage_dtype)
         target_dtype = self._hierarchy_vector_compute_dtype(device, source_dtype=hierarchy_vectors.dtype)
         if hierarchy_vectors.device != device or hierarchy_vectors.dtype != target_dtype:
             hierarchy_vectors = hierarchy_vectors.to(device=device, dtype=target_dtype)
@@ -7198,6 +7211,16 @@ class PrismalWaveModel(nn.Module):
         if signature_family_ids is None:
             signature_family_ids = torch.zeros_like(input_ids)
 
+        normalization = dict(getattr(self.cfg, "hierarchy_vector_normalization", {}) or {})
+        if not normalization:
+            normalization = {
+                "token_vocab_size": max(self.vocab_size, 1),
+                "signature_vocab_size": max(self.signature_vocab_size, 1),
+                "level_vocab_size": max(self.signature_level_vocab_size, 1),
+                "relation_vocab_size": max(self.signature_relation_vocab_size, 1),
+                "family_vocab_size": max(self.signature_bucket_vocab_size, 1),
+            }
+            self.cfg.hierarchy_vector_normalization = dict(normalization)
         hierarchy_vectors = _build_hierarchy_vector_tensor(
             input_ids,
             signature_ids,
@@ -7205,11 +7228,9 @@ class PrismalWaveModel(nn.Module):
             signature_relation_ids,
             parent_signature_ids,
             signature_family_ids,
-            token_vocab_size=max(self.vocab_size, 1),
-            signature_vocab_size=max(self.signature_vocab_size, 1),
-            level_vocab_size=max(self.signature_level_vocab_size, 1),
-            relation_vocab_size=max(self.signature_relation_vocab_size, 1),
-            family_vocab_size=max(int(signature_family_ids.max().item()) + 1 if signature_family_ids.numel() > 0 else 1, 1),
+            **normalization,
+            low_rank_enabled=bool(getattr(self.cfg, "hierarchy_vector_low_rank_enabled", True)),
+            low_rank_dim=int(getattr(self.cfg, "hierarchy_vector_low_rank_dim", 4)),
         )
         hierarchy_vectors = self._prepare_hierarchy_vectors_for_projection(hierarchy_vectors, device=input_ids.device)
         hierarchy_vectors = self._fit_hierarchy_vector_width(hierarchy_vectors)
@@ -7807,20 +7828,6 @@ class PrismalWaveModel(nn.Module):
             self._ensure_position_embedding_capacity(position_offset + seq_len)
 
         family_ids_for_context = signature_family_ids if signature_family_ids is not None else signature_ids
-        if (
-            signature_family_ids is not None
-            or signature_ids is not None
-            or signature_level_ids is not None
-            or signature_relation_ids is not None
-            or parent_signature_ids is not None
-        ):
-            self.registry.observe(
-                family_ids=family_ids_for_context,
-                level_ids=signature_level_ids,
-                relation_ids=signature_relation_ids,
-                parent_ids=parent_signature_ids,
-            )
-
         family_context_seq: Optional[torch.Tensor] = None
         level_context_seq: Optional[torch.Tensor] = None
         relation_context_seq: Optional[torch.Tensor] = None
@@ -8032,6 +8039,10 @@ class PrismalWaveModel(nn.Module):
             path_vram.setdefault("vram_sharc_router_reserved_delta_mb", 0.0)
 
         chunk_len = max(1, int(getattr(self.cfg, "torus_chunk_len", seq_len)))
+        if self.token_hierarchy is not None:
+            # Nested mixture/family gates consume a token-sized causal context.
+            # Larger scheduling blocks require a proven equivalent gate scan.
+            chunk_len = 1
         num_chunks = (seq_len + chunk_len - 1) // chunk_len
         use_chunk_solver = (
             bool(getattr(self.cfg, "use_fixed_point_solver", False))
@@ -8069,7 +8080,7 @@ class PrismalWaveModel(nn.Module):
                     level_context_: torch.Tensor,
                     relation_context_: torch.Tensor,
                     parent_context_: torch.Tensor,
-                    _chunk_start=chunk_start,
+                    _chunk_start=position_offset + chunk_start,
                     _signature_family_slice=signature_family_slice,
                     _signature_ids_slice=signature_ids_slice,
                     _signature_level_slice=signature_level_slice,
@@ -8141,7 +8152,7 @@ class PrismalWaveModel(nn.Module):
                             relation_context=chunk_relation_context,
                             parent_context=chunk_parent_context,
                             path_index=path_index,
-                            step_index_offset=chunk_start,
+                            step_index_offset=position_offset + chunk_start,
                             use_solver=use_chunk_solver,
                             relay_mode=False,
                         ),
@@ -8177,7 +8188,7 @@ class PrismalWaveModel(nn.Module):
                         relation_context=chunk_relation_context if chunk_relation_context is not None else empty_context,
                         parent_context=chunk_parent_context if chunk_parent_context is not None else empty_context,
                         path_index=path_index,
-                        step_index_offset=chunk_start,
+                        step_index_offset=position_offset + chunk_start,
                     ),
                     vram_enabled=profile_vram,
                     vram_stats=path_vram,
@@ -8209,7 +8220,7 @@ class PrismalWaveModel(nn.Module):
                             relation_context=chunk_relation_context,
                             parent_context=chunk_parent_context,
                             path_index=path_index,
-                            step_index_offset=chunk_start,
+                            step_index_offset=position_offset + chunk_start,
                             use_solver=use_chunk_solver,
                             relay_mode=False,
                         ),
@@ -9640,6 +9651,24 @@ class PrismalWaveModel(nn.Module):
                 next_slot_state = self.router.init_slots(input_ids.size(0), input_ids.device)
         return logits, next_slot_state, output
 
+    def _causal_generation_metadata(
+        self, history: torch.Tensor, next_ids: torch.Tensor,
+        fallback: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokenizer = getattr(self, "_prismal_tokenizer", None)
+        if tokenizer is None:
+            return fallback
+        rows = []
+        for previous, next_row in zip(history.tolist(), next_ids.tolist()):
+            frames = []
+            for token_id in next_row:
+                frames.append(tokenizer.output_hierarchy_frame(previous, token_id))
+                previous.append(token_id)
+            rows.append(frames)
+        frames_tensor = torch.tensor(rows, device=next_ids.device, dtype=torch.long)
+        signatures, levels, relations, parents, families = frames_tensor.unbind(dim=-1)
+        return signatures, families, levels, relations, parents
+
     def _apply_generation_safety_mask(self, logits: torch.Tensor) -> torch.Tensor:
         """Suppress universal non-output ids; codec-specific masks are passed explicitly."""
         blocked = logits.clone()
@@ -10025,6 +10054,9 @@ class PrismalWaveModel(nn.Module):
                                     self.signature_relation_to_id["continuation"],
                                 )
                                 next_parent = next_sig.clone()
+                                next_sig, next_family, next_level, next_relation, next_parent = self._causal_generation_metadata(
+                                    beam["generated"], next_id, (next_sig, next_family, next_level, next_relation, next_parent)
+                                )
                                 new_generated = torch.cat([beam["generated"], next_id], dim=-1)
                                 new_families = torch.cat([beam["families"], next_family], dim=-1)
                                 new_signatures = torch.cat([beam["signatures"], next_sig], dim=-1)
@@ -10152,6 +10184,9 @@ class PrismalWaveModel(nn.Module):
                         self.signature_relation_to_id["continuation"],
                     )
                     next_parent = next_sig.clone()
+                    next_sig, next_family, next_level, next_relation, next_parent = self._causal_generation_metadata(
+                        beam["generated"], next_id, (next_sig, next_family, next_level, next_relation, next_parent)
+                    )
                     new_generated = torch.cat([beam["generated"], next_id], dim=-1)
                     new_families = torch.cat([beam["families"], next_family], dim=-1)
                     new_signatures = torch.cat([beam["signatures"], next_sig], dim=-1)
@@ -10280,7 +10315,7 @@ class PrismalWaveModel(nn.Module):
             values = lookup_tensor[token_ids.squeeze(-1).long()]
             return values.to(device=token_ids.device, dtype=token_ids.dtype).unsqueeze(-1)
 
-        def _build_signature_tensors(token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        def _build_signature_tensors(token_ids: torch.Tensor, history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             next_sig = _lookup_next_tokens(token_signature_lookup_tensor, token_ids, 7)
             next_family = _lookup_next_tokens(token_family_lookup_tensor, token_ids, 0)
             next_level = _lookup_next_tokens(token_level_lookup_tensor, token_ids, self.signature_level_to_id["char"])
@@ -10290,7 +10325,9 @@ class PrismalWaveModel(nn.Module):
                 self.signature_relation_to_id["continuation"],
             )
             next_parent = next_sig.clone()
-            return next_sig, next_family, next_level, next_relation, next_parent
+            return self._causal_generation_metadata(
+                history, token_ids, (next_sig, next_family, next_level, next_relation, next_parent)
+            )
 
         def apply_repetition_penalty(logits: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
             if repetition_penalty <= 1.0:
@@ -10487,7 +10524,9 @@ class PrismalWaveModel(nn.Module):
                 else:
                     draft_logits, _ = self._sanitize_sampling_logits(draft_logits)
                     next_token = torch.argmax(draft_logits, dim=-1, keepdim=True)
-                next_signature, next_family, next_level, next_relation, next_parent = _build_signature_tensors(next_token)
+                next_signature, next_family, next_level, next_relation, next_parent = _build_signature_tensors(
+                    next_token, torch.cat([generated] + draft_tokens, dim=1)
+                )
                 draft_tokens.append(next_token)
                 draft_signatures.append(next_signature)
                 draft_families.append(next_family)
@@ -10555,7 +10594,7 @@ class PrismalWaveModel(nn.Module):
                     break
             if accept_count <= 0:
                 accepted_tokens = verify_predictions[:, :1]
-                accepted_signatures, accepted_families, accepted_levels, accepted_relations, accepted_parents = _build_signature_tensors(accepted_tokens)
+                accepted_signatures, accepted_families, accepted_levels, accepted_relations, accepted_parents = _build_signature_tensors(accepted_tokens, generated)
                 accept_count = 1
             else:
                 accepted_tokens = draft_tokens_tensor[:, :accept_count]
@@ -10707,6 +10746,15 @@ class PrismalWaveModel(nn.Module):
         output.route_stats["token_superposition_bag_count"] = torch.tensor(float(output.logits.size(1)), device=output.logits.device)
         loss = ce + output.aux_loss
         output.ce_loss = ce.detach()
+        # Registry birth/activity statistics are training observations, not a
+        # hidden state mutation while reading a prompt or evaluating a prefix.
+        # Commit after the forward pass so its conditioning stays fixed.
+        if self.training:
+            self.registry.observe(
+                family_ids=signature_family_ids if signature_family_ids is not None else signature_ids,
+                level_ids=signature_level_ids, relation_ids=signature_relation_ids,
+                parent_ids=parent_signature_ids,
+            )
         return loss, output
 
     @torch.no_grad()
@@ -10800,6 +10848,7 @@ class PrismalWaveModel(nn.Module):
             and self.use_hmote
             and beam_size == 1
             and not anchor_rail_active
+            and (self.signature_lattice_attention is None or bool(self.cfg.use_signature_lattice_generation_cache))
         ):
             return self._coarse_fine_speculative_generate(
                 input_ids,
@@ -11048,14 +11097,14 @@ class PrismalWaveModel(nn.Module):
         anchor_next_ids = self._token_memory_anchor_next_ids(anchor_token_memory_state, device=input_ids.device)
         if anchor_next_ids is not None:
             probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
+            next_id = logits.argmax(dim=-1, keepdim=True) if temperature <= 0.0 else torch.multinomial(probs, num_samples=1)
             active_anchor_mask = anchor_next_ids.ge(0)
             if bool(active_anchor_mask.any().item()):
                 next_id = next_id.clone()
                 next_id[active_anchor_mask] = anchor_next_ids[active_anchor_mask]
         else:
             probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
+            next_id = logits.argmax(dim=-1, keepdim=True) if temperature <= 0.0 else torch.multinomial(probs, num_samples=1)
         anchor_token_memory_state = self._advance_token_memory_anchor_state(anchor_token_memory_state, next_id)
         if token_signature_lookup is not None:
             next_sig = _lookup_next_tokens(token_signature_lookup_tensor, next_id, 7)
@@ -11078,6 +11127,9 @@ class PrismalWaveModel(nn.Module):
         else:
             next_relation = torch.full_like(next_id, fill_value=self.signature_relation_to_id["continuation"])
         next_parent = next_sig.clone()
+        next_sig, next_family, next_level, next_relation, next_parent = self._causal_generation_metadata(
+            generated, next_id, (next_sig, next_family, next_level, next_relation, next_parent)
+        )
         generated = torch.cat([generated, next_id], dim=-1)
         generated_families = torch.cat([generated_families, next_family], dim=-1)
         generated_signatures = torch.cat([generated_signatures, next_sig], dim=-1)
@@ -11094,19 +11146,30 @@ class PrismalWaveModel(nn.Module):
             if relay_needed and laps_used >= generation_lap_cap - 1:
                 relay_needed = False
             current_path_index = None if relay_needed else committed_path_index
-            logits, carried_slots, output = self.forward_incremental(
-                generated[:, -1:],
-                signature_family_ids=generated_families[:, -1:],
-                signature_ids=generated_signatures[:, -1:],
-                signature_level_ids=generated_levels[:, -1:],
-                signature_relation_ids=generated_relations[:, -1:],
-                parent_signature_ids=generated_parents[:, -1:],
-                slot_state=carried_slots,
-                signature_lattice_state=carried_lattice_state,
-                token_memory_state=carried_token_memory_state,
-                path_index=current_path_index,
-                position_index=generated.size(1) - 1,
-            )
+            if self.signature_lattice_attention is not None and not bool(self.cfg.use_signature_lattice_generation_cache):
+                # Disabling the cache means replaying the observed prefix, not
+                # silently removing lattice memory from the trained model.
+                output = self.forward(
+                    generated, signature_family_ids=generated_families,
+                    signature_ids=generated_signatures, signature_level_ids=generated_levels,
+                    signature_relation_ids=generated_relations, parent_signature_ids=generated_parents,
+                    path_index=current_path_index,
+                )
+                logits, carried_slots = output.logits[:, -1, :], output.slot_state
+            else:
+                logits, carried_slots, output = self.forward_incremental(
+                    generated[:, -1:],
+                    signature_family_ids=generated_families[:, -1:],
+                    signature_ids=generated_signatures[:, -1:],
+                    signature_level_ids=generated_levels[:, -1:],
+                    signature_relation_ids=generated_relations[:, -1:],
+                    parent_signature_ids=generated_parents[:, -1:],
+                    slot_state=carried_slots,
+                    signature_lattice_state=carried_lattice_state,
+                    token_memory_state=carried_token_memory_state,
+                    path_index=current_path_index,
+                    position_index=generated.size(1) - 1,
+                )
             carried_lattice_state = output.signature_lattice_state if output.signature_lattice_state is not None else carried_lattice_state
             carried_token_memory_state = output.token_memory_state if output.token_memory_state is not None else carried_token_memory_state
             selected = output.route_stats.get("selected_path_index")
@@ -11152,14 +11215,14 @@ class PrismalWaveModel(nn.Module):
             anchor_next_ids = self._token_memory_anchor_next_ids(anchor_token_memory_state, device=input_ids.device)
             if anchor_next_ids is not None:
                 probs = F.softmax(logits, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
+                next_id = logits.argmax(dim=-1, keepdim=True) if temperature <= 0.0 else torch.multinomial(probs, num_samples=1)
                 active_anchor_mask = anchor_next_ids.ge(0)
                 if bool(active_anchor_mask.any().item()):
                     next_id = next_id.clone()
                     next_id[active_anchor_mask] = anchor_next_ids[active_anchor_mask]
             else:
                 probs = F.softmax(logits, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
+                next_id = logits.argmax(dim=-1, keepdim=True) if temperature <= 0.0 else torch.multinomial(probs, num_samples=1)
             anchor_token_memory_state = self._advance_token_memory_anchor_state(anchor_token_memory_state, next_id)
             if token_signature_lookup is not None:
                 next_sig = _lookup_next_tokens(token_signature_lookup_tensor, next_id, 7)
@@ -11182,6 +11245,9 @@ class PrismalWaveModel(nn.Module):
             else:
                 next_relation = torch.full_like(next_id, fill_value=self.signature_relation_to_id["continuation"])
             next_parent = next_sig.clone()
+            next_sig, next_family, next_level, next_relation, next_parent = self._causal_generation_metadata(
+                generated, next_id, (next_sig, next_family, next_level, next_relation, next_parent)
+            )
             generated = torch.cat([generated, next_id], dim=-1)
             generated_families = torch.cat([generated_families, next_family], dim=-1)
             generated_signatures = torch.cat([generated_signatures, next_sig], dim=-1)

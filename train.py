@@ -7,6 +7,7 @@ import math
 import json
 import hashlib
 import tempfile
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import time
@@ -173,7 +174,7 @@ def _tokenizer_cache_key(
     hierarchy_vector_low_rank_dim: int,
 ) -> str:
     payload = {
-        "cache_version": 3,
+        "cache_version": 8,
         "base_tokenizer": base_tokenizer_fingerprint,
         "source": _tokenizer_source_fingerprint(source),
         "settings": {
@@ -836,7 +837,7 @@ def build_tokenizer_from_source(
     )
     try:
         cache_payload = {
-            "cache_version": 3,
+            "cache_version": 8,
             "source": str(Path(source).resolve()),
             "base_tokenizer": base_fingerprint,
             "settings": {
@@ -958,11 +959,13 @@ def build_train_val_dataloaders(
     *,
     val_fraction: float = 0.1,
     max_samples: int = 1000,
+    val_max_samples: int | None = None,
     seed: int = 42,
     streaming: bool = True,
     hierarchy_vector_dtype: object = "float8_e4m3fn",
 ) -> tuple[DataLoader, DataLoader]:
     hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
+    val_sample_limit = max_samples if val_max_samples is None else max(0, int(val_max_samples))
     if isinstance(texts_or_source, (str, Path)):
         source = Path(texts_or_source)
         pretokenized_root = _find_pretokenized_root(source)
@@ -980,7 +983,7 @@ def build_train_val_dataloaders(
                 split="val",
                 val_fraction=val_fraction,
                 seed=seed,
-                max_samples=max_samples,
+                max_samples=val_sample_limit,
                 hierarchy_vector_dtype=hierarchy_dtype,
             )
             train_loader = DataLoader(
@@ -1037,7 +1040,7 @@ def build_train_val_dataloaders(
             source,
             tokenizer,
             seq_len=seq_len,
-            max_samples=max_samples,
+            max_samples=val_sample_limit,
             split="val",
             val_fraction=val_fraction,
             seed=seed,
@@ -1147,6 +1150,7 @@ def save_checkpoint(
             if hasattr(config, field_name):
                 setattr(cfg, field_name, getattr(config, field_name))
     saved_cfg = PrismalWaveConfig.from_dict(cfg.to_dict())
+    saved_cfg.hierarchy_vector_normalization = dict(model.cfg.hierarchy_vector_normalization)
     saved_cfg.vocab_size = 0
     saved_cfg.signature_vocab_size = 0
     saved_cfg.signature_level_vocab_size = 0
@@ -1652,6 +1656,7 @@ def maybe_compile_model(model: PrismalWaveModel, *, enabled: bool = True) -> Pri
 def resolve_runtime_config(cfg: PrismalWaveConfig, tokenizer: PrismalTokenizer) -> PrismalWaveConfig:
     runtime_cfg = PrismalWaveConfig.from_dict(cfg.to_dict())
     runtime_cfg.base_vocab_size = tokenizer.base_vocab_size
+    runtime_cfg.hierarchy_vector_normalization = tokenizer.hierarchy_normalization_capacities
     if getattr(runtime_cfg, "use_hmote", False) or getattr(runtime_cfg, "use_recursive_hmoe", False):
         runtime_cfg.use_torus_core = True
     if runtime_cfg.vocab_size <= 0:
@@ -1755,6 +1760,20 @@ def _infer_runtime_sizes_from_state(
     return runtime_cfg
 
 
+def _bind_checkpoint_hierarchy(model: PrismalWaveModel, tokenizer: PrismalTokenizer, payload: Dict[str, object]) -> None:
+    model._prismal_tokenizer = tokenizer
+    _unwrap_model(model)._prismal_tokenizer = tokenizer
+    if not model.cfg.hierarchy_vector_normalization:
+        model.cfg.hierarchy_vector_normalization = tokenizer.hierarchy_normalization_capacities
+    tokenizer_state = payload.get("tokenizer_state")
+    if isinstance(tokenizer_state, dict) and int(tokenizer_state.get("hierarchy_protocol_version", 0)) != 1:
+        warnings.warn(
+            "This checkpoint predates the causal hierarchy protocol. Its weights remain loadable, "
+            "but new execution does not validate its earlier training; use a fresh control run before assessing quality.",
+            stacklevel=2,
+        )
+
+
 def load_model_from_checkpoint(checkpoint_path: str | Path, device: str | torch.device | None = None) -> PrismalWaveModel:
     device_obj = resolve_device(device)
     payload = torch.load(checkpoint_path, map_location=device_obj)
@@ -1796,6 +1815,7 @@ def load_model_from_checkpoint(checkpoint_path: str | Path, device: str | torch.
         model.configure_precision(device_obj, enabled=False)
     refresh_quantized_caches(model)
     model.eval()
+    _bind_checkpoint_hierarchy(model, tokenizer, payload)
     return model
 
 
@@ -1878,6 +1898,7 @@ def load_bundle_from_checkpoint(
             model.configure_precision(device_obj, enabled=False)
     refresh_quantized_caches(model)
     model.eval()
+    _bind_checkpoint_hierarchy(model, tokenizer, payload)
     return model, tokenizer, cfg
 
 
@@ -3069,6 +3090,10 @@ def generate_text(
 ) -> str:
     model.eval()
     prompt = _format_generation_prompt(prompt, template_prompt=template_prompt)
+    model._prismal_tokenizer = tokenizer
+    _unwrap_model(model)._prismal_tokenizer = tokenizer
+    if not model.cfg.hierarchy_vector_normalization:
+        model.cfg.hierarchy_vector_normalization = tokenizer.hierarchy_normalization_capacities
     conditioning_prompt = _fast_context_generation_prompt(
         prompt,
         cfg=getattr(model, "cfg", PrismalWaveConfig()),

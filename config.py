@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """Configuration for the standalone Prismal Torus prototype."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -121,6 +121,7 @@ class PrismalWaveConfig:
     hierarchy_vector_dtype: str = "float8_e4m3fn"
     hierarchy_vector_low_rank_enabled: bool = True
     hierarchy_vector_low_rank_dim: int = 4
+    hierarchy_vector_normalization: Dict[str, int] = field(default_factory=dict)
     per_family_torus_enabled: bool = True
     per_family_torus_scale: float = 0.125
     family_specialist_d_model: int = 64
@@ -144,8 +145,8 @@ class PrismalWaveConfig:
     signature_lattice_candidates: int = 8
     signature_lattice_weight: float = 0.25
     signature_lattice_decay: float = 0.85
-    signature_lattice_chunk_len: int = 8
-    use_signature_lattice_generation_cache: bool = False
+    signature_lattice_chunk_len: int = 1
+    use_signature_lattice_generation_cache: bool = True
     use_sparse_emitter_routing: bool = True
     router_sparse_candidate_budget: int = 32
     use_token_superposition_training: bool = True
@@ -240,7 +241,7 @@ class PrismalWaveConfig:
     torus_lane_relay_hop_spacing: int = 6
     generation_lap_cap: int = 2
     generation_lap_token_cap: int = 32
-    torus_chunk_len: int = 16
+    torus_chunk_len: int = 1
     use_fixed_point_solver: bool = True
     use_chunk_solver_training: bool = False
     chunk_solver_training_iterations: int = 1
@@ -473,7 +474,7 @@ class PrismalWaveConfig:
         if self.signature_lattice_decay > 1.0:
             self.signature_lattice_decay = 1.0
         if self.signature_lattice_chunk_len < 1:
-            self.signature_lattice_chunk_len = 8
+            self.signature_lattice_chunk_len = 1
         self.use_contrastive_routing = bool(self.use_contrastive_routing)
         self.contrastive_routing_hard_negatives = bool(self.contrastive_routing_hard_negatives)
         self.use_contrastive_routing_signature_neighborhood = bool(self.use_contrastive_routing_signature_neighborhood)

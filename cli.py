@@ -608,6 +608,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_p.add_argument("--seq-len", type=int, default=0)
     train_p.add_argument("--lr", type=float, default=default_cfg.lr)
     train_p.add_argument("--max-samples", type=int, default=default_cfg.max_samples)
+    train_p.add_argument(
+        "--val-max-samples",
+        type=int,
+        default=None,
+        help="Maximum validation windows; defaults to --max-samples",
+    )
     train_p.add_argument("--max-new-tokens", type=int, default=0)
     train_p.add_argument("--min-token-frequency", type=int, default=2)
     train_p.add_argument("--dataset-streaming", dest="dataset_streaming", action="store_true")
@@ -1398,6 +1404,7 @@ def main(argv: List[str] | None = None) -> int:
             seq_len=args.seq_len,
             batch_size=args.batch_size,
             max_samples=args.max_samples,
+            val_max_samples=args.val_max_samples,
             val_fraction=args.val_fraction,
             seed=args.seed,
             streaming=getattr(args, "dataset_streaming", True),

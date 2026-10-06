@@ -491,7 +491,7 @@ class SmokeTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(linear_field, legacy_field))
 
-    def test_torus_chunked_step_returns_direct_stats_for_single_step_chunk(self) -> None:
+    def test_torus_chunked_step_updates_every_token_and_averages_stats(self) -> None:
         cfg = PrismalWaveConfig()
         cfg.d_model = 8
         cfg.n_paths = 1
@@ -520,9 +520,9 @@ class SmokeTests(unittest.TestCase):
         with mock.patch.object(core, "step", side_effect=fake_step) as patched_step:
             chunk_output, next_state, chunk_stats = core.chunked_step(hidden_chunk, field_state)
 
-        expected_output = hidden_chunk + (step_output - hidden_chunk[:, 0, :]).unsqueeze(1)
+        expected_output = step_output.unsqueeze(1).expand_as(hidden_chunk)
         self.assertTrue(torch.allclose(chunk_output, expected_output))
-        self.assertEqual(patched_step.call_count, 1)
+        self.assertEqual(patched_step.call_count, hidden_chunk.size(1))
         self.assertIsNot(chunk_stats, step_stats)
         self.assertEqual(set(chunk_stats.keys()), set(step_stats.keys()))
         self.assertTrue(torch.equal(chunk_stats["recursive_depth"], step_stats["recursive_depth"]))
@@ -653,8 +653,8 @@ class SmokeTests(unittest.TestCase):
             "--save-dir",
             "tmp/run",
         ])
-        self.assertFalse(args.use_contrastive_routing)
-        self.assertFalse(args.use_contrastive_routing_signature_neighborhood)
+        self.assertEqual(args.use_contrastive_routing, PrismalWaveConfig().use_contrastive_routing)
+        self.assertEqual(args.use_contrastive_routing_signature_neighborhood, PrismalWaveConfig().use_contrastive_routing_signature_neighborhood)
         args = parser.parse_args([
             "train",
             "--data",
@@ -718,7 +718,7 @@ class SmokeTests(unittest.TestCase):
             "--save-dir",
             "tmp/run",
         ])
-        self.assertFalse(args.use_token_superposition_training)
+        self.assertEqual(args.use_token_superposition_training, PrismalWaveConfig().use_token_superposition_training)
         self.assertEqual(args.token_superposition_bag_size, PrismalWaveConfig().token_superposition_bag_size)
 
         args = parser.parse_args([
@@ -2611,7 +2611,7 @@ class SmokeTests(unittest.TestCase):
         self.assertIsNotNone(bf16_context)
         assert bf16_context is not None
         self.assertEqual(tuple(bf16_context.shape[:2]), tuple(input_ids.shape))
-        self.assertEqual(bf16_context.dtype, torch.bfloat16)
+        self.assertEqual(bf16_context.dtype, model.hierarchy_vector_projection.weight.dtype)
 
         if hasattr(torch, "float8_e4m3fn"):
             try:
@@ -2815,12 +2815,16 @@ class SmokeTests(unittest.TestCase):
 
     def test_mini_overfit_fixture_loads(self) -> None:
         fixture = ROOT / "BaseData" / "mini_overfit" / "mini_overfit.jsonl"
+        if not fixture.exists():
+            self.skipTest("Optional BaseData/mini_overfit fixture is not present in this checkout")
         texts = list(iter_text_corpus(fixture))
         self.assertGreaterEqual(len(texts), 8)
         self.assertTrue(any("cat" in text.lower() for text in texts))
 
     def test_mini_overfit_training_can_memorize_fixture(self) -> None:
         fixture = ROOT / "BaseData" / "mini_overfit" / "mini_overfit.jsonl"
+        if not fixture.exists():
+            self.skipTest("Optional BaseData/mini_overfit fixture is not present in this checkout")
         tokenizer = PrismalTokenizer()
         train_loader, val_loader = build_train_val_dataloaders(
             fixture,

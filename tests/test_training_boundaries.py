@@ -25,6 +25,7 @@ from data import (
     build_collate_fn,
 )
 from train import (
+    build_train_val_dataloaders,
     _fast_context_bundle_from_text,
     _prepend_fast_context_prefix,
     _token_superposition_phase_active,
@@ -123,6 +124,49 @@ class TrainingBoundaryTests(unittest.TestCase):
         self.assertEqual(targets["<LINE>"][0], 0.0, "the seeded first line frame must remain contextual")
         self.assertTrue(any(value > 0.0 for value in targets["<LINE>"][1:]), "later line frames must be generated")
 
+    def test_seeded_assistant_line_uses_generation_neutral_hierarchy(self) -> None:
+        tokenizer = PrismalTokenizer()
+        prompt = "Give two lines."
+        text = (
+            f"<BOI>{prompt}<EOI><BOO>"
+            "A detailed first answer line.\nA different second answer line.<EOO>"
+        )
+        sample = _build_window_samples_from_text(tokenizer, text, seq_len=0)[0]
+        names = self._token_names(tokenizer, sample.input_ids.tolist())
+        boo_index = names.index("<BOO>")
+        first_output_line = names.index("<LINE>", boo_index + 1)
+
+        # The loss mask is aligned to labels, so the target at input index i is
+        # stored at i - 1.
+        self.assertEqual(int(sample.loss_mask[first_output_line - 1]), 0)
+        self.assertEqual(int(sample.signature_ids[first_output_line]), tokenizer.signature_blo_id)
+        self.assertEqual(
+            int(sample.signature_level_ids[first_output_line]), tokenizer.signature_level_to_id["line"]
+        )
+        self.assertEqual(
+            int(sample.signature_relation_ids[first_output_line]), tokenizer.signature_relation_to_id["containment"]
+        )
+        self.assertEqual(int(sample.parent_signature_ids[first_output_line]), tokenizer.signature_blo_id)
+        self.assertEqual(
+            int(sample.signature_family_ids[first_output_line]), tokenizer.signature_family_to_id["line"]
+        )
+
+        generation = tokenizer.prepare_generation_hierarchy(prompt)
+        prefix_len = len(generation.token_ids)
+        self.assertEqual(sample.input_ids[:prefix_len].tolist(), generation.token_ids)
+        self.assertEqual(sample.signature_ids[:prefix_len].tolist(), generation.signature_ids)
+        self.assertEqual(sample.signature_level_ids[:prefix_len].tolist(), generation.signature_level_ids)
+        self.assertEqual(sample.signature_relation_ids[:prefix_len].tolist(), generation.signature_relation_ids)
+        self.assertEqual(sample.parent_signature_ids[:prefix_len].tolist(), generation.parent_signature_ids)
+        self.assertEqual(sample.signature_family_ids[:prefix_len].tolist(), generation.signature_family_ids)
+        self.assertTrue(
+            torch.equal(
+                sample.hierarchy_vectors[:prefix_len],
+                torch.as_tensor(generation.hierarchy_vectors, dtype=sample.hierarchy_vectors.dtype),
+            ),
+            "training and inference hierarchy features must match through the seeded assistant line",
+        )
+
     def test_streaming_sample_order_is_reproducible_from_seed(self) -> None:
         tokenizer = PrismalTokenizer()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,6 +184,33 @@ class TrainingBoundaryTests(unittest.TestCase):
             ]
             samples = [[sample.input_ids.tolist() for sample in dataset] for dataset in datasets]
         self.assertEqual(samples[0], samples[1])
+
+    def test_streaming_validation_sample_limit_is_independent(self) -> None:
+        tokenizer = PrismalTokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "records.jsonl"
+            source.write_text(
+                "\n".join(
+                    json.dumps({"text": f"<BOI>Prompt {i}<EOI><BOO>Answer {i} with context.<EOO>"})
+                    for i in range(20)
+                ),
+                encoding="utf-8",
+            )
+            train_loader, val_loader = build_train_val_dataloaders(
+                source,
+                tokenizer,
+                seq_len=32,
+                batch_size=1,
+                val_fraction=0.25,
+                max_samples=8,
+                val_max_samples=2,
+                seed=123,
+                streaming=True,
+            )
+            train_count = sum(1 for _ in train_loader.dataset)
+            val_count = sum(1 for _ in val_loader.dataset)
+        self.assertEqual(train_count, 8)
+        self.assertEqual(val_count, 2)
 
     def test_loss_mask_label_shift_alignment(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -159,7 +230,7 @@ class TrainingBoundaryTests(unittest.TestCase):
         bundle = tokenizer.prepare_generation_hierarchy("What is a torus?")
         names = self._token_names(tokenizer, bundle.token_ids)
         self.assertEqual(names[:2], ["<BOS>", "<BOI>"])
-        self.assertEqual(names[-2:], ["<EOI>", "<BOO>"])
+        self.assertEqual(names[-3:], ["<EOI>", "<BOO>", "<LINE>"])
 
     def test_encode_decode_preserves_single_newlines(self) -> None:
         tokenizer = PrismalTokenizer()
@@ -238,13 +309,13 @@ class TrainingBoundaryTests(unittest.TestCase):
         boo_index = encoded.index(boo)
         eoo_index = encoded.index(eoo)
         for index, (token_id, value) in enumerate(zip(encoded, mask)):
-            if index <= boo_index or index >= eoo_index or int(token_id) in {
+            if index <= boo_index or index > eoo_index or int(token_id) in {
                 tokenizer.special_tokens["<LINE>"],
                 tokenizer.special_tokens["<EOL>"],
                 tokenizer.special_tokens["<BLO>"],
             }:
                 # Structure zeros applied later in window builder; span mask itself is 0 outside output.
-                if index <= boo_index or index >= eoo_index:
+                if index <= boo_index or index > eoo_index:
                     self.assertEqual(float(value), 0.0)
             else:
                 self.assertEqual(float(value), 1.0)

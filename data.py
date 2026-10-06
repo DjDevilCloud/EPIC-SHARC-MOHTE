@@ -4,6 +4,7 @@ from __future__ import annotations
 """Hierarchical byte/token data utilities for the EPIC-SHARC MOHTE architecture."""
 
 from collections import Counter
+import codecs
 import concurrent.futures
 from functools import lru_cache
 import itertools
@@ -31,8 +32,10 @@ except Exception:  # pragma: no cover - optional dependency
     cp = None
 
 
-WORD_RE = re.compile(r"[A-Za-z0-9_']+|[^\w\s]", re.UNICODE)
-SEGMENT_RE = re.compile(r"[A-Za-z0-9_']+|\s+|[^\w\s]", re.UNICODE)
+# The fallback must also cover non-ASCII letters: Unicode \w excluded them
+# from the old punctuation branch while the word branch only accepted ASCII.
+WORD_RE = re.compile(r"[A-Za-z0-9_']+|[^\s]", re.UNICODE)
+SEGMENT_RE = re.compile(r"[A-Za-z0-9_']+|\s+|[^\s]", re.UNICODE)
 STRUCTURE_MARKER_RE = re.compile(
     r"(<BOI>|<EOI>|<BOO>|<EOO>|<BOP>|<EOP>|<BLO>|<LINE>|<EOL>|<CAP>|<UPPER>|<SIG:OTHER>)"
 )
@@ -60,6 +63,24 @@ STRUCTURE_MARKER_TEXTS = frozenset(
         "<SIG:OTHER>",
     }
 )
+
+def _structure_parts(text: str) -> Iterator[str]:
+    """Shared fitting/encoding boundaries; markers are atomic, never words."""
+    yield from (part for part in STRUCTURE_MARKER_RE.split(text) if part)
+
+
+def _plain_lines(text: str) -> Iterator[str]:
+    yield from (text.splitlines(keepends=True) or [text])
+
+
+def _fitting_content_lines(text: str) -> Iterator[str]:
+    for part in _structure_parts(text):
+        if part in STRUCTURE_MARKER_TEXTS:
+            continue
+        for raw in _plain_lines(part):
+            line = raw.rstrip("\n")
+            if line.strip() and line.strip() not in STRUCTURE_MARKER_TEXTS:
+                yield line
 BOUNDARY_MARKER_TEXTS = frozenset({"<BOI>", "<EOI>", "<BOO>", "<EOO>", "<BOP>", "<EOP>"})
 MAX_DYNAMIC_LINE_TOKEN_CHARS = 240
 CONTROL_TOKEN_TEXTS = {
@@ -931,11 +952,89 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
             yield merged
 
 
+class CausalOutputHierarchy:
+    """Hierarchy state derived only from construction units already emitted.
+
+    Complete prompt spans keep their observed hierarchy. Output spans use this
+    same transition during teacher forcing and decoding; no upcoming word or
+    line is consulted, and no signature vocabulary is grown by a transition.
+    """
+
+    def __init__(self, tokenizer: "PrismalTokenizer") -> None:
+        self.tokenizer = tokenizer
+        self.partial_word = ""
+        self.partial_line = ""
+        self.completed_word_signature = tokenizer.signature_blo_id
+        self.completed_line_signature = tokenizer.signature_blo_id
+        self.line_seen = False
+        self.byte_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def _finish_word(self) -> None:
+        if self.partial_word:
+            self.completed_word_signature = self.tokenizer.signature_id_for_word(self.partial_word)
+            self.partial_word = ""
+
+    def step(self, token_id: int) -> tuple[int, int, int, int, int]:
+        tokenizer = self.tokenizer
+        unit = tokenizer.construction_units[int(token_id)]
+        text = unit.text
+        levels, relations = tokenizer.signature_level_to_id, tokenizer.signature_relation_to_id
+        signature = tokenizer.token_signature_id_by_id.get(int(token_id), tokenizer.signature_special_ids["<OTHER>"])
+        parent = signature
+        level = levels["char"]
+        relation = relations["continuation"]
+        family = tokenizer.signature_family_id_by_signature_id.get(signature, tokenizer.signature_family_to_id["fallback"])
+
+        if text == "<LINE>":
+            signature = parent = self.completed_line_signature if self.line_seen else tokenizer.signature_blo_id
+            self.line_seen = True
+            level, relation, family = levels["line"], relations["containment"], tokenizer.signature_family_to_id["line"]
+        elif text in {"<EOL>", "<BLO>"}:
+            self._finish_word()
+            signature = parent = tokenizer.signature_id_for_line(self.partial_line)
+            self.completed_line_signature = signature
+            self.partial_line = ""
+            level, relation, family = levels["line"], relations["containment"], tokenizer.signature_family_to_id["line"]
+        elif text in {"<BOI>", "<EOI>", "<BOO>", "<EOO>", "<BOP>", "<EOP>"}:
+            signature = parent = getattr(tokenizer, f"signature_{text[1:-1].lower()}_id")
+            level, relation, family = levels["special"], relations["special"], tokenizer.signature_family_to_id["boundary"]
+        elif int(token_id) in {tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id}:
+            signature = parent = {
+                tokenizer.pad_id: tokenizer.signature_pad_id,
+                tokenizer.bos_id: tokenizer.signature_bos_id,
+                tokenizer.eos_id: tokenizer.signature_eos_id,
+            }[int(token_id)]
+            level, relation, family = levels["special"], relations["special"], tokenizer.signature_family_to_id["special"]
+        elif unit.kind == "case":
+            parent = tokenizer.signature_id_for_word(self.partial_word) if self.partial_word else tokenizer.signature_blo_id
+            level, relation = levels["piece"], relations["prefix"]
+        else:
+            had_word = bool(self.partial_word)
+            if unit.kind == "byte":
+                rendered = self.byte_decoder.decode(bytes([int(text[6:-1], 16)]), final=False)
+            else:
+                rendered = unit.render
+            for character in rendered:
+                self.partial_line += character
+                if character.isalnum() or character in {"_", "'"}:
+                    self.partial_word += character
+                else:
+                    self._finish_word()
+            if unit.kind in {"space", "punct"}:
+                parent = self.completed_word_signature
+                level, relation = levels["piece"] if unit.kind == "space" else levels["char"], relations["adjacency"]
+            else:
+                parent = tokenizer.signature_id_for_word(self.partial_word) if self.partial_word else self.completed_word_signature
+                level = levels["piece"] if unit.kind in {"word", "phrase", "piece", "byte"} else levels["char"]
+                relation = relations["continuation"] if had_word else relations["prefix"]
+        return int(signature), int(level), int(relation), int(parent), int(family)
+
+
 class PrismalTokenizer:
     """Byte tokenizer with a handcrafted base alphabet plus learned construction units."""
 
     base_vocab_size: int = 0
-    codec_version: int = 6
+    codec_version: int = 9
     _COMMON_WORDS_AS_WHOLE_UNITS = CONTROL_TOKEN_TEXTS
     _CONSTRUCTION_PIECES: tuple[str, ...] = (
         "tion",
@@ -1190,6 +1289,46 @@ class PrismalTokenizer:
         self._construction_piece_ids: Dict[str, int] = {}
         self._byte_fallback_ids: Dict[int, int] = {}
         self._install_construction_vocabulary()
+        self._hierarchy_normalization: Optional[Dict[str, int]] = None
+
+    @property
+    def hierarchy_normalization_capacities(self) -> Dict[str, int]:
+        """Frozen feature denominators, independent of window/batch contents."""
+        if self._hierarchy_normalization is None:
+            self._hierarchy_normalization = {
+                "token_vocab_size": max(self.vocab_size, 1),
+                "signature_vocab_size": max(self.signature_vocab_size, 1),
+                "level_vocab_size": max(self.signature_level_vocab_size, 1),
+                "relation_vocab_size": max(self.signature_relation_vocab_size, 1),
+                "family_vocab_size": max(self.signature_family_vocab_size, 1),
+            }
+        return dict(self._hierarchy_normalization)
+
+    def apply_causal_output_hierarchy(
+        self, token_ids: Sequence[int], signature_ids: List[int], level_ids: List[int],
+        relation_ids: List[int], parent_ids: List[int], family_ids: List[int],
+    ) -> None:
+        state: Optional[CausalOutputHierarchy] = None
+        for index, token_id in enumerate(token_ids):
+            if int(token_id) == self.special_tokens["<BOO>"]:
+                state = CausalOutputHierarchy(self)
+            if state is not None:
+                frame = state.step(int(token_id))
+                for track, value in zip((signature_ids, level_ids, relation_ids, parent_ids, family_ids), frame):
+                    track[index] = value
+            if int(token_id) == self.special_tokens["<EOO>"]:
+                state = None
+
+    def output_hierarchy_frame(self, history: Sequence[int], next_token: int) -> tuple[int, int, int, int, int]:
+        """Replay the emitted output prefix, including for forked beam/draft paths."""
+        state = CausalOutputHierarchy(self)
+        start = 0
+        for index, token_id in enumerate(history):
+            if int(token_id) == self.special_tokens["<BOO>"]:
+                start = index
+        for token_id in history[start:]:
+            state.step(int(token_id))
+        return state.step(int(next_token))
 
     @property
     def vocab_size(self) -> int:
@@ -1357,8 +1496,7 @@ class PrismalTokenizer:
         for text in texts:
             if not isinstance(text, str) or not text.strip():
                 continue
-            for raw_line in text.splitlines() or [text]:
-                line = re.sub(r"\s+", " ", raw_line.strip())
+            for line in _fitting_content_lines(text):
                 if not line:
                     continue
                 for segment_match in SEGMENT_RE.finditer(line):
@@ -1526,16 +1664,18 @@ class PrismalTokenizer:
                 node = node.setdefault(ch, {})
             node["$"] = idx
 
-    def _rebuild_signature_index(self) -> None:
+    def _rebuild_signature_index(self, *, preserve_family_ids: bool | None = None) -> None:
         self.signature_to_id = {code: idx for idx, code in self._signature_id_to_code.items()}
         self._signature_trie = {}
-        self.signature_family_to_id = {
+        preserve_family_ids = getattr(self, "_hierarchy_normalization", None) is not None if preserve_family_ids is None else preserve_family_ids
+        existing_families = dict(self.signature_family_to_id) if preserve_family_ids else {}
+        self.signature_family_to_id = existing_families or {
             "pad": 0,
             "special": 1,
             "line": 2,
             "fallback": 3,
         }
-        if getattr(self, "_include_boundary_family", True):
+        if getattr(self, "_include_boundary_family", True) and "boundary" not in self.signature_family_to_id:
             self.signature_family_to_id["boundary"] = len(self.signature_family_to_id)
         self.signature_family_by_id = {idx: family for family, idx in self.signature_family_to_id.items()}
         self.signature_family_id_by_signature_id = {}
@@ -1764,12 +1904,25 @@ class PrismalTokenizer:
         pieces: List[tuple[int, str, str]] = []
         if not word:
             return pieces
+        lowered = word.lower()
+        representable_case = word in {lowered, word.upper(), lowered[:1].upper() + lowered[1:]}
+        if not representable_case:
+            # CAP/UPPER cannot express internal case changes (NASA's, iPhone).
+            # Existing literal character/UTF-8 units preserve them exactly.
+            for character in word:
+                unit_id = self._unit_id_for_text(character)
+                if unit_id is not None:
+                    kind = "digit" if character.isdigit() else "char" if character.isalpha() else "punct"
+                    pieces.append((unit_id, kind, character))
+                else:
+                    for value in character.encode("utf-8"):
+                        pieces.append((self._byte_fallback_unit(value), "byte", f"<BYTE:{value:02x}>"))
+            return pieces
         if len(word) > 1 and word.isupper():
             pieces.append((self.special_tokens["<UPPER>"], "case", ""))
         elif word[0].isupper():
             pieces.append((self.special_tokens["<CAP>"], "case", ""))
 
-        lowered = word.lower()
         i = 0
         while i < len(lowered):
             match_text = ""
@@ -1932,7 +2085,7 @@ class PrismalTokenizer:
                 start_sig,
             )
 
-        lines = text.splitlines(keepends=True) or [text]
+        lines = _plain_lines(text)
         for raw_line in lines:
             line = raw_line.rstrip("\n")
             if not (line or raw_line.endswith("\n")):
@@ -2115,7 +2268,7 @@ class PrismalTokenizer:
     ) -> None:
         if not text:
             return
-        lines = text.splitlines(keepends=True) or [text]
+        lines = _plain_lines(text)
         for raw_line in lines:
             line = raw_line.rstrip("\n")
             if not (line or raw_line.endswith("\n")):
@@ -2208,24 +2361,7 @@ class PrismalTokenizer:
     ) -> None:
         """Encode text, promoting atomic structure markers to special token IDs."""
 
-        if not text:
-            return
-        if not STRUCTURE_MARKER_RE.search(text):
-            self._encode_plain_lines_into(
-                text,
-                token_ids=token_ids,
-                signature_ids=signature_ids,
-                signature_level_ids=signature_level_ids,
-                signature_relation_ids=signature_relation_ids,
-                parent_signature_ids=parent_signature_ids,
-                signature_family_ids=signature_family_ids,
-            )
-            return
-
-        parts = STRUCTURE_MARKER_RE.split(text)
-        for part in parts:
-            if not part:
-                continue
+        for part in _structure_parts(text):
             if part in STRUCTURE_MARKER_TEXTS:
                 self._append_structure_marker_frame(
                     part,
@@ -2320,6 +2456,10 @@ class PrismalTokenizer:
             parent_signature_ids.append(self.signature_eos_id)
             signature_family_ids.append(self.signature_family_to_id["special"])
 
+        self.apply_causal_output_hierarchy(
+            token_ids, signature_ids, signature_level_ids, signature_relation_ids,
+            parent_signature_ids, signature_family_ids,
+        )
         hierarchy_vectors = _build_hierarchy_vector_tensor(
             torch.tensor(token_ids, dtype=torch.long),
             torch.tensor(signature_ids, dtype=torch.long),
@@ -2327,11 +2467,7 @@ class PrismalTokenizer:
             torch.tensor(signature_relation_ids, dtype=torch.long),
             torch.tensor(parent_signature_ids, dtype=torch.long),
             torch.tensor(signature_family_ids, dtype=torch.long),
-            token_vocab_size=max(self.vocab_size, 1),
-            signature_vocab_size=max(self.signature_vocab_size, 1),
-            level_vocab_size=max(self.signature_level_vocab_size, 1),
-            relation_vocab_size=max(self.signature_relation_vocab_size, 1),
-            family_vocab_size=max(self.signature_family_vocab_size, 1),
+            **self.hierarchy_normalization_capacities,
             low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
             low_rank_dim=self.hierarchy_vector_low_rank_dim,
         ).tolist()
@@ -2403,11 +2539,7 @@ class PrismalTokenizer:
             torch.tensor(signature_relation_ids, dtype=torch.long),
             torch.tensor(parent_signature_ids, dtype=torch.long),
             torch.tensor(signature_family_ids, dtype=torch.long),
-            token_vocab_size=max(self.vocab_size, 1),
-            signature_vocab_size=max(self.signature_vocab_size, 1),
-            level_vocab_size=max(self.signature_level_vocab_size, 1),
-            relation_vocab_size=max(self.signature_relation_vocab_size, 1),
-            family_vocab_size=max(self.signature_family_vocab_size, 1),
+            **self.hierarchy_normalization_capacities,
             low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
             low_rank_dim=self.hierarchy_vector_low_rank_dim,
         ).tolist()
@@ -2646,6 +2778,14 @@ class PrismalTokenizer:
         return pairs
 
     @staticmethod
+    def _decode_byte_runs(text: str) -> str:
+        return re.sub(
+            r"(?:<BYTE:[0-9a-fA-F]{2}>)+",
+            lambda match: bytes(int(value, 16) for value in re.findall(r"<BYTE:([0-9a-fA-F]{2})>", match.group(0))).decode("utf-8", errors="replace"),
+            text,
+        )
+
+    @staticmethod
     def _cleanup_decoded_text(text: str) -> str:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
@@ -2656,6 +2796,14 @@ class PrismalTokenizer:
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = re.sub(r"[ \t]{2,}", " ", text)
         return text.strip()
+
+    @staticmethod
+    def _decode_case_controls(text: str) -> str:
+        def apply(match: re.Match[str]) -> str:
+            controls, word = match.groups()
+            return word.upper() if controls.endswith("<UPPER>") else word[:1].upper() + word[1:]
+        text = re.sub(r"((?:<CAP>|<UPPER>)+)([\w']+)", apply, text)
+        return text.replace("<CAP>", "").replace("<UPPER>", "")
 
     def _decode_construction(
         self,
@@ -2670,6 +2818,9 @@ class PrismalTokenizer:
         parts: List[str] = []
         for token_id in token_ids:
             token_id = int(token_id)
+            if token_id in {self.special_tokens.get("<CAP>"), self.special_tokens.get("<UPPER>")}:
+                parts.append(self.id_to_token[token_id])
+                continue
             if token_id in self.skip_decode_ids:
                 continue
             if token_id == self.eos_id:
@@ -2697,7 +2848,7 @@ class PrismalTokenizer:
             if token_text and not token_text.startswith("<BYTE:"):
                 parts.append(token_text)
 
-        decoded = "".join(parts)
+        decoded = self._decode_case_controls(self._decode_byte_runs("".join(parts)))
         if collapse_structure:
             decoded = re.sub(r"\n{3,}", "\n\n", decoded)
             decoded = re.sub(r" +", " ", decoded)
@@ -2719,6 +2870,9 @@ class PrismalTokenizer:
         parts: List[str] = []
         for token_id in token_ids:
             token_id = int(token_id)
+            if token_id in {self.special_tokens.get("<CAP>"), self.special_tokens.get("<UPPER>")}:
+                parts.append(self.id_to_token[token_id])
+                continue
             if token_id in self.skip_decode_ids:
                 continue
             if token_id == self.eos_id:
@@ -2736,7 +2890,7 @@ class PrismalTokenizer:
             else:
                 parts.append(f"<UNK:{token_id}>")
 
-        decoded = "".join(parts)
+        decoded = self._decode_case_controls(self._decode_byte_runs("".join(parts)))
         if collapse_structure:
             decoded = re.sub(r"\n{3,}", "\n\n", decoded)
             decoded = re.sub(r" +", " ", decoded)
@@ -2774,8 +2928,7 @@ class PrismalTokenizer:
         for text in texts:
             if not isinstance(text, str) or not text.strip():
                 continue
-            for raw_line in text.splitlines() or [text]:
-                line = re.sub(r"\s+", " ", raw_line.strip())
+            for line in _fitting_content_lines(text):
                 if not line:
                     continue
                 line_code = self._line_signature_code(line)
@@ -2811,8 +2964,7 @@ class PrismalTokenizer:
         for text in texts:
             if not isinstance(text, str) or not text.strip():
                 continue
-            for raw_line in text.splitlines() or [text]:
-                line = re.sub(r"\s+", " ", raw_line.strip())
+            for line in _fitting_content_lines(text):
                 if not line:
                     continue
                 line_code = self._line_signature_code(line)
@@ -2915,6 +3067,9 @@ class PrismalTokenizer:
             max_signature_tokens=max_signature_tokens,
             signature_counts=signature_counts,
         )
+        # Freeze once after initial learning. Extending a tokenizer preserves
+        # the existing feature scale instead of rescaling every older token.
+        self.hierarchy_normalization_capacities
         return
 
         word_counts: Counter[str] = Counter()
@@ -3022,6 +3177,9 @@ class PrismalTokenizer:
     def to_state_dict(self) -> Dict[str, object]:
         return {
             "codec_version": self.codec_version,
+            "hierarchy_protocol_version": 1,
+            "hierarchy_vector_normalization": dict(self._hierarchy_normalization) if self._hierarchy_normalization is not None else None,
+            "signature_family_to_id": dict(self.signature_family_to_id),
             "base_vocab_size": self.base_vocab_size,
             "pad_id": self.pad_id,
             "bos_id": self.bos_id,
@@ -3041,6 +3199,16 @@ class PrismalTokenizer:
             hierarchy_vector_low_rank_enabled=bool(payload.get("hierarchy_vector_low_rank_enabled", True)),
             hierarchy_vector_low_rank_dim=int(payload.get("hierarchy_vector_low_rank_dim", DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM)),
         )
+        normalization = payload.get("hierarchy_vector_normalization")
+        def restore_representation_contract() -> None:
+            # Reconstruct legacy IDs once before freezing them. Modern states
+            # serialize the family mapping explicitly rather than infer its order.
+            if isinstance(normalization, dict):
+                tokenizer._hierarchy_normalization = {str(key): max(1, int(value)) for key, value in normalization.items()}
+            families = payload.get("signature_family_to_id")
+            if isinstance(families, dict):
+                tokenizer.signature_family_to_id = {str(key): int(value) for key, value in families.items()}
+                tokenizer._rebuild_signature_index(preserve_family_ids=True)
         tokenizer.pad_id = int(payload.get("pad_id", tokenizer.pad_id))
         tokenizer.bos_id = int(payload.get("bos_id", tokenizer.bos_id))
         tokenizer.eos_id = int(payload.get("eos_id", tokenizer.eos_id))
@@ -3062,6 +3230,7 @@ class PrismalTokenizer:
             tokenizer._rebuild_signature_index()
             for unit_id, unit in enumerate(tokenizer.construction_units):
                 tokenizer.token_signature_id_by_id[unit_id] = tokenizer.signature_id_for_code(unit.signature)
+            restore_representation_contract()
             return tokenizer
 
         tokenizer.base_vocab_size = int(payload.get("base_vocab_size", tokenizer.base_vocab_size))
@@ -3158,6 +3327,7 @@ class PrismalTokenizer:
         if blo_id is not None:
             tokenizer.skip_decode_ids.discard(blo_id)
         tokenizer._rebuild_signature_index()
+        restore_representation_contract()
         return tokenizer
 
     def signature_lookup_by_token_id(self) -> Dict[int, int]:
@@ -3256,11 +3426,7 @@ class PrismalTokenizer:
                 torch.tensor([relation_id], dtype=torch.long),
                 torch.tensor([signature_id], dtype=torch.long),
                 torch.tensor([family_id], dtype=torch.long),
-                token_vocab_size=max(self.vocab_size, 1),
-                signature_vocab_size=max(self.signature_vocab_size, 1),
-                level_vocab_size=max(self.signature_level_vocab_size, 1),
-                relation_vocab_size=max(self.signature_relation_vocab_size, 1),
-                family_vocab_size=max(self.signature_family_vocab_size, 1),
+                **self.hierarchy_normalization_capacities,
                 low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
                 low_rank_dim=self.hierarchy_vector_low_rank_dim,
             )[0].tolist()
@@ -3268,24 +3434,15 @@ class PrismalTokenizer:
 
     def generation_suppressed_token_ids(self) -> List[int]:
         suppressed = [self.pad_id, self.bos_id]
-        # Keep printable punctuation available to the model. Math, code, and
-        # structured answers commonly need braces, backslashes, hashes, and
-        # operators; suppressing those made valid supervised targets impossible
-        # to emit even when they were the highest-scoring next token.
-        allowed_punct = {
-            ".", ",", "?", "!", ":", ";", "'", '"', "-", "_", "(", ")",
-            "[", "]", "{", "}", "\\", "/", "$", "#", "=", "+", "*", "%",
-            "&", "@", "<", ">", "|", "~", "`",
-        }
+        # All content construction units (including punctuation and byte
+        # fallback) must remain reachable. Only protocol controls are masked.
         # The first LINE frame is seeded in the prompt; later LINE frames are
         # generated after EOL. EOL renders a newline and EOO closes the span.
         emit_allowed_structure = {"<BLO>", "<LINE>", "<EOL>", "<EOO>"}
         for unit_id, unit in enumerate(self.construction_units):
             if unit.text in emit_allowed_structure:
                 continue
-            if unit.kind in {"special", "structure", "signature", "byte"} and unit_id != self.eos_id:
-                suppressed.append(unit_id)
-            elif unit.kind == "punct" and unit.text not in allowed_punct:
+            if unit.kind in {"special", "structure", "signature"} and unit_id != self.eos_id:
                 suppressed.append(unit_id)
         return sorted(set(token_id for token_id in suppressed if token_id != self.eos_id))
 
@@ -3541,6 +3698,9 @@ def _build_window_samples_from_text(
         encoded_parents,
         encoded_families,
     )
+    tokenizer.apply_causal_output_hierarchy(
+        encoded, encoded_signatures, encoded_levels, encoded_relations, encoded_parents, encoded_families,
+    )
     if len(encoded) < 4:
         (
             encoded,
@@ -3578,7 +3738,7 @@ def _build_window_samples_from_text(
     in_output = False
     output_line_seen = False
     filtered_loss_mask: List[float] = []
-    for token_id, mask in zip(encoded, token_loss_mask):
+    for token_index, (token_id, mask) in enumerate(zip(encoded, token_loss_mask)):
         token_id = int(token_id)
         if boo_id is not None and token_id == int(boo_id):
             in_output = True
@@ -3589,6 +3749,8 @@ def _build_window_samples_from_text(
         if in_output and line_id is not None and token_id == int(line_id):
             output_line_seen = True
         if is_seeded_output_line:
+            # The canonical hierarchy builder supplies neutral seed metadata.
+            # This seeded frame is context, not an assistant prediction target.
             filtered_loss_mask.append(0.0)
         elif token_id in unsupervised_token_ids and token_id not in output_structure_ids:
             filtered_loss_mask.append(0.0)
@@ -3628,11 +3790,7 @@ def _build_window_samples_from_text(
             torch.tensor(rel_ids, dtype=torch.long),
             torch.tensor(parent_ids, dtype=torch.long),
             torch.tensor(family_ids, dtype=torch.long),
-            token_vocab_size=max(tokenizer.vocab_size, 1),
-            signature_vocab_size=max(tokenizer.signature_vocab_size, 1),
-            level_vocab_size=max(tokenizer.signature_level_vocab_size, 1),
-            relation_vocab_size=max(tokenizer.signature_relation_vocab_size, 1),
-            family_vocab_size=max(tokenizer.signature_family_vocab_size, 1),
+            **tokenizer.hierarchy_normalization_capacities,
             dtype=hierarchy_vector_torch_dtype(hierarchy_vector_dtype),
             low_rank_enabled=low_rank_enabled,
             low_rank_dim=low_rank_dim,
@@ -4034,6 +4192,7 @@ def stream_pretokenized_windows(
 
     payload: Dict[str, Any] = {
         "format_version": 1,
+        "hierarchy_protocol_version": 1,
         "seq_len": int(seq_len),
         "num_samples": int(written),
         "field_names": _window_sample_field_names(),
@@ -4067,13 +4226,16 @@ class MemmapTokenDataset(Dataset):
         if not self.meta_path.exists():
             raise FileNotFoundError(f"Pretokenized metadata not found: {self.meta_path}")
         self.meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        if int(self.meta.get("hierarchy_protocol_version", 0)) != 1:
+            raise ValueError("Pretokenized hierarchy uses a legacy protocol; rebuild it from raw text with the causal hierarchy encoder.")
         self.seq_len = int(self.meta.get("seq_len", 0))
         self.total_samples = int(self.meta.get("num_samples", 0))
         self.split = split
         self.val_fraction = float(val_fraction)
         self.seed = int(seed)
         self.max_samples = max(0, int(max_samples))
-        self.sample_seed = int(sample_seed) if sample_seed is not None else random.SystemRandom().randrange(1 << 63)
+        split_offset = {"train": 0, "val": 1, "all": 2}.get(self.split, 3)
+        self.sample_seed = int(sample_seed) if sample_seed is not None else self.seed * 4 + split_offset
         hierarchy_vector_dim = int(self.meta.get("hierarchy_vector_dim", DEFAULT_HIERARCHY_VECTOR_DIM))
         if "hierarchy_vector_low_rank_enabled" in self.meta:
             self.hierarchy_vector_low_rank_enabled = bool(self.meta.get("hierarchy_vector_low_rank_enabled"))
