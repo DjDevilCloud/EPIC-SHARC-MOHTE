@@ -42,6 +42,8 @@ class PrismalWaveConfig:
     use_gradient_accumulation: bool = False
     gradient_accumulation_steps: int = 1
     training_finite_guard_enabled: bool = True
+    training_finite_guard_backend: str = "sync"  # sync or optional CuPy CUDA repair
+    training_precompute_torus_inputs: bool = True
     inference_finite_guard_enabled: bool = True
     grad_clip_muon: float = 0.25
     grad_clip_scalar: float = 0.2
@@ -389,6 +391,10 @@ class PrismalWaveConfig:
         if self.gradient_accumulation_steps < 1:
             self.gradient_accumulation_steps = 1
         self.training_finite_guard_enabled = bool(self.training_finite_guard_enabled)
+        self.training_precompute_torus_inputs = bool(self.training_precompute_torus_inputs)
+        self.training_finite_guard_backend = str(self.training_finite_guard_backend).lower()
+        if self.training_finite_guard_backend not in {"sync", "cuda"}:
+            raise ValueError("training_finite_guard_backend must be sync or cuda")
         self.inference_finite_guard_enabled = bool(self.inference_finite_guard_enabled)
         if self.grad_clip_muon < 0.0:
             self.grad_clip_muon = 0.0

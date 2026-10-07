@@ -1122,6 +1122,8 @@ def save_checkpoint(
             "transformer_engine_leaf_recipe",
             "transformer_engine_leaf_params_dtype",
             "training_finite_guard_enabled",
+            "training_finite_guard_backend",
+            "training_precompute_torus_inputs",
             "inference_finite_guard_enabled",
             "grad_clip_muon",
             "grad_clip_scalar",

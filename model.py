@@ -19,11 +19,13 @@ from torch.utils.checkpoint import checkpoint
 
 try:
     from .config import PrismalWaveConfig
+    from .fused_finite import repair_transition as _repair_finite_transition_cuda
     from .data import DEFAULT_HIERARCHY_VECTOR_DIM, SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS, _build_hierarchy_vector_tensor
     from .hierarchical_precision import HierarchicalPrecisionPolicy, HierarchicalPrecisionSpec, attach_precision_policy, current_precision_spec, dtype_name, is_float8_dtype
     from .quantization import QuantizationConfig, create_quantized_embedding, create_quantized_linear
 except ImportError:  # pragma: no cover - supports direct script launching.
     from config import PrismalWaveConfig
+    from fused_finite import repair_transition as _repair_finite_transition_cuda
     from data import DEFAULT_HIERARCHY_VECTOR_DIM, SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS, _build_hierarchy_vector_tensor
     from hierarchical_precision import HierarchicalPrecisionPolicy, HierarchicalPrecisionSpec, attach_precision_policy, current_precision_spec, dtype_name, is_float8_dtype
     from quantization import QuantizationConfig, create_quantized_embedding, create_quantized_linear
@@ -3032,30 +3034,12 @@ class PrismalTorusCore(nn.Module):
             return 0.5 * context.mean(dim=1) + 0.25 * context[:, 0, :] + 0.25 * context[:, -1, :]
         return context
 
-    def transition(
-        self,
-        hidden: torch.Tensor,
-        field: torch.Tensor | PrismalTorusState | Dict[str, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor],
-        *,
-        path_index: int,
-        step_index: int = 0,
-        relay_mode: bool = False,
-        registry_context: Optional[torch.Tensor] = None,
-        family_context: Optional[torch.Tensor] = None,
-        level_context: Optional[torch.Tensor] = None,
-        relation_context: Optional[torch.Tensor] = None,
-        parent_context: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, PrismalTorusState, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        batch_size, dim = hidden.shape
-        core_hidden_dim = self.write_delta_proj.in_features
-        if dim != core_hidden_dim:
-            hidden = hidden.mean(dim=-1, keepdim=True).expand(batch_size, core_hidden_dim)
-            dim = core_hidden_dim
-
-        torus_state = self.init_state(batch_size, hidden.device, state=field)
-        field_tensor = torus_state.field
-        bus_tensor = torus_state.bus
-
+    def _prepare_transition_inputs(
+        self, hidden, *, path_index, relay_mode=False, registry_context=None,
+        family_context=None, level_context=None, relation_context=None, parent_context=None,
+    ):
+        """Compute token-local write inputs without reading recurrent state."""
+        batch_size = hidden.size(0)
         registry_context = self._summarize_chunk_context(registry_context)
         family_context = self._summarize_chunk_context(family_context)
         level_context = self._summarize_chunk_context(level_context)
@@ -3110,6 +3094,107 @@ class PrismalTorusCore(nn.Module):
         write_gate = torch.sigmoid(self.write_gate(registry_hidden)).view(batch_size, 1) * 0.65 + 0.35
         write_delta = torch.tanh(self.write_delta_proj(registry_hidden + 0.1 * path_vector))
 
+        return {
+            "path_vector": path_vector,
+            "path_bias": path_bias,
+            "registry_hidden": registry_hidden,
+            "write_coord": write_coord,
+            "center_z": center_z,
+            "center_y": center_y,
+            "center_x": center_x,
+            "local_temperature": local_temperature,
+            "temperature_scale": temperature_scale,
+            "active_radius": active_radius,
+            "active_offsets": active_offsets,
+            "stencil_weights": stencil_weights,
+            "write_gate": write_gate,
+            "write_delta": write_delta,
+        }
+
+    def prepare_transition_sequence(self, hidden, *, path_index, family_context=None,
+                                    level_context=None, relation_context=None, parent_context=None):
+        """Batch token-local projections; recurrent reads/writes remain sequential."""
+        batch, length, _ = hidden.shape
+        flat = hidden.reshape(batch * length, -1)
+        if flat.size(-1) != self.write_delta_proj.in_features:
+            flat = flat.mean(-1, keepdim=True).expand(-1, self.write_delta_proj.in_features)
+
+        def flatten(context):
+            if context is None or context.numel() == 0:
+                return None
+            if context.dim() == 2:
+                context = context[:, None, :].expand(-1, length, -1)
+            return context.reshape(batch * length, -1)
+
+        values = self._prepare_transition_inputs(
+            flat, path_index=path_index, family_context=flatten(family_context),
+            level_context=flatten(level_context), relation_context=flatten(relation_context),
+            parent_context=flatten(parent_context),
+        )
+        values["bus_slot_gate"] = torch.softmax(self.bus_slot_gate_proj(values["registry_hidden"]), dim=-1)
+        values["bus_gate"] = torch.sigmoid(self.bus_gate_proj(values["registry_hidden"]))
+        values["transport_gate"] = torch.sigmoid(self.transport_gate(flat))
+        return {key: value if key in {"active_offsets", "active_radius"}
+                else value.reshape(batch, length, *value.shape[1:]) for key, value in values.items()}
+
+    def can_prepare_transition_sequence(self):
+        names = ("registry_proj", "family_registry_proj", "level_registry_proj", "relation_registry_proj",
+                 "parent_registry_proj", "path_coord_proj", "write_coord_proj", "stencil_proj",
+                 "write_gate", "write_delta_proj", "bus_slot_gate_proj", "bus_gate_proj", "transport_gate")
+        return all(type(getattr(self, name)).__name__ in {"Linear", "PrecisionAwareLinear"}
+                   and not getattr(self, name)._forward_hooks and not getattr(self, name)._forward_pre_hooks
+                   for name in names)
+
+    def transition(
+        self,
+        hidden: torch.Tensor,
+        field: torch.Tensor | PrismalTorusState | Dict[str, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor],
+        *,
+        path_index: int,
+        step_index: int = 0,
+        relay_mode: bool = False,
+        registry_context: Optional[torch.Tensor] = None,
+        family_context: Optional[torch.Tensor] = None,
+        level_context: Optional[torch.Tensor] = None,
+        relation_context: Optional[torch.Tensor] = None,
+        parent_context: Optional[torch.Tensor] = None,
+        prepared_inputs: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, PrismalTorusState, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        batch_size, dim = hidden.shape
+        core_hidden_dim = self.write_delta_proj.in_features
+        if dim != core_hidden_dim:
+            hidden = hidden.mean(dim=-1, keepdim=True).expand(batch_size, core_hidden_dim)
+            dim = core_hidden_dim
+
+        torus_state = self.init_state(batch_size, hidden.device, state=field)
+        field_tensor = torus_state.field
+        bus_tensor = torus_state.bus
+
+        registry_context = self._summarize_chunk_context(registry_context)
+        family_context = self._summarize_chunk_context(family_context)
+        level_context = self._summarize_chunk_context(level_context)
+        relation_context = self._summarize_chunk_context(relation_context)
+        parent_context = self._summarize_chunk_context(parent_context)
+        prepared = prepared_inputs if prepared_inputs is not None else self._prepare_transition_inputs(
+            hidden, path_index=path_index, relay_mode=relay_mode, registry_context=registry_context,
+            family_context=family_context, level_context=level_context,
+            relation_context=relation_context, parent_context=parent_context,
+        )
+        path_vector = prepared["path_vector"]
+        path_bias = prepared["path_bias"]
+        registry_hidden = prepared["registry_hidden"]
+        write_coord = prepared["write_coord"]
+        center_z = prepared["center_z"]
+        center_y = prepared["center_y"]
+        center_x = prepared["center_x"]
+        local_temperature = prepared["local_temperature"]
+        temperature_scale = prepared["temperature_scale"]
+        active_radius = prepared["active_radius"]
+        active_offsets = prepared["active_offsets"]
+        stencil_weights = prepared["stencil_weights"]
+        write_gate = prepared["write_gate"]
+        write_delta = prepared["write_delta"]
+
         local_patch = self._gather_patch(field_tensor, center_z, center_y, center_x, active_radius)
         patch_context = (stencil_weights.unsqueeze(-1) * local_patch).sum(dim=1)
         if patch_context.shape[-1] != write_delta.shape[-1]:
@@ -3139,7 +3224,8 @@ class PrismalTorusCore(nn.Module):
                 + torch.roll(next_field, shifts=1, dims=3)
                 + torch.roll(next_field, shifts=-1, dims=3)
             ) / 7.0
-            transport_gate = torch.sigmoid(self.transport_gate(hidden)).view(batch_size, 1, 1, 1, 1)
+            transport_gate = (prepared_inputs["transport_gate"] if prepared_inputs is not None
+                              else torch.sigmoid(self.transport_gate(hidden))).view(batch_size, 1, 1, 1, 1)
             next_field = next_field + self.transport_rate * transport_gate * temperature_scale.view(batch_size, 1, 1, 1, 1) * (transport - next_field)
 
         read_patch = self._gather_patch_from_linear_idx(next_field, patch_linear_idx)
@@ -3149,9 +3235,11 @@ class PrismalTorusCore(nn.Module):
 
         bus_source = torch.cat([registry_hidden, local_summary], dim=-1)
         bus_value = torch.tanh(self.bus_value_proj(bus_source))
-        bus_slot_gate = torch.softmax(self.bus_slot_gate_proj(registry_hidden), dim=-1)
+        bus_slot_gate = (prepared_inputs["bus_slot_gate"] if prepared_inputs is not None
+                         else torch.softmax(self.bus_slot_gate_proj(registry_hidden), dim=-1))
         bus_input = bus_slot_gate.unsqueeze(-1) * bus_value.unsqueeze(1)
-        bus_gate = torch.sigmoid(self.bus_gate_proj(registry_hidden)).view(batch_size, 1, 1)
+        bus_gate = (prepared_inputs["bus_gate"] if prepared_inputs is not None
+                    else torch.sigmoid(self.bus_gate_proj(registry_hidden))).view(batch_size, 1, 1)
         next_bus = self.global_bus_decay * bus_tensor + (1.0 - self.global_bus_decay) * (
             self.global_bus_write_scale * bus_gate * bus_input
         )
@@ -3475,6 +3563,7 @@ class PrismalTorusCore(nn.Module):
         level_context: Optional[torch.Tensor] = None,
         relation_context: Optional[torch.Tensor] = None,
         parent_context: Optional[torch.Tensor] = None,
+        prepared_inputs: Optional[Dict[str, torch.Tensor]] = None,
         path_index: int = 0,
         step_index_offset: int = 0,
         relay_mode: bool = False,
@@ -3496,8 +3585,12 @@ class PrismalTorusCore(nn.Module):
                 level_context=level_context[:, 0, :] if level_context is not None and level_context.dim() == 3 else level_context,
                 relation_context=relation_context[:, 0, :] if relation_context is not None and relation_context.dim() == 3 else relation_context,
                 parent_context=parent_context[:, 0, :] if parent_context is not None and parent_context.dim() == 3 else parent_context,
+                **({"prepared_inputs": prepared_inputs} if prepared_inputs is not None else {}),
             )
             return step_output.unsqueeze(1), current_state, stats
+
+        if prepared_inputs is not None:
+            raise ValueError("Prepared inputs require one-token chunks")
 
         # Chunking schedules a causal scan; it must not change the recurrence.
         def at(context: Optional[torch.Tensor], index: int) -> Optional[torch.Tensor]:
@@ -3814,6 +3907,7 @@ class PrismalTorusCore(nn.Module):
         level_context: Optional[torch.Tensor] = None,
         relation_context: Optional[torch.Tensor] = None,
         parent_context: Optional[torch.Tensor] = None,
+        prepared_inputs: Optional[Dict[str, torch.Tensor]] = None,
         collect_telemetry: bool = True,
     ) -> Tuple[torch.Tensor, PrismalTorusState, Dict[str, torch.Tensor]]:
         profile_enabled = bool(getattr(self.cfg, "profile_runtime", False))
@@ -3839,6 +3933,7 @@ class PrismalTorusCore(nn.Module):
                 level_context=level_context,
                 relation_context=relation_context,
                 parent_context=parent_context,
+                **({"prepared_inputs": prepared_inputs} if prepared_inputs is not None else {}),
             ),
             vram_enabled=profile_vram,
             vram_stats=vram_stats,
@@ -3850,13 +3945,27 @@ class PrismalTorusCore(nn.Module):
         if isinstance(next_field, PrismalTorusState):
             transition_entries.extend(
                 (
-                    (next_field.field, next_field.field.new_zeros(next_field.field.shape), False),
-                    (next_field.bus, next_field.bus.new_zeros(next_field.bus.shape), False),
+                    (next_field.field, None, False),
+                    (next_field.bus, None, False),
                 )
             )
         stat_keys = [key for key, value in stats.items() if torch.is_tensor(value)]
         finite_entries = transition_entries + [(stats[key], None, False) for key in stat_keys]
-        if self._finite_guard_enabled():
+        fused_guard = (
+            self._finite_guard_enabled()
+            and self.training
+            and hidden.device.type == "cuda"
+            and getattr(self.cfg, "training_finite_guard_backend", "sync") == "cuda"
+        )
+        if fused_guard:
+            repaired_values, repair_counts = _repair_finite_transition_cuda(finite_entries, len(transition_entries))
+            transition_tensors = repaired_values[:len(transition_entries)]
+            sanitized_stats = dict(stats)
+            sanitized_stats.update(zip(stat_keys, repaired_values[len(transition_entries):]))
+            sanitized_stats["stability_nonfinite_repair_count"] = repair_counts[1].float()
+            sanitized_stats["stability_finite_guard_enabled"] = _device_scalar(1.0, device=hidden.device)
+            repair_count = repair_counts[0].float()
+        elif self._finite_guard_enabled():
             repaired_values, repair_count, entry_counts = _repair_finite_tensor_group(
                 finite_entries, include_entry_counts=True
             )
@@ -3879,7 +3988,9 @@ class PrismalTorusCore(nn.Module):
         next_hidden = transition_tensors[0]
         if isinstance(next_field, PrismalTorusState):
             next_field = PrismalTorusState(field=transition_tensors[1], bus=transition_tensors[2])
-        if repair_count == 0:
+        if fused_guard:
+            sanitized_stats["stability_step_repair_count"] = repair_count
+        elif repair_count == 0:
             sanitized_stats["stability_step_repair_count"] = _device_scalar(0.0, device=hidden.device)
         else:
             sanitized_stats["stability_step_repair_count"] = torch.tensor(float(repair_count), device=hidden.device)
@@ -8270,10 +8381,25 @@ class PrismalWaveModel(nn.Module):
         overlay_step_fn = self.torus_core.overlay_step if hasattr(self.torus_core, "overlay_step") else None
         empty_context = torch.empty(0, device=input_ids.device)
 
+        prepared_sequence = None
+        if (self.training and getattr(self.cfg, "training_precompute_torus_inputs", False)
+                and type(self.torus_core) is PrismalTorusCore and chunk_len == 1
+                and not use_chunk_solver and not self.use_gradient_checkpointing
+                and self.torus_core.can_prepare_transition_sequence()):
+            prepared_sequence = self.torus_core.prepare_transition_sequence(
+                hidden, path_index=path_index, family_context=family_context_seq,
+                level_context=level_context_seq, relation_context=relation_context_seq,
+                parent_context=parent_context_seq,
+            )
+
         for chunk_index in range(num_chunks):
             chunk_start = chunk_index * chunk_len
             chunk_end = min(seq_len, chunk_start + chunk_len)
             chunk_hidden = hidden[:, chunk_start:chunk_end, :]
+            prepared_kwargs = {} if prepared_sequence is None else {"prepared_inputs": {
+                key: value if key in {"active_offsets", "active_radius"} else value[:, chunk_start]
+                for key, value in prepared_sequence.items()
+            }}
             signature_family_slice = signature_family_ids[:, chunk_start:chunk_end] if signature_family_ids is not None else None
             signature_ids_slice = signature_ids[:, chunk_start:chunk_end] if signature_ids is not None else None
             signature_level_slice = signature_level_ids[:, chunk_start:chunk_end] if signature_level_ids is not None else None
@@ -8391,6 +8517,7 @@ class PrismalWaveModel(nn.Module):
                     lambda: core_step_fn(
                         chunk_hidden,
                         field_state,
+                        **prepared_kwargs,
                         signature_family_ids=signature_family_slice,
                         signature_ids=signature_ids_slice,
                         signature_level_ids=signature_level_slice,

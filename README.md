@@ -200,6 +200,47 @@ The script keeps the optimizer and precision stack fixed, varies only the torus/
 
 ## Code Map
 
+### Optional CUDA transition repair
+
+Training can use `--training-finite-guard-backend cuda` (or set
+`training_finite_guard_backend="cuda"` in the model config) when CuPy and CUDA
+are available. The default is `sync`. CPU and inference retain the original
+guard. CUDA kernels compile on first use; benchmark after warmup.
+
+This backend checks and repairs each transition before the next token uses it,
+keeps repair counts on the GPU, and implements backward gradients for both the
+input and hidden-state fallback. It allocates fresh outputs even when values
+are finite, so healthy tensor identity is not preserved. It never mutates
+transition inputs. One-token causal scheduling stays unchanged.
+
+CuPy is optional (`cupy-cuda12x` for CUDA 12). Selecting this backend without
+CuPy raises an error. On the local RTX 4070 SUPER real 32 × 257 batch, the guard
+removed 257 per-token host reads; two forward/backward comparisons measured
+about 4% faster and 3% slower, so there is no reliable throughput gain yet.
+Measure your workload before adopting it. Use
+`--training-finite-guard-backend sync` to restore the original backend.
+
+### Batched token-local torus inputs
+
+Training now prepares write coordinates, stencil weights, write deltas, and
+state-independent gates for the whole sequence before scanning the recurrent
+field and bus. Every token still reads, updates, repairs, and passes its state
+to the next token in order; the finite guard and one-token schedule are intact.
+
+`training_precompute_torus_inputs` defaults to `true`. The optimization applies
+to the plain torus core with dense, unhooked projections, one-token chunks, no
+fixed-point solver, and no gradient checkpointing. Other paths and inference
+retain their existing execution. Use `--no-precompute-torus-inputs` to disable
+it, or `--precompute-torus-inputs` to explicitly enable it when resuming.
+
+Two local real 32 × 257 batch comparisons on the RTX 4070 SUPER measured
+forward/backward median throughput gains of 1.30× and 1.85×. Linear calls fell
+from 4,171 to 1,323. Timings vary; these measurements exclude optimizer updates
+and data loading. Loss matched exactly, parameter gradients and route stats
+passed comparison, and logits differed by at most 0.0014 under the existing
+precision policy because batched GEMMs can round differently. No additional
+CUDA library is needed.
+
 If you want to inspect the implementation, start here:
 
 - `./data.py`

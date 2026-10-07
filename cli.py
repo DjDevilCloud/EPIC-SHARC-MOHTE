@@ -159,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--training-finite-guard-enabled", dest="training_finite_guard_enabled", action="store_true")
         p.add_argument("--no-training-finite-guard-enabled", dest="training_finite_guard_enabled", action="store_false")
         p.set_defaults(training_finite_guard_enabled=default_cfg.training_finite_guard_enabled)
+        p.add_argument("--training-finite-guard-backend", choices=("sync", "cuda"), default=None,
+                       help="Use optional CuPy fused CUDA transition repair to avoid per-token host reads")
+        p.add_argument("--precompute-torus-inputs", dest="training_precompute_torus_inputs", action="store_true",
+                       help="Batch token-local projections before the recurrent training scan")
+        p.add_argument("--no-precompute-torus-inputs", dest="training_precompute_torus_inputs", action="store_false")
+        p.set_defaults(training_precompute_torus_inputs=None)
         p.add_argument("--inference-finite-guard-enabled", dest="inference_finite_guard_enabled", action="store_true")
         p.add_argument("--no-inference-finite-guard-enabled", dest="inference_finite_guard_enabled", action="store_false")
         p.set_defaults(inference_finite_guard_enabled=default_cfg.inference_finite_guard_enabled)
@@ -720,6 +726,10 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         use_gradient_accumulation=getattr(args, "use_gradient_accumulation", default_cfg.use_gradient_accumulation),
         gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", default_cfg.gradient_accumulation_steps),
         training_finite_guard_enabled=getattr(args, "training_finite_guard_enabled", default_cfg.training_finite_guard_enabled),
+        training_finite_guard_backend=getattr(args, "training_finite_guard_backend", None) or default_cfg.training_finite_guard_backend,
+        training_precompute_torus_inputs=(default_cfg.training_precompute_torus_inputs
+                                         if getattr(args, "training_precompute_torus_inputs", None) is None
+                                         else args.training_precompute_torus_inputs),
         inference_finite_guard_enabled=getattr(args, "inference_finite_guard_enabled", default_cfg.inference_finite_guard_enabled),
         grad_clip_muon=getattr(args, "grad_clip_muon", default_cfg.grad_clip_muon),
         grad_clip_scalar=getattr(args, "grad_clip_scalar", default_cfg.grad_clip_scalar),
@@ -1122,6 +1132,9 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.nested_learning_mid_ema_beta = getattr(args, "nested_learning_mid_ema_beta", raw_cfg.nested_learning_mid_ema_beta)
             raw_cfg.nested_learning_global_ema_beta = getattr(args, "nested_learning_global_ema_beta", raw_cfg.nested_learning_global_ema_beta)
             raw_cfg.training_finite_guard_enabled = getattr(args, "training_finite_guard_enabled", raw_cfg.training_finite_guard_enabled)
+            raw_cfg.training_finite_guard_backend = getattr(args, "training_finite_guard_backend", None) or raw_cfg.training_finite_guard_backend
+            if getattr(args, "training_precompute_torus_inputs", None) is not None:
+                raw_cfg.training_precompute_torus_inputs = args.training_precompute_torus_inputs
             raw_cfg.inference_finite_guard_enabled = getattr(args, "inference_finite_guard_enabled", raw_cfg.inference_finite_guard_enabled)
             raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)
             raw_cfg.grad_clip_scalar = getattr(args, "grad_clip_scalar", raw_cfg.grad_clip_scalar)
@@ -1246,6 +1259,9 @@ def main(argv: List[str] | None = None) -> int:
             raw_cfg.nested_learning_mid_ema_beta = getattr(args, "nested_learning_mid_ema_beta", raw_cfg.nested_learning_mid_ema_beta)
             raw_cfg.nested_learning_global_ema_beta = getattr(args, "nested_learning_global_ema_beta", raw_cfg.nested_learning_global_ema_beta)
             raw_cfg.training_finite_guard_enabled = getattr(args, "training_finite_guard_enabled", raw_cfg.training_finite_guard_enabled)
+            raw_cfg.training_finite_guard_backend = getattr(args, "training_finite_guard_backend", None) or raw_cfg.training_finite_guard_backend
+            if getattr(args, "training_precompute_torus_inputs", None) is not None:
+                raw_cfg.training_precompute_torus_inputs = args.training_precompute_torus_inputs
             raw_cfg.inference_finite_guard_enabled = getattr(args, "inference_finite_guard_enabled", raw_cfg.inference_finite_guard_enabled)
             raw_cfg.grad_clip_muon = getattr(args, "grad_clip_muon", raw_cfg.grad_clip_muon)
             raw_cfg.grad_clip_scalar = getattr(args, "grad_clip_scalar", raw_cfg.grad_clip_scalar)
