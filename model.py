@@ -43,6 +43,23 @@ def _sync_for_timing(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+@lru_cache(maxsize=256)
+def _cached_device_scalar(device: torch.device, value: float | int | bool, dtype: torch.dtype) -> torch.Tensor:
+    """Cache immutable scalar metadata tensors used repeatedly in token loops."""
+    return torch.tensor(value, device=device, dtype=dtype)
+
+
+def _device_scalar(value: float | int | bool, *, device: torch.device, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    if dtype is None:
+        if isinstance(value, bool):
+            dtype = torch.bool
+        elif isinstance(value, int):
+            dtype = torch.int64
+        else:
+            dtype = torch.get_default_dtype()
+    return _cached_device_scalar(torch.device(device), value, dtype)
+
+
 _VRAM_BYTES_PER_MIB = float(1024.0 * 1024.0)
 
 
@@ -97,8 +114,7 @@ def _effective_count_from_weights(weights: torch.Tensor) -> torch.Tensor:
 
 def _mixture_loss_from_effective_count(effective_count: torch.Tensor, target_count: float) -> torch.Tensor:
     target = max(float(target_count), 1.0)
-    target_tensor = torch.tensor(target, device=effective_count.device, dtype=effective_count.dtype)
-    return torch.relu(target_tensor - effective_count.mean()) / target
+    return torch.relu(target - effective_count.mean()) / target
 
 
 def _scalar_stat_tensor(value: torch.Tensor | float | int, *, device: torch.device) -> torch.Tensor:
@@ -247,6 +263,69 @@ def _repair_finite_tensor(
             replacement = replacement.expand_as(tensor)
     repaired = torch.where(bad_mask, replacement, tensor)
     return repaired, int(bad_mask.sum().item())
+
+
+def _repair_finite_tensor_group(
+    entries: Sequence[Tuple[torch.Tensor, Optional[torch.Tensor], bool]],
+    *,
+    include_entry_counts: bool = False,
+) -> Tuple[List[torch.Tensor], int] | Tuple[List[torch.Tensor], int, Optional[List[torch.Tensor]]]:
+    """Sanitize related tensors with one host sync per device, not per tensor."""
+    tensors = [entry[0] for entry in entries]
+    grouped_indices: Dict[Tuple[torch.device, torch.dtype, bool], List[int]] = {}
+    for index, (tensor, _fallback, allow_negative_inf) in enumerate(entries):
+        if tensor.numel() == 0 or not tensor.dtype.is_floating_point:
+            continue
+        grouped_indices.setdefault((tensor.device, tensor.dtype, allow_negative_inf), []).append(index)
+
+    group_data: Dict[Tuple[torch.device, torch.dtype, bool], Tuple[torch.Tensor, torch.Tensor, List[Tuple[int, int, int]]]] = {}
+    device_counts: Dict[torch.device, torch.Tensor] = {}
+    for group_key, indices in grouped_indices.items():
+        values = [entries[index][0].reshape(-1) for index in indices]
+        flat_values = torch.cat(values)
+        if group_key[2]:
+            bad_flat = torch.isnan(flat_values) | torch.isposinf(flat_values)
+        else:
+            bad_flat = ~torch.isfinite(flat_values)
+        offsets: List[Tuple[int, int, int]] = []
+        offset = 0
+        for index in indices:
+            next_offset = offset + entries[index][0].numel()
+            offsets.append((index, offset, next_offset))
+            offset = next_offset
+        group_data[group_key] = (flat_values, bad_flat, offsets)
+        group_count = bad_flat.sum(dtype=torch.int64)
+        device = group_key[0]
+        device_counts[device] = device_counts.get(device, torch.zeros((), device=device, dtype=torch.int64)) + group_count
+
+    counts_by_device = {device: int(count.item()) for device, count in device_counts.items()}
+    total_repairs = sum(counts_by_device.values())
+    if total_repairs == 0:
+        if include_entry_counts:
+            return tensors, 0, None
+        return tensors, 0
+
+    repaired_tensors = list(tensors)
+    for group_key, (_flat_values, bad_flat, offsets) in group_data.items():
+        for index, start, end in offsets:
+            if not counts_by_device.get(group_key[0], 0):
+                continue
+            local_bad = bad_flat[start:end].reshape(entries[index][0].shape)
+            fallback = entries[index][1]
+            if fallback is None:
+                replacement = torch.zeros_like(entries[index][0])
+            else:
+                replacement = fallback.to(device=entries[index][0].device, dtype=entries[index][0].dtype)
+                if replacement.shape != entries[index][0].shape:
+                    replacement = replacement.expand_as(entries[index][0])
+            repaired_tensors[index] = torch.where(local_bad, replacement, entries[index][0])
+    if include_entry_counts:
+        entry_counts = [torch.zeros((), device=tensor.device, dtype=torch.int64) for tensor in tensors]
+        for _group_key, (_flat_values, bad_flat, offsets) in group_data.items():
+            for index, start, end in offsets:
+                entry_counts[index] = bad_flat[start:end].sum(dtype=torch.int64)
+        return repaired_tensors, total_repairs, entry_counts
+    return repaired_tensors, total_repairs
 
 
 def _validate_aligned_signature_tensors(
@@ -1679,6 +1758,7 @@ class HierarchicalParameterNest(nn.Module):
 
         gate_logits = self.family_gate(hidden.mean(dim=1) if hidden.dim() == 3 else hidden)
         specialist_prob = torch.sigmoid(gate_logits).squeeze(-1)
+
         if specialist_prob.numel() == 0 or not bool((specialist_prob > self.family_specialist_gate_threshold).any().item()):
             stats = self._family_specialist_stats(
                 hidden,
@@ -2473,30 +2553,31 @@ class SignatureEmitterRegistry(nn.Module):
         flat = flat[flat.ge(0)]
         if flat.numel() == 0:
             return
+        activity: torch.Tensor = getattr(self, buffer_name)
+        active_mask: torch.Tensor = getattr(self, mask_name)
+        if self.capacity_growth_locked:
+            # Capacities were fitted before the run and are immutable. A dense
+            # seen mask preserves the once-per-ID activity update without
+            # dynamic torch.unique output or CUDA scalar reads.
+            seen = torch.zeros_like(activity).scatter_(0, flat, 1.0)
+            with torch.no_grad():
+                births = activity.eq(0).to(activity.dtype) * seen
+                activity.add_(seen)
+                active_mask.scatter_(0, flat, 1.0)
+                if buffer_name == "family_activity":
+                    self.family_births.add_(births)
+            return
+
         unique_ids = torch.unique(flat)
         max_id = int(unique_ids.max().item())
         if buffer_name == "family_activity":
-            if self.training and self.capacity_growth_locked and max_id >= self.family_embedding.num_embeddings:
-                raise RuntimeError("Registry family capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(max_id, 0, 0)
+            self._ensure_capacity(max_id, 0, 0)
         elif buffer_name == "relation_activity":
-            if self.training and self.capacity_growth_locked and max_id >= self.relation_embedding.num_embeddings:
-                raise RuntimeError("Registry relation capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(0, max_id, 0)
+            self._ensure_capacity(0, max_id, 0)
         elif buffer_name == "parent_activity":
-            if self.training and self.capacity_growth_locked and max_id >= self.parent_embedding.num_embeddings:
-                raise RuntimeError("Registry parent capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(max_id, 0, 0)
+            self._ensure_capacity(max_id, 0, 0)
         else:
-            if self.training and self.capacity_growth_locked and max_id >= self.level_embedding.num_embeddings:
-                raise RuntimeError("Registry level capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(0, 0, max_id)
-        activity: torch.Tensor = getattr(self, buffer_name)
-        active_mask: torch.Tensor = getattr(self, mask_name)
+            self._ensure_capacity(0, 0, max_id)
         with torch.no_grad():
             births = activity[unique_ids].eq(0).to(activity.dtype)
             activity[unique_ids] += 1.0
@@ -2535,12 +2616,9 @@ class SignatureEmitterRegistry(nn.Module):
 
     def family_context(self, family_ids: torch.Tensor) -> torch.Tensor:
         family_ids = family_ids.clamp(min=0)
-        if family_ids.numel() > 0:
+        if family_ids.numel() > 0 and not self.capacity_growth_locked:
             max_family_id = int(family_ids.max().item())
-            if self.training and self.capacity_growth_locked and max_family_id >= self.family_embedding.num_embeddings:
-                raise RuntimeError("Registry family capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(max_family_id, 0, 0)
+            self._ensure_capacity(max_family_id, 0, 0)
         embed = self.family_embedding(family_ids)
         mask = self.family_active_mask[family_ids].to(embed.dtype).unsqueeze(-1)
         activity = self.family_activity[family_ids].to(embed.dtype).unsqueeze(-1)
@@ -2552,12 +2630,9 @@ class SignatureEmitterRegistry(nn.Module):
         if level_ids is None:
             device, dtype = self._module_device_dtype(self.family_embedding)
             return torch.zeros(0, device=device, dtype=dtype)
-        if level_ids.numel() > 0:
+        if level_ids.numel() > 0 and not self.capacity_growth_locked:
             max_level_id = int(level_ids.max().item())
-            if self.training and self.capacity_growth_locked and max_level_id >= self.level_embedding.num_embeddings:
-                raise RuntimeError("Registry level capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(0, 0, max_level_id)
+            self._ensure_capacity(0, 0, max_level_id)
         embed = self.level_embedding(level_ids.clamp(min=0))
         mask = self.level_active_mask[level_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
         return embed * (0.5 + 0.5 * mask)
@@ -2566,12 +2641,9 @@ class SignatureEmitterRegistry(nn.Module):
         if relation_ids is None:
             device, dtype = self._module_device_dtype(self.family_embedding)
             return torch.zeros(0, device=device, dtype=dtype)
-        if relation_ids.numel() > 0:
+        if relation_ids.numel() > 0 and not self.capacity_growth_locked:
             max_relation_id = int(relation_ids.max().item())
-            if self.training and self.capacity_growth_locked and max_relation_id >= self.relation_embedding.num_embeddings:
-                raise RuntimeError("Registry relation capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(0, max_relation_id, 0)
+            self._ensure_capacity(0, max_relation_id, 0)
         embed = self.relation_embedding(relation_ids.clamp(min=0))
         mask = self.relation_active_mask[relation_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
         activity = self.relation_activity[relation_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
@@ -2581,12 +2653,9 @@ class SignatureEmitterRegistry(nn.Module):
         if parent_ids is None:
             device, dtype = self._module_device_dtype(self.family_embedding)
             return torch.zeros(0, device=device, dtype=dtype)
-        if parent_ids.numel() > 0:
+        if parent_ids.numel() > 0 and not self.capacity_growth_locked:
             max_parent_id = int(parent_ids.max().item())
-            if self.training and self.capacity_growth_locked and max_parent_id >= self.parent_embedding.num_embeddings:
-                raise RuntimeError("Registry parent capacity is locked; prepare capacity before training.")
-            else:
-                self._ensure_capacity(max_parent_id, 0, 0)
+            self._ensure_capacity(max_parent_id, 0, 0)
         embed = self.parent_embedding(parent_ids.clamp(min=0))
         mask = self.parent_active_mask[parent_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
         activity = self.parent_activity[parent_ids.clamp(min=0)].to(embed.dtype).unsqueeze(-1)
@@ -3115,7 +3184,7 @@ class PrismalTorusCore(nn.Module):
             emitter_cell_mixture_loss = _mixture_loss_from_effective_count(stencil_effective_count, mixture_target)
             stats = {
                 "torus_entropy": stencil_entropy,
-                "torus_activity_threshold": torch.tensor(self.activity_threshold, device=hidden.device).detach(),
+                "torus_activity_threshold": _device_scalar(self.activity_threshold, device=hidden.device).detach(),
                 "cell_energy_mean": cell_energy.mean().detach(),
                 "cell_energy_min": cell_energy.min().detach(),
                 "cell_energy_max": cell_energy.max().detach(),
@@ -3135,9 +3204,9 @@ class PrismalTorusCore(nn.Module):
                 "emitter_cell_coverage_loss": active_balance_loss,
                 "write_coord": write_coord.detach(),
                 "torus_temperature": local_temperature.detach(),
-                "global_bus_slots": torch.tensor(float(self.global_bus_slots), device=hidden.device),
+                "global_bus_slots": _device_scalar(float(self.global_bus_slots), device=hidden.device),
                 "global_bus_norm": next_bus.abs().mean().detach(),
-                "active_torus_radius": torch.tensor(float(active_radius), device=hidden.device),
+                "active_torus_radius": _device_scalar(float(active_radius), device=hidden.device),
             }
         else:
             stats = {
@@ -3150,8 +3219,8 @@ class PrismalTorusCore(nn.Module):
                 "global_bus_norm": next_bus.abs().mean().detach(),
                 "write_coord": write_coord.detach(),
                 "torus_temperature": local_temperature.detach(),
-                "global_bus_slots": torch.tensor(float(self.global_bus_slots), device=hidden.device),
-                "active_torus_radius": torch.tensor(float(active_radius), device=hidden.device),
+                "global_bus_slots": _device_scalar(float(self.global_bus_slots), device=hidden.device),
+                "active_torus_radius": _device_scalar(float(active_radius), device=hidden.device),
             }
         transition_state = {
             "linear": {
@@ -3162,7 +3231,7 @@ class PrismalTorusCore(nn.Module):
                 "center_z": center_z,
                 "center_y": center_y,
                 "center_x": center_x,
-                "active_radius": torch.tensor(float(active_radius), device=hidden.device),
+                "active_radius": _device_scalar(float(active_radius), device=hidden.device),
             },
             "nonlinear": {
                 "stencil_weights": stencil_weights,
@@ -3170,14 +3239,14 @@ class PrismalTorusCore(nn.Module):
                 "write_update": write_update,
                 "read_hidden": read_hidden,
                 "bus_gate": bus_gate,
-                "transport_applied": torch.tensor(bool(step_index % self.transport_interval == 0), device=hidden.device),
+                "transport_applied": _device_scalar(bool(step_index % self.transport_interval == 0), device=hidden.device),
             },
             "carry": {
                 "field": next_field,
                 "bus": next_bus,
-                "local_field_radius": torch.tensor(float(self.local_field_radius), device=hidden.device),
-                "active_radius": torch.tensor(float(active_radius), device=hidden.device),
-                "bus_slots": torch.tensor(float(self.global_bus_slots), device=hidden.device),
+                "local_field_radius": _device_scalar(float(self.local_field_radius), device=hidden.device),
+                "active_radius": _device_scalar(float(active_radius), device=hidden.device),
+                "bus_slots": _device_scalar(float(self.global_bus_slots), device=hidden.device),
                 "temperature": local_temperature,
                 "write_strength": write_strength,
             },
@@ -3708,15 +3777,15 @@ class PrismalTorusCore(nn.Module):
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         if not self._finite_guard_enabled():
             return route_stats, 0
-        sanitized: Dict[str, torch.Tensor] = {}
-        repairs = 0
-        for key, value in route_stats.items():
-            if torch.is_tensor(value):
-                clean_value, clean_repairs = self._sanitize_tensor(value)
-                sanitized[key] = clean_value
-                repairs += clean_repairs
-            else:
-                sanitized[key] = value
+        tensor_keys = [key for key, value in route_stats.items() if torch.is_tensor(value)]
+        repaired_values, repairs = _repair_finite_tensor_group(
+            [(route_stats[key], None, False) for key in tensor_keys]
+        )
+        repaired_by_key = dict(zip(tensor_keys, repaired_values))
+        sanitized = {
+            key: repaired_by_key[key] if key in repaired_by_key else value
+            for key, value in route_stats.items()
+        }
         sanitized["stability_nonfinite_repair_count"] = torch.tensor(float(repairs), device=device)
         sanitized["stability_finite_guard_enabled"] = torch.tensor(1.0, device=device)
         return sanitized, repairs
@@ -3775,17 +3844,45 @@ class PrismalTorusCore(nn.Module):
             vram_stats=vram_stats,
             vram_key="torus_step",
         )
-        repair_count = 0
-        next_hidden, repaired = self._sanitize_tensor(next_hidden, fallback=hidden)
-        repair_count += repaired
+        transition_entries: List[Tuple[torch.Tensor, Optional[torch.Tensor], bool]] = [
+            (next_hidden, hidden, False),
+        ]
         if isinstance(next_field, PrismalTorusState):
-            next_field_field, repaired = self._sanitize_tensor(next_field.field, fallback=next_field.field.new_zeros(next_field.field.shape))
-            next_field_bus, repaired_bus = self._sanitize_tensor(next_field.bus, fallback=next_field.bus.new_zeros(next_field.bus.shape))
-            repair_count += repaired + repaired_bus
-            next_field = PrismalTorusState(field=next_field_field, bus=next_field_bus)
-        sanitized_stats, stat_repairs = self._sanitize_route_stats(stats, device=hidden.device)
-        repair_count += stat_repairs
-        sanitized_stats["stability_step_repair_count"] = torch.tensor(float(repair_count), device=hidden.device)
+            transition_entries.extend(
+                (
+                    (next_field.field, next_field.field.new_zeros(next_field.field.shape), False),
+                    (next_field.bus, next_field.bus.new_zeros(next_field.bus.shape), False),
+                )
+            )
+        stat_keys = [key for key, value in stats.items() if torch.is_tensor(value)]
+        finite_entries = transition_entries + [(stats[key], None, False) for key in stat_keys]
+        if self._finite_guard_enabled():
+            repaired_values, repair_count, entry_counts = _repair_finite_tensor_group(
+                finite_entries, include_entry_counts=True
+            )
+            transition_tensors = repaired_values[: len(transition_entries)]
+            repaired_stats = dict(stats)
+            repaired_stats.update(zip(stat_keys, repaired_values[len(transition_entries) :]))
+            if entry_counts is None or not stat_keys:
+                stat_repairs: torch.Tensor | int = 0
+            else:
+                stat_repairs = torch.stack(entry_counts[len(transition_entries) :]).sum().to(hidden.device)
+            sanitized_stats = repaired_stats
+            sanitized_stats["stability_nonfinite_repair_count"] = torch.as_tensor(
+                stat_repairs, device=hidden.device, dtype=torch.float32
+            )
+            sanitized_stats["stability_finite_guard_enabled"] = _device_scalar(1.0, device=hidden.device)
+        else:
+            repair_count = 0
+            transition_tensors = [entry[0] for entry in transition_entries]
+            sanitized_stats = stats
+        next_hidden = transition_tensors[0]
+        if isinstance(next_field, PrismalTorusState):
+            next_field = PrismalTorusState(field=transition_tensors[1], bus=transition_tensors[2])
+        if repair_count == 0:
+            sanitized_stats["stability_step_repair_count"] = _device_scalar(0.0, device=hidden.device)
+        else:
+            sanitized_stats["stability_step_repair_count"] = torch.tensor(float(repair_count), device=hidden.device)
         if profile_enabled:
             _sync_for_timing(hidden.device)
             timing_ms["timing_torus_step_ms"] = (time.perf_counter() - start_total) * 1000.0
@@ -4248,8 +4345,11 @@ class SignatureLatticeAttention(nn.Module):
             if signature_relation_ids is not None
             else zero_ids
         )
-        level_vocab = max(1, int(getattr(self.level_bias, "num_embeddings", level_ids.max().item() + 1 if level_ids.numel() else 1)))
-        relation_vocab = max(1, int(getattr(self.relation_bias, "num_embeddings", relation_ids.max().item() + 1 if relation_ids.numel() else 1)))
+        # num_embeddings is fixed by the module contract. Avoid evaluating a
+        # CUDA .max().item() fallback on every forward (Python evaluates
+        # getattr's default argument even when the attribute exists).
+        level_vocab = max(1, int(self.level_bias.num_embeddings))
+        relation_vocab = max(1, int(self.relation_bias.num_embeddings))
         level_ids = level_ids.remainder(level_vocab)
         relation_ids = relation_ids.remainder(relation_vocab)
         level_relation_bucket = ((level_ids * 131) + (relation_ids * 17)).remainder(self.buckets)
@@ -5207,6 +5307,7 @@ class PrismalEmitterRouter(nn.Module):
             x = idx % self.grid_width
             coords.append((float(y % self.grid_height), float(x)))
         self.register_buffer("emitter_grid_coords", torch.tensor(coords, dtype=torch.float32), persistent=False)
+        self._sparse_spatial_candidate_tables: Dict[Tuple[int, int, str, int | None], torch.Tensor] = {}
 
     def _make_embedding(self, size: int, d_model: int) -> nn.Embedding:
         size = max(1, int(size))
@@ -5470,8 +5571,7 @@ class PrismalEmitterRouter(nn.Module):
         *,
         batch: int,
         seq_len: int,
-        path_coord_y: float,
-        path_coord_x: float,
+        path_coord: torch.Tensor,
         signature_family_ids: Optional[torch.Tensor],
         signature_ids: Optional[torch.Tensor],
         signature_level_ids: Optional[torch.Tensor],
@@ -5483,29 +5583,140 @@ class PrismalEmitterRouter(nn.Module):
         candidate_budget: int,
         device: torch.device,
     ) -> torch.Tensor:
-        rows: List[List[int]] = []
-        for batch_idx in range(batch):
-            for seq_idx in range(seq_len):
-                family_id = int(signature_family_ids[batch_idx, seq_idx].item()) if signature_family_ids is not None else 0
-                sig_id = int(signature_ids[batch_idx, seq_idx].item()) if signature_ids is not None else family_id
-                level_id = int(signature_level_ids[batch_idx, seq_idx].item()) if signature_level_ids is not None else 0
-                relation_id = int(signature_relation_ids[batch_idx, seq_idx].item()) if signature_relation_ids is not None else 0
-                parent_id = int(parent_signature_ids[batch_idx, seq_idx].item()) if parent_signature_ids is not None else family_id
-                candidate_ids = self._sparse_candidate_ids_for_token(
-                    path_coord_y=path_coord_y,
-                    path_coord_x=path_coord_x,
-                    signature_family_id=family_id,
-                    signature_id=sig_id,
-                    signature_level_id=level_id,
-                    signature_relation_id=relation_id,
-                    parent_signature_id=parent_id,
-                    path_index=path_index,
-                    layer_index=layer_index,
-                    total_emitters=total_emitters,
-                    candidate_budget=candidate_budget,
+        # Candidate IDs are discrete metadata, so construct them with integer
+        # CUDA operations. The previous reference loop copied every signature
+        # field to Python and hashed every token independently; that left a
+        # large CPU gap between one-token causal transitions.
+        zero_ids = torch.zeros((batch, seq_len), device=device, dtype=torch.long)
+        family_ids = signature_family_ids[:, :seq_len].to(device=device, dtype=torch.long) if signature_family_ids is not None else zero_ids
+        sig_ids = signature_ids[:, :seq_len].to(device=device, dtype=torch.long) if signature_ids is not None else family_ids
+        level_ids = signature_level_ids[:, :seq_len].to(device=device, dtype=torch.long) if signature_level_ids is not None else zero_ids
+        relation_ids = signature_relation_ids[:, :seq_len].to(device=device, dtype=torch.long) if signature_relation_ids is not None else zero_ids
+        parent_ids = parent_signature_ids[:, :seq_len].to(device=device, dtype=torch.long) if parent_signature_ids is not None else family_ids
+        total_emitters = max(1, int(total_emitters))
+        candidate_budget = max(1, min(int(candidate_budget), total_emitters))
+        if total_emitters <= candidate_budget:
+            return torch.arange(total_emitters, device=device, dtype=torch.long).view(1, 1, -1).expand(batch, seq_len, -1)
+
+        spatial_budget = max(1, candidate_budget // 2)
+        seed_budget = max(1, candidate_budget - spatial_budget)
+        per_seed_budget = max(1, seed_budget // 7)
+        table_key = (total_emitters, spatial_budget, device.type, device.index)
+        spatial_table = self._sparse_spatial_candidate_tables.get(table_key)
+        if spatial_table is None:
+            offsets = _manhattan_offsets(spatial_budget * 4)
+            rows: List[List[int]] = []
+            for row_center in range(max(self.grid_height, 1)):
+                for col_center in range(max(self.grid_width, 1)):
+                    ordered: List[int] = []
+                    seen: set[int] = set()
+                    for row_offset, col_offset in offsets:
+                        row = (row_center + row_offset) % max(self.grid_height, 1)
+                        col = (col_center + col_offset) % max(self.grid_width, 1)
+                        emitter_id = row * self.grid_width + col
+                        if emitter_id >= total_emitters or emitter_id in seen:
+                            continue
+                        seen.add(emitter_id)
+                        ordered.append(emitter_id)
+                        if len(ordered) >= spatial_budget:
+                            break
+                    if len(ordered) < spatial_budget:
+                        # Preserve the exact reference path for deliberately
+                        # tiny/degenerate grids where spatial neighbors cannot
+                        # fill their allotted share.
+                        path_y, path_x = path_coord.detach().to(device="cpu").tolist()
+                        zero_cpu = torch.zeros((batch, seq_len), dtype=torch.long)
+                        cpu_fields = [field.detach().to(device="cpu").long() if field is not None else zero_cpu
+                                      for field in (signature_family_ids, signature_ids, signature_level_ids,
+                                                    signature_relation_ids, parent_signature_ids)]
+                        result = []
+                        for b in range(batch):
+                            result.append([
+                                self._sparse_candidate_ids_for_token(
+                                    path_coord_y=float(path_y), path_coord_x=float(path_x),
+                                    signature_family_id=int(cpu_fields[0][b, s]),
+                                    signature_id=int(cpu_fields[1][b, s]),
+                                    signature_level_id=int(cpu_fields[2][b, s]),
+                                    signature_relation_id=int(cpu_fields[3][b, s]),
+                                    parent_signature_id=int(cpu_fields[4][b, s]),
+                                    path_index=path_index, layer_index=layer_index,
+                                    total_emitters=total_emitters, candidate_budget=candidate_budget,
+                                ) for s in range(seq_len)
+                            ])
+                        return torch.tensor(result, device=device, dtype=torch.long)
+                    rows.append(ordered)
+            spatial_table = torch.tensor(rows, dtype=torch.long, device=device)
+            self._sparse_spatial_candidate_tables[table_key] = spatial_table
+
+        rounded_y = torch.round(path_coord[0].detach()).long()
+        rounded_x = torch.round(path_coord[1].detach()).long()
+        center_y = rounded_y.remainder(max(self.grid_height, 1))
+        center_x = rounded_x.remainder(max(self.grid_width, 1))
+        spatial_index = center_y * max(self.grid_width, 1) + center_x
+        spatial = spatial_table[spatial_index].view(1, 1, spatial_budget).expand(batch, seq_len, -1)
+
+        def _unsigned_remainder(value: torch.Tensor, divisor: int) -> torch.Tensor:
+            remainder = torch.remainder(value, divisor)
+            wrap = (1 << 64) % divisor
+            if wrap:
+                remainder = torch.where(value < 0, torch.remainder(remainder + wrap, divisor), remainder)
+            return remainder
+
+        def _mix_seed_tensor(first: int | torch.Tensor, *values: int | torch.Tensor) -> torch.Tensor:
+            reference = first if torch.is_tensor(first) else path_coord.new_zeros(())
+            acc = torch.full_like(reference, -7046029254386353131, dtype=torch.long)
+            for value in (first, *values):
+                current = value.to(device=device, dtype=torch.long) if torch.is_tensor(value) else torch.full_like(acc, int(value))
+                logical_right = torch.bitwise_right_shift(acc, 2).bitwise_and((1 << 62) - 1)
+                mixed = current + (-7046029254386353131) + (acc << 6) + logical_right
+                acc = torch.bitwise_xor(acc, mixed)
+            return _unsigned_remainder(acc, total_emitters)
+
+        seed_fields = (family_ids, sig_ids, level_ids, relation_ids, parent_ids,
+                       torch.full_like(family_ids, int(path_index)),
+                       torch.full_like(family_ids, int(layer_index)))
+        raw_seed_candidates: List[torch.Tensor] = []
+        for source_index, seed in enumerate(seed_fields):
+            base = _mix_seed_tensor(seed, path_index, layer_index, source_index, total_emitters)
+            raw_seed_candidates.append(base)
+            for offset in range(1, per_seed_budget + 2):
+                raw_seed_candidates.append(torch.remainder(base + offset, total_emitters))
+                raw_seed_candidates.append(torch.remainder(base - offset, total_emitters))
+        raw = torch.stack(raw_seed_candidates, dim=-1)
+        raw_count = raw.size(-1)
+        prior = torch.tril(torch.ones((raw_count, raw_count), device=device, dtype=torch.bool), diagonal=-1)
+        duplicate_prior = (raw.unsqueeze(-1).eq(raw.unsqueeze(-2)) & prior).any(dim=-1)
+        duplicate_spatial = raw.unsqueeze(-1).eq(spatial.unsqueeze(-2)).any(dim=-1)
+        unique = ~(duplicate_prior | duplicate_spatial)
+        ranks = unique.to(torch.long).cumsum(dim=-1) - 1
+        remaining = candidate_budget - spatial_budget
+        desired_ranks = torch.arange(remaining, device=device, dtype=torch.long)
+        selected_mask = unique.unsqueeze(-1) & ranks.unsqueeze(-1).eq(desired_ranks.view(1, 1, 1, -1))
+        selected_indices = selected_mask.to(torch.int8).argmax(dim=-2)
+        selected = raw.gather(-1, selected_indices)
+        candidates = torch.cat((spatial, selected), dim=-1)
+        filled = spatial.new_full((batch, seq_len), spatial_budget, dtype=torch.long) + unique.sum(dim=-1)
+
+        # Degenerate collision patterns are rare, but match the reference's
+        # fallback sequence exactly when the signature-derived candidates do
+        # not fill the configured budget.
+        if bool(filled.lt(candidate_budget).any().item()):
+            fallback = _mix_seed_tensor(
+                int(path_index), layer_index, total_emitters, rounded_y, rounded_x
+            )
+            for offset in range(2 * candidate_budget + 1):
+                value = torch.remainder(fallback + offset, total_emitters).expand(batch, seq_len)
+                duplicate = candidates.eq(value.unsqueeze(-1)).any(dim=-1)
+                add = (~duplicate) & filled.lt(candidate_budget)
+                slot = filled.clamp(max=candidate_budget - 1)
+                old_value = candidates.gather(-1, slot.unsqueeze(-1)).squeeze(-1)
+                candidates = candidates.scatter(
+                    -1, slot.unsqueeze(-1), torch.where(add, value, old_value).unsqueeze(-1)
                 )
-                rows.append(list(candidate_ids))
-        return torch.tensor(rows, device=device, dtype=torch.long).view(batch, seq_len, candidate_budget)
+                filled = filled + add.to(torch.long)
+            if bool(filled.lt(candidate_budget).any().item()):
+                raise RuntimeError("Sparse candidate fallback failed to fill the configured candidate budget.")
+        return candidates
 
     def init_slots(
         self,
@@ -5602,8 +5813,7 @@ class PrismalEmitterRouter(nn.Module):
             candidate_ids = self._build_sparse_candidate_tensor(
                 batch=batch,
                 seq_len=seq_len,
-                path_coord_y=float(path_coord[0].item()),
-                path_coord_x=float(path_coord[1].item()),
+                path_coord=path_coord,
                 signature_family_ids=signature_family_ids,
                 signature_ids=signature_ids,
                 signature_level_ids=signature_level_ids,
@@ -5724,7 +5934,9 @@ class PrismalEmitterRouter(nn.Module):
                 balance_loss = torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
                 usage_entropy = torch.tensor(0.0, device=hidden.device, dtype=query.dtype)
 
-            active_emitters = torch.tensor(float(torch.unique(top_idx).numel()), device=hidden.device)
+            active_emitters = torch.bincount(
+                top_idx.detach().reshape(-1).long(), minlength=emitter_bank.size(0)
+            ).gt(0).sum().to(dtype=hidden.dtype)
             stats = {
                 "emitter_top_idx": top_idx.detach(),
                 "emitter_top_weights": top_weights.detach(),
@@ -5897,7 +6109,9 @@ class PrismalEmitterRouter(nn.Module):
         )
 
         entropy = entropy_accum.mean()
-        active_emitters = torch.tensor(float(torch.unique(top_idx).numel()), device=hidden.device)
+        active_emitters = torch.bincount(
+            top_idx.detach().reshape(-1).long(), minlength=emitter_bank.size(0)
+        ).gt(0).sum().to(dtype=hidden.dtype)
         usage = torch.bincount(top_idx.reshape(-1).detach(), minlength=emitter_bank.size(0)).to(hidden.device).float()
         usage = usage / usage.sum().clamp_min(1.0)
         soft_usage = usage_accum / usage_accum.sum().clamp_min(1e-8)
@@ -6830,15 +7044,15 @@ class PrismalWaveModel(nn.Module):
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         if not self._finite_guard_enabled():
             return route_stats, 0
-        sanitized: Dict[str, torch.Tensor] = {}
-        repairs = 0
-        for key, value in route_stats.items():
-            if torch.is_tensor(value):
-                clean_value, clean_repairs = self._sanitize_tensor(value)
-                sanitized[key] = clean_value
-                repairs += clean_repairs
-            else:
-                sanitized[key] = value
+        tensor_keys = [key for key, value in route_stats.items() if torch.is_tensor(value)]
+        repaired_values, repairs = _repair_finite_tensor_group(
+            [(route_stats[key], None, False) for key in tensor_keys]
+        )
+        repaired_by_key = dict(zip(tensor_keys, repaired_values))
+        sanitized = {
+            key: repaired_by_key[key] if key in repaired_by_key else value
+            for key, value in route_stats.items()
+        }
         sanitized["stability_nonfinite_repair_count"] = torch.tensor(float(repairs), device=device)
         sanitized["stability_finite_guard_enabled"] = torch.tensor(1.0, device=device)
         return sanitized, repairs
@@ -8236,7 +8450,13 @@ class PrismalWaveModel(nn.Module):
             outputs.append(chunk_output)
             entropy_terms.append(chunk_stats["torus_entropy"])
             if collect_telemetry:
-                active_terms.append(chunk_stats.get("emitter_cell_occupancy", chunk_stats.get("active_cells", torch.tensor(0.0, device=input_ids.device))).float())
+                if "emitter_cell_occupancy" in chunk_stats:
+                    active_value = chunk_stats["emitter_cell_occupancy"]
+                elif "active_cells" in chunk_stats:
+                    active_value = chunk_stats["active_cells"]
+                else:
+                    active_value = _device_scalar(0.0, device=input_ids.device)
+                active_terms.append(active_value.float())
                 if "emitter_cell_soft_occupancy" in chunk_stats:
                     soft_active_terms.append(chunk_stats["emitter_cell_soft_occupancy"].float())
                 if "emitter_cell_effective_count" in chunk_stats:

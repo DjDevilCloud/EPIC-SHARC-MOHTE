@@ -3670,6 +3670,8 @@ def _build_window_samples_from_text(
     *,
     seq_len: int,
     max_samples: int = 0,
+    window_stride: int = 0,
+    include_structure_starts: bool = True,
     hierarchy_vector_dtype: object = "float8_e4m3fn",
     low_rank_enabled: Optional[bool] = None,
     low_rank_dim: Optional[int] = None,
@@ -3813,7 +3815,7 @@ def _build_window_samples_from_text(
     boundary_starts = _structure_boundary_starts(encoded, tokenizer)
     if seq_len <= 0:
         chunk_len = max(64, min(len(encoded), 256))
-        stride = max(1, chunk_len // 2)
+        stride = max(1, int(window_stride)) if window_stride else max(1, chunk_len // 2)
         supervised_indices = [idx for idx, mask in enumerate(token_loss_mask) if float(mask) > 0.0]
         anchored_starts: set[int] = set()
         if supervised_indices:
@@ -3834,7 +3836,13 @@ def _build_window_samples_from_text(
                     anchored_starts.add(answer_start)
                     if max_samples and len(samples) >= max_samples:
                         return samples
-        candidate_starts = sorted(set(boundary_starts) | set(range(0, max(1, len(encoded) - 1), stride)))
+        regular_starts = list(range(0, max(1, len(encoded) - 1), stride))
+        if regular_starts and regular_starts[-1] + chunk_len < len(encoded):
+            regular_starts.append(max(0, len(encoded) - chunk_len))
+        candidate_starts = set(regular_starts)
+        if include_structure_starts:
+            candidate_starts.update(boundary_starts)
+        candidate_starts = sorted(candidate_starts)
         for start in candidate_starts:
             if start in anchored_starts:
                 continue
@@ -3843,8 +3851,14 @@ def _build_window_samples_from_text(
                 break
     else:
         chunk_len = max(4, seq_len - 1)
-        stride = max(1, chunk_len // 2)
-        candidate_starts = sorted(set(boundary_starts) | set(range(0, max(1, len(encoded) - 1), stride)))
+        stride = max(1, int(window_stride)) if window_stride else max(1, chunk_len // 2)
+        regular_starts = list(range(0, max(1, len(encoded) - 1), stride))
+        if regular_starts and regular_starts[-1] + chunk_len < len(encoded):
+            regular_starts.append(max(0, len(encoded) - chunk_len))
+        candidate_starts = set(regular_starts)
+        if include_structure_starts:
+            candidate_starts.update(boundary_starts)
+        candidate_starts = sorted(candidate_starts)
         for start in candidate_starts:
             append_window(start, chunk_len)
             if max_samples and len(samples) >= max_samples:
@@ -3927,11 +3941,15 @@ class StreamingTextCorpusDataset(IterableDataset):
         seed: int = 42,
         sample_seed: int | None = None,
         shuffle_buffer_size: int | None = None,
+        window_stride: int = 0,
+        include_structure_starts: bool = True,
         hierarchy_vector_dtype: object = "float8_e4m3fn",
     ) -> None:
         self.source = Path(source)
         self.tokenizer = tokenizer
         self.seq_len = max(0, int(seq_len))
+        self.window_stride = max(0, int(window_stride))
+        self.include_structure_starts = bool(include_structure_starts)
         self.hierarchy_vector_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
         self.max_samples = max(0, int(max_samples))
         self.split = split
@@ -3973,6 +3991,8 @@ class StreamingTextCorpusDataset(IterableDataset):
             merged,
             seq_len=self.seq_len,
             max_samples=remaining,
+            window_stride=self.window_stride,
+            include_structure_starts=self.include_structure_starts,
             hierarchy_vector_dtype=self.hierarchy_vector_dtype,
         )
 

@@ -962,6 +962,8 @@ def build_train_val_dataloaders(
     val_max_samples: int | None = None,
     seed: int = 42,
     streaming: bool = True,
+    window_stride: int = 0,
+    include_structure_starts: bool = True,
     hierarchy_vector_dtype: object = "float8_e4m3fn",
 ) -> tuple[DataLoader, DataLoader]:
     hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
@@ -1034,6 +1036,8 @@ def build_train_val_dataloaders(
             split="train",
             val_fraction=val_fraction,
             seed=seed,
+            window_stride=window_stride,
+            include_structure_starts=include_structure_starts,
             hierarchy_vector_dtype=hierarchy_dtype,
         )
         val_dataset = StreamingTextCorpusDataset(
@@ -1044,6 +1048,8 @@ def build_train_val_dataloaders(
             split="val",
             val_fraction=val_fraction,
             seed=seed,
+            window_stride=window_stride,
+            include_structure_starts=include_structure_starts,
             hierarchy_vector_dtype=hierarchy_dtype,
         )
         train_loader = DataLoader(
@@ -1515,7 +1521,49 @@ AUX_BREAKDOWN_KEYS: tuple[str, ...] = (
 
 
 def _aux_breakdown_values(route_stats: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    return {key: _stat_value(route_stats, key) for key in AUX_BREAKDOWN_KEYS}
+    reference = next((value for value in route_stats.values() if torch.is_tensor(value)), None)
+    device = reference.device if reference is not None else torch.device("cpu")
+    values = []
+    for key in AUX_BREAKDOWN_KEYS:
+        value = route_stats.get(key)
+        if torch.is_tensor(value):
+            values.append(value.detach().float().mean().to(device=device))
+        else:
+            values.append(torch.tensor(float(value or 0.0), device=device))
+    # The scalar diagnostics are needed by Python progress/checkpoint code, but
+    # transfer them as one packet rather than synchronizing once per key.
+    host_values = torch.stack(values).cpu().tolist()
+    return dict(zip(AUX_BREAKDOWN_KEYS, (float(value) for value in host_values)))
+
+
+def _train_step_host_metrics(
+    loss: torch.Tensor,
+    ce_loss: torch.Tensor,
+    aux_loss: torch.Tensor,
+    route_stats: Dict[str, torch.Tensor],
+) -> Dict[str, float]:
+    """Read the scalar values needed by the Python trainer with one CUDA sync."""
+    keys = ("loss", "ce_loss", "aux_loss", "signature_agreement", "avg_entropy",
+            "stability_nonfinite_repair_count", *AUX_BREAKDOWN_KEYS)
+    device = loss.device
+    values = [loss.detach().float().mean(), ce_loss.detach().float().mean(), aux_loss.detach().float().mean()]
+    for key in keys[3:-len(AUX_BREAKDOWN_KEYS)]:
+        value = route_stats.get(key)
+        if torch.is_tensor(value):
+            values.append(value.detach().float().mean().to(device=device))
+        else:
+            values.append(torch.tensor(float(value or 0.0), device=device))
+    for key in AUX_BREAKDOWN_KEYS:
+        value = route_stats.get(key)
+        if torch.is_tensor(value):
+            values.append(value.detach().float().mean().to(device=device))
+        else:
+            values.append(torch.tensor(float(value or 0.0), device=device))
+    values.append(torch.isfinite(loss.detach()).all().to(dtype=torch.float32))
+    host_values = torch.stack(values).cpu().tolist()
+    result = dict(zip(keys, (float(value) for value in host_values[:-1])))
+    result["loss_is_finite"] = float(host_values[-1])
+    return result
 
 
 def _format_aux_top_terms(aux_terms: Dict[str, float], top_n: int = 3) -> str:
@@ -1589,6 +1637,7 @@ def _optimizer_group_grad_clip_cap(group: dict, cfg: PrismalWaveConfig, fallback
 
 
 def _optimizer_gradients_are_finite(optimizer: torch.optim.Optimizer) -> bool:
+    finite_checks: list[torch.Tensor] = []
     for group in optimizer.param_groups:
         for param in group.get("params", []):
             if not isinstance(param, torch.Tensor) or param.grad is None:
@@ -1596,9 +1645,15 @@ def _optimizer_gradients_are_finite(optimizer: torch.optim.Optimizer) -> bool:
             grad = param.grad
             if grad.is_sparse:
                 grad = grad.coalesce().values()
-            if not torch.isfinite(grad).all():
-                return False
-    return True
+            finite_checks.append(torch.isfinite(grad).all())
+    if not finite_checks:
+        return True
+    # A Python truth check for each gradient tensor synchronizes CUDA once per
+    # parameter. Reduce on-device and make one host read for the whole model.
+    devices = {check.device for check in finite_checks}
+    if len(devices) == 1:
+        return bool(torch.stack(finite_checks).all().item())
+    return all(bool(torch.stack([check for check in finite_checks if check.device == device]).all().item()) for device in devices)
 
 
 def _clip_optimizer_group_gradients(
@@ -2554,15 +2609,11 @@ def train_model(
                 }
             )
             torch.cuda.reset_peak_memory_stats(device)
-        repair_count = 0
-        stability_value = output.route_stats.get("stability_nonfinite_repair_count")
-        if torch.is_tensor(stability_value):
-            repair_count = int(max(0.0, float(stability_value.detach().float().mean().item())))
-        elif stability_value is not None:
-            repair_count = int(max(0.0, float(stability_value)))
+        host_metrics = _train_step_host_metrics(loss, output.ce_loss, output.aux_loss, output.route_stats)
+        repair_count = int(max(0.0, host_metrics["stability_nonfinite_repair_count"]))
         if repair_count > 0:
             stability_repaired_tensors += repair_count
-        is_finite_loss = bool(torch.isfinite(loss.detach()).all().item())
+        is_finite_loss = bool(host_metrics["loss_is_finite"])
         last_stability_text = f"repairs={repair_count}"
         if not is_finite_loss:
             stability_nonfinite_loss_batches += 1
@@ -2619,16 +2670,16 @@ def train_model(
             output.route_stats.update({key: torch.tensor(value, device=device).detach() for key, value in batch_vram.items()})
 
         step += 1
-        loss_value = float(loss.detach().item())
-        ce_value = float(output.ce_loss.detach().item())
-        aux_value = float(output.aux_loss.detach().item())
+        loss_value = host_metrics["loss"]
+        ce_value = host_metrics["ce_loss"]
+        aux_value = host_metrics["aux_loss"]
         last_loss_tensor = loss_value
         last_ce_loss_tensor = ce_value
         last_aux_loss_tensor = aux_value
         loss_sum = loss_value if loss_sum is None else loss_sum + loss_value
         ce_loss_sum = ce_value if ce_loss_sum is None else ce_loss_sum + ce_value
         aux_loss_sum = aux_value if aux_loss_sum is None else aux_loss_sum + aux_value
-        aux_values = _aux_breakdown_values(output.route_stats)
+        aux_values = {key: host_metrics[key] for key in AUX_BREAKDOWN_KEYS}
         for key, value in aux_values.items():
             last_aux_component_values[key] = value
             aux_component_sum[key] = value if aux_component_sum[key] is None else aux_component_sum[key] + value
@@ -2641,8 +2692,8 @@ def train_model(
                 "loss": loss_value,
                 "ce_loss": ce_value,
                 "aux_loss": aux_value,
-                "signature_agreement": _stat_value(output.route_stats, "signature_agreement"),
-                "avg_entropy": _stat_value(output.route_stats, "avg_entropy"),
+                "signature_agreement": host_metrics["signature_agreement"],
+                "avg_entropy": host_metrics["avg_entropy"],
             },
             step=step,
             force=False,
