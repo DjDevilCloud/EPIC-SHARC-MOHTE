@@ -1767,7 +1767,7 @@ def _infer_runtime_sizes_from_state(
                 return int(value.shape[0])
         return None
 
-    if runtime_cfg.signature_representation in {"compositional_v1", "compositional_v2"}:
+    if runtime_cfg.signature_representation in {"compositional_v1", "compositional_v2", "compositional_v3"}:
         for field, key in (("signature_vocab_size", "shared_signature_bank.signature_components"),
                            ("signature_bucket_vocab_size", "shared_signature_bank.family_components"),
                            ("signature_level_vocab_size", "registry.level_activity"),

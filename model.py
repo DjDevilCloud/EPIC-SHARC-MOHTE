@@ -19,14 +19,14 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 try:
-    from .signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor
+    from .signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor, BoundedIdentityReadout
     from .config import PrismalWaveConfig
     from .fused_finite import repair_transition as _repair_finite_transition_cuda
     from .data import DEFAULT_HIERARCHY_VECTOR_DIM, SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS, _build_hierarchy_vector_tensor
     from .hierarchical_precision import HierarchicalPrecisionPolicy, HierarchicalPrecisionSpec, attach_precision_policy, current_precision_spec, dtype_name, is_float8_dtype
     from .quantization import QuantizationConfig, create_quantized_embedding, create_quantized_linear
 except ImportError:  # pragma: no cover - supports direct script launching.
-    from signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor
+    from signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor, BoundedIdentityReadout
     from config import PrismalWaveConfig
     from fused_finite import repair_transition as _repair_finite_transition_cuda
     from data import DEFAULT_HIERARCHY_VECTOR_DIM, SIGNATURE_LEVEL_IDS, SIGNATURE_RELATION_IDS, _build_hierarchy_vector_tensor
@@ -5398,6 +5398,8 @@ class PrismalWaveOutput:
     signature_lattice_state: Optional[SignatureLatticeState] = None
     token_memory_state: Optional[TokenMemoryState] = None
     runtime_signature_state: Optional[list] = None
+    bounded_identity_state: Optional[list] = None
+    readout_hidden: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -6397,7 +6399,7 @@ class PrismalWaveModel(nn.Module):
             transformer_engine_leaf_params_dtype=str(getattr(cfg, "transformer_engine_leaf_params_dtype", "bfloat16")),
         )
         self.quantization_config = qcfg
-        self.shared_signature_bank = (SharedSignatureBank(cfg) if cfg.signature_representation in {"compositional_v1", "compositional_v2"} else None)
+        self.shared_signature_bank = (SharedSignatureBank(cfg) if cfg.signature_representation in {"compositional_v1", "compositional_v2", "compositional_v3"} else None)
         self.signature_span_memory = (SignatureSpanMemory(cfg) if cfg.use_verified_signature_spans else None)
         self.last_signature_span_stats = {}
         self.registry = SignatureEmitterRegistry(cfg, quantization_config=qcfg, shared_bank=self.shared_signature_bank)
@@ -6573,6 +6575,7 @@ class PrismalWaveModel(nn.Module):
         self.use_fullgatetrain = bool(getattr(cfg, "use_fullgatetrain", False))
         self.use_gatetrain = bool(getattr(cfg, "use_gatetrain", False)) or self.use_fullgatetrain
         self.gate_controller = GateResidencyController(self) if self.use_gate else None
+        self.bounded_identity_readout = BoundedIdentityReadout(cfg) if cfg.use_bounded_identity_readout else None
         self.gatetrain_controller = (
             GateResidencyController(
                 self,
@@ -9485,6 +9488,7 @@ class PrismalWaveModel(nn.Module):
             slot_state=final_slot_state,
             signature_lattice_state=final_signature_lattice_state,
             token_memory_state=frame.token_memory_state,
+            readout_hidden=final_hidden if self.bounded_identity_readout is not None else None,
         )
 
     @property
@@ -9583,7 +9587,7 @@ class PrismalWaveModel(nn.Module):
         self.signature_bucket_vocab_size = new_bucket_vocab_size
         self.cfg.signature_bucket_vocab_size = new_bucket_vocab_size
 
-    def forward(self, input_ids: torch.Tensor, *args, runtime_signature_state=None, **kwargs):
+    def forward(self, input_ids: torch.Tensor, *args, runtime_signature_state=None, bounded_identity_state=None, **kwargs):
         states = None
         if self.shared_signature_bank is not None and self.shared_signature_bank.runtime_enabled:
             if args:
@@ -9595,6 +9599,10 @@ class PrismalWaveModel(nn.Module):
             kwargs['hierarchy_vectors'] = features
         output = self._forward_impl(input_ids, *args, **kwargs)
         output.runtime_signature_state = states
+        if self.bounded_identity_readout is not None:
+            output.logits, output.bounded_identity_state = self.bounded_identity_readout(
+                output.logits, output.readout_hidden, input_ids, features,
+                self._prismal_tokenizer, self.shared_signature_bank, bounded_identity_state)
         return output
 
     def _forward_impl(
@@ -10042,6 +10050,7 @@ class PrismalWaveModel(nn.Module):
             aux_loss=aux_loss,
             slot_state=final_slot_state,
             signature_lattice_state=None,
+            readout_hidden=final_hidden if self.bounded_identity_readout is not None else None,
         )
 
     def forward_incremental(
@@ -10059,10 +10068,13 @@ class PrismalWaveModel(nn.Module):
         path_index: Optional[int] = None,
         position_index: int = 0,
         runtime_signature_state: Optional[list] = None,
+        bounded_identity_state: Optional[list] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, PrismalWaveOutput]:
-        if (self.cfg.signature_representation == 'compositional_v2'
+        if (self.cfg.signature_representation in {'compositional_v2', 'compositional_v3'}
                 and position_index > 0 and runtime_signature_state is None):
             raise ValueError('Carry output.runtime_signature_state between incremental runtime-signature calls.')
+        if self.bounded_identity_readout is not None and position_index > 0 and bounded_identity_state is None:
+            raise ValueError('Carry output.bounded_identity_state between incremental identity-readout calls.')
         output = self.forward(
             input_ids,
             signature_family_ids=signature_family_ids,
@@ -10077,6 +10089,7 @@ class PrismalWaveModel(nn.Module):
             path_index=path_index,
             position_index=position_index,
             runtime_signature_state=runtime_signature_state,
+            bounded_identity_state=bounded_identity_state,
         )
         logits = output.logits[:, -1, :]
         next_slot_state = output.slot_state if output.slot_state is not None else slot_state
@@ -11107,7 +11120,7 @@ class PrismalWaveModel(nn.Module):
             and superposition_bag_size > 1
             and input_ids.size(1) > superposition_bag_size
         )
-        if use_superposition and self.cfg.signature_representation == 'compositional_v2':
+        if use_superposition and self.cfg.signature_representation in {'compositional_v2', 'compositional_v3'}:
             raise ValueError('Runtime signatures require individual token transitions; use superposition_bag_size=1.')
         if use_superposition:
             superposition = self._build_superposition_batch(
@@ -11253,7 +11266,7 @@ class PrismalWaveModel(nn.Module):
         speculative_temperature = float(
             speculative_temperature if speculative_temperature is not None else getattr(self.cfg, "speculative_temperature", 0.0)
         )
-        if self.cfg.signature_representation == 'compositional_v2' and (
+        if self.cfg.signature_representation in {'compositional_v2', 'compositional_v3'} and (
             beam_size > 1 or (speculative_enabled and speculative_draft_tokens > 1)
         ):
             raise ValueError('Runtime signature state currently supports ordinary decoding; disable beam/speculative decoding.')
@@ -11635,6 +11648,7 @@ class PrismalWaveModel(nn.Module):
                     path_index=current_path_index,
                     position_index=generated.size(1) - 1,
                     runtime_signature_state=output.runtime_signature_state,
+                    bounded_identity_state=output.bounded_identity_state,
                 )
             carried_lattice_state = output.signature_lattice_state if output.signature_lattice_state is not None else carried_lattice_state
             carried_token_memory_state = output.token_memory_state if output.token_memory_state is not None else carried_token_memory_state

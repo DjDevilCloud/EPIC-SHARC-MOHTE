@@ -126,6 +126,8 @@ Fresh models can opt into the shared component table and verified greedy continu
 
 `--signature-representation compositional_v2` adds causal runtime properties for unfamiliar and partial words, bypassing whole-profile registration in root hierarchy conditioning and torus parent context. Use fresh training with individual tokens and ordinary decoding. See [Runtime compositional signatures v2](./COMPOSITIONAL_SIGNATURES_V2.md) for state handling, supported modes, and the held-out recombination control (4/8 exact versus v1's 2/8; fruit rule selection remains unresolved).
 
+The optional `--bounded-identity-readout` adds a learned read of observed input units after the torus recurrence, using the same shared bank. On a fresh two-seed selection control it answered 12/12 unseen combinations in each seed, versus matched v2 baselines of 7/12 and 6/12. See [Bounded identity readout](./BOUNDED_IDENTITY_READOUT.md) for checkpoints, limitations and usage. Structural-only `compositional_v3` retains short word positions and completed summaries, but its separate control showed mixed quality results; it remains experimental.
+
 Precision support is backend-specific:
 
 - Ada-class GPUs can use the hierarchical float8 path where supported

@@ -40,13 +40,17 @@ def components(code: str) -> list[str]:
 
 class RuntimeStructuralState:
     """Bounded causal properties; never looks up a word or stores its full text."""
-    def __init__(self):
+    def __init__(self, version=2):
+        self.version = version
         self.role = 'outside'
         self.case = 'lower'
         self.word_length = self.vowels = self.digits = 0
         self.word_position = self.line_length = self.indent = 0
         self.in_indent = True
         self.previous_class = 'boundary'
+        self.completed_word = (0, 0, 0)
+        self.completed_line = (0, 0, 0)
+        self.line_ended = False
         self.decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
 
     def clone(self):
@@ -61,10 +65,20 @@ class RuntimeStructuralState:
 
     def step(self, unit):
         text = unit.text
-        if text in ('<BOI>', '<BOO>', '<LINE>', '<BLO>', '<EOL>'):
+        if self.version == 3 and self.line_ended:
+            self.word_length = self.vowels = self.digits = 0
+            self.word_position = self.line_length = self.indent = 0
+            self.in_indent = True
+            self.case, self.previous_class = 'lower', 'boundary'
+            self.line_ended = False
+        reset_markers = ('<BOI>', '<BOO>', '<LINE>', '<BLO>', '<EOL>') if self.version == 2 else ('<BOI>', '<BOO>', '<LINE>', '<BLO>')
+        if text in reset_markers:
             role = {'<BOI>':'input', '<BOO>':'output'}.get(text, self.role)
-            self.__init__()
+            completed_word, completed_line = self.completed_word, self.completed_line
+            self.__init__(self.version)
             self.role = role
+            if self.version == 3 and text != '<BOI>':
+                self.completed_word, self.completed_line = completed_word, completed_line
         if text in ('<CAP>', '<UPPER>'):
             self.case = 'title' if text == '<CAP>' else 'upper'
         if unit.kind == 'byte':
@@ -87,19 +101,34 @@ class RuntimeStructuralState:
                 self.digits += int(ch.isdigit())
                 self.previous_class = 'digit' if ch.isdigit() else ('vowel' if ch.lower() in 'aeiou' else 'letter')
             else:
+                if self.word_length:
+                    self.completed_word = (self.word_length, self.vowels, self.digits)
                 self.word_length = self.vowels = self.digits = 0
                 self.case = 'lower'
                 self.previous_class = ('space' if ch.isspace() else
                     'operator' if ch in '+-*/%=<>!&|' else
                     'bracket' if ch in '()[]{}' else 'punctuation')
+        if self.version == 3 and text == '<EOL>':
+            if self.word_length:
+                self.completed_word = (self.word_length, self.vowels, self.digits)
+            self.completed_line = (self.line_length, self.word_position, self.indent)
+            self.line_ended = True
+        # Exact short ordinals distinguish fields; long sequences have bounded tails.
+        position = self.bucket(self.word_position) if self.version == 2 else (
+            str(self.word_position) if self.word_position <= 16 else 'tail:' + str(self.bucket(self.word_position)))
         # Each property has its own address; no Cartesian profile identity.
-        return [f'runtime:role={self.role}', f'runtime:unit={unit.kind}',
+        features = [f'runtime:role={self.role}', f'runtime:unit={unit.kind}',
                 f'runtime:case={self.case}', f'runtime:word_len={self.bucket(self.word_length)}',
                 f'runtime:vowels={self.bucket(self.vowels)}', f'runtime:digits={self.bucket(self.digits)}',
-                f'runtime:word_pos={self.bucket(self.word_position)}',
+                f'runtime:word_pos={position}',
                 f'runtime:line_len={self.bucket(self.line_length)}',
                 f'runtime:indent={self.bucket(self.indent)}', f'runtime:edge={self.previous_class}',
                 f'runtime:word_active={int(bool(self.word_length))}']
+        if self.version == 3:
+            for name, values in (('completed_word', self.completed_word), ('completed_line', self.completed_line)):
+                for index, value in enumerate(values):
+                    features.append(f'runtime:{name}:{index}={self.bucket(value)}')
+        return features
 
 
 class SharedSignatureBank(nn.Module):
@@ -109,7 +138,8 @@ class SharedSignatureBank(nn.Module):
         super().__init__()
         self.width = cfg.d_model
         self.capacity = cfg.signature_component_buckets
-        self.runtime_enabled = cfg.signature_representation == 'compositional_v2'
+        self.runtime_enabled = cfg.signature_representation in {'compositional_v2', 'compositional_v3'}
+        self.runtime_version = 3 if cfg.signature_representation == 'compositional_v3' else 2
         self.embedding = nn.Embedding(self.capacity + 1, self.width, padding_idx=0)
         self._bound_contract = None
         self._configured = False
@@ -161,7 +191,9 @@ class SharedSignatureBank(nn.Module):
             raise RuntimeError('Runtime signatures require a bound tokenizer.')
         if states is not None and len(states) != input_ids.size(0):
             raise ValueError('Runtime signature state batch size differs from input.')
-        states = [s.clone() for s in states] if states is not None else [RuntimeStructuralState() for _ in range(input_ids.size(0))]
+        if states is not None and any(s.version != self.runtime_version for s in states):
+            raise ValueError('Runtime signature state representation version differs from this bank.')
+        states = [s.clone() for s in states] if states is not None else [RuntimeStructuralState(self.runtime_version) for _ in range(input_ids.size(0))]
         rows = []
         for tokens, state in zip(input_ids.tolist(), states):
             frames = []
@@ -227,6 +259,62 @@ class SignatureBankView(nn.Module):
 
     def forward(self, ids):
         return self.bank.encode(self.domain, ids)
+
+
+@dataclass
+class IdentityReadoutState:
+    entries: list
+    role: str = 'outside'
+
+
+class BoundedIdentityReadout(nn.Module):
+    """Trainable post-recurrence read of bounded, causally observed input units."""
+    def __init__(self, cfg):
+        super().__init__()
+        self.capacity = cfg.identity_readout_capacity
+        self.query = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.key = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.gate = nn.Linear(cfg.d_model, 1)
+        nn.init.constant_(self.gate.bias, -2.)
+
+    def forward(self, logits, hidden, input_ids, features, tokenizer, bank, states=None):
+        if states is not None and len(states) != input_ids.size(0):
+            raise ValueError('Identity readout state batch size differs from input.')
+        states = [IdentityReadoutState(list(s.entries), s.role) for s in states] if states is not None else [
+            IdentityReadoutState([]) for _ in range(input_ids.size(0))]
+        rows=[]
+        feature_rows=features.tolist()
+        for row,(tokens,state) in enumerate(zip(input_ids.tolist(),states)):
+            steps=[]
+            for position,token in enumerate(tokens):
+                unit=tokenizer.construction_units[token]
+                if token==tokenizer.bos_id or unit.text=='<BOI>':
+                    state.entries=[]
+                    state.role='input' if unit.text=='<BOI>' else 'outside'
+                elif unit.text=='<EOI>':state.role='outside'
+                elif unit.text=='<BOO>':state.role='output'
+                elif unit.text=='<EOO>':state.role='outside'
+                if state.role=='input' and unit.kind in {'piece','word','phrase','char','digit','byte'}:
+                    state.entries.append((token, tuple(feature_rows[row][position])))
+                    state.entries=state.entries[-self.capacity:]
+                current=logits[row,position]
+                if state.role=='output' and state.entries:
+                    ids=torch.tensor([e[0] for e in state.entries],device=logits.device)
+                    properties=torch.tensor([e[1] for e in state.entries],device=logits.device)
+                    candidates=(bank.encode('token',ids)+bank.encode_runtime(properties))/math.sqrt(2.)
+                    keys=self.key(candidates)
+                    h=hidden[row,position]
+                    # All bounded candidates participate in training, so q/k receive gradients.
+                    scores=(keys*self.query(h)).sum(-1)/math.sqrt(keys.size(-1))
+                    attention=F.softmax(scores.float(),-1)
+                    copy=torch.zeros_like(current,dtype=torch.float32).scatter_add(0,ids,attention)
+                    gate=self.gate(h).float().squeeze(-1)
+                    vocabulary=F.log_softmax(current.float(),-1)+F.logsigmoid(-gate)
+                    copied=copy.clamp_min(1e-30).log()+F.logsigmoid(gate)
+                    current=torch.logaddexp(vocabulary,copied).to(logits.dtype)
+                steps.append(current)
+            rows.append(torch.stack(steps))
+        return torch.stack(rows),states
 
 
 class ProjectedSignatureBankView(SignatureBankView):

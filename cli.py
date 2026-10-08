@@ -114,8 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_model_args(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--signature-representation", choices=("legacy", "compositional_v1", "compositional_v2"), default="legacy")
+        p.add_argument("--signature-representation", choices=("legacy", "compositional_v1", "compositional_v2", "compositional_v3"), default="legacy")
         p.add_argument("--signature-component-buckets", type=int, default=8192)
+        p.add_argument("--bounded-identity-readout", action="store_true")
+        p.add_argument("--identity-readout-capacity", type=int, default=16)
         p.add_argument("--verified-signature-spans", action="store_true",
                        help="Collect training-only continuation evidence and verify greedy span proposals.")
         p.add_argument("--d-model", type=int, default=default_cfg.d_model)
@@ -727,6 +729,8 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         base_vocab_size=getattr(tokenizer, "base_vocab_size", PrismalWaveConfig.base_vocab_size),
         vocab_size=0,
         signature_representation=getattr(args, "signature_representation", "legacy"),
+        use_bounded_identity_readout=getattr(args, "bounded_identity_readout", False),
+        identity_readout_capacity=getattr(args, "identity_readout_capacity", 16),
         signature_component_buckets=getattr(args, "signature_component_buckets", 8192),
         use_verified_signature_spans=getattr(args, "verified_signature_spans", False),
         max_samples=getattr(args, "max_samples", PrismalWaveConfig.max_samples),

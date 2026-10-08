@@ -37,8 +37,10 @@ class PrismalWaveConfig:
     signature_relation_vocab_size: int = 0
     signature_bucket_vocab_size: int = 0
     registry_family_capacity: int = 0  # checkpoint shape override; fresh models use family vocabulary
-    signature_representation: str = "legacy"  # legacy, compositional_v1, or causal runtime compositional_v2
+    signature_representation: str = "legacy"  # legacy, catalog compositional_v1, causal runtime v2/v3
     signature_component_buckets: int = 8192
+    use_bounded_identity_readout: bool = False
+    identity_readout_capacity: int = 16
     use_verified_signature_spans: bool = False
     signature_span_capacity: int = 256
     signature_span_context: int = 32
@@ -329,8 +331,12 @@ class PrismalWaveConfig:
     eos_id: int = 2
 
     def __post_init__(self) -> None:
-        if self.signature_representation not in {"legacy", "compositional_v1", "compositional_v2"}:
-            raise ValueError("signature_representation must be legacy, compositional_v1 or compositional_v2")
+        if self.use_bounded_identity_readout and self.signature_representation not in {'compositional_v2','compositional_v3'}:
+            raise ValueError('Bounded identity readout requires runtime compositional signatures.')
+        if self.identity_readout_capacity < 1:
+            raise ValueError('identity_readout_capacity must be positive')
+        if self.signature_representation not in {"legacy", "compositional_v1", "compositional_v2", "compositional_v3"}:
+            raise ValueError("signature_representation must be legacy, compositional_v1, compositional_v2 or compositional_v3")
         for name in ("signature_component_buckets", "signature_span_capacity", "signature_span_context", "signature_span_tokens", "signature_span_min_support"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be positive")

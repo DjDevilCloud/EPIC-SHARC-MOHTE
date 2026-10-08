@@ -10,12 +10,15 @@ from tests import test_causal_protocol as fixtures
 
 
 class RuntimeSignatureTests(unittest.TestCase):
+    representation='compositional_v2'
+    identity_readout=False
     def setup_model(self):
         helper=fixtures.CausalProtocolTests()
         t=helper.tokenizer()
         cfg=helper.model(t,lattice=True,chunk_len=1).cfg
-        cfg.signature_representation='compositional_v2'
+        cfg.signature_representation=self.representation
         cfg.signature_component_buckets=512
+        cfg.use_bounded_identity_readout=self.identity_readout
         model=PrismalWaveModel(cfg)
         model._prismal_tokenizer=t
         model.prepare_capacity_for_tokenizer(t)
@@ -68,13 +71,14 @@ class RuntimeSignatureTests(unittest.TestCase):
         vals=helper.inputs(s)
         with torch.no_grad():
             full=m(s.input_ids[None],**vals)
-            state=slots=lattice=None
+            state=identity=slots=lattice=None
             parts=[]
             for i in range(s.input_ids.numel()):
                 _,slots,o=m.forward_incremental(s.input_ids[i:i+1][None],
                     **{k:v[:,i:i+1] for k,v in vals.items()},slot_state=slots,
-                    signature_lattice_state=lattice,runtime_signature_state=state,position_index=i)
+                    signature_lattice_state=lattice,runtime_signature_state=state,bounded_identity_state=identity,position_index=i)
                 state=o.runtime_signature_state
+                identity=o.bounded_identity_state
                 lattice=o.signature_lattice_state
                 parts.append(o.logits)
             torch.testing.assert_close(full.logits,torch.cat(parts,1),rtol=1e-4,atol=1e-5)
@@ -82,7 +86,7 @@ class RuntimeSignatureTests(unittest.TestCase):
                 path=save_checkpoint(m,directory,tokenizer=t)
                 restored,_,cfg=load_bundle_from_checkpoint(path,device='cpu',load_training_state=False)
                 restored.set_capacity_growth_locked(True)
-                self.assertEqual(cfg.signature_representation,'compositional_v2')
+                self.assertEqual(cfg.signature_representation,self.representation)
                 self.assertEqual(restored.registry.family_vocab_size,m.registry.family_vocab_size)
                 torch.testing.assert_close(full.logits,restored(s.input_ids[None],**vals).logits,rtol=0,atol=0)
         m.train()
@@ -99,7 +103,7 @@ class RuntimeSignatureTests(unittest.TestCase):
         p=t.prepare_generation_hierarchy('New quizzical café')
         kw={k:torch.tensor([getattr(p,k)]) for k in ('signature_ids','signature_family_ids',
             'signature_level_ids','signature_relation_ids','parent_signature_ids','hierarchy_vectors')}
-        options=dict(max_new_tokens=16,min_new_tokens=0,temperature=0.,top_k=1,top_p=1.,
+        options=dict(max_new_tokens=16,min_new_tokens=4,temperature=0.,top_k=1,top_p=1.,
             repetition_penalty=1.,no_repeat_ngram_size=0,use_speculative_decoding=False,
             suppressed_token_ids=t.generation_suppressed_token_ids(),
             token_signature_lookup=t.signature_lookup_by_token_id(),token_family_lookup=t.signature_family_lookup_by_token_id(),
@@ -126,6 +130,79 @@ class RuntimeSignatureTests(unittest.TestCase):
                 loss_mask=s.loss_mask[None].cuda(),collect_telemetry=False)
         loss.backward()
         self.assertTrue(torch.isfinite(m.shared_signature_bank.embedding.weight.grad).all())
+
+
+class RuntimeSignatureV3Tests(RuntimeSignatureTests):
+    representation='compositional_v3'
+
+    def test_distinct_short_positions_and_completed_boundaries(self):
+        from signature_bank import RuntimeStructuralState
+        from data import ConstructionUnit
+        state=RuntimeStructuralState(3)
+        unit=lambda text,kind='piece':ConstructionUnit(text=text,kind=kind,render=text)
+        first=state.step(unit('red'))
+        space=state.step(unit(' ','space'))
+        second=state.step(unit('pear'))
+        self.assertIn('runtime:word_pos=1',first)
+        self.assertIn('runtime:word_pos=2',second)
+        self.assertIn('runtime:completed_word:0=2',space)
+        end=state.step(unit('<EOL>','structure'))
+        self.assertIn('runtime:completed_line:0=3',end)
+        self.assertIn('runtime:completed_word:0=2',end)
+        output=state.step(unit('<BOO>','structure'))
+        self.assertIn('runtime:completed_line:0=3',output)
+        self.assertIn('runtime:role=output',output)
+        self.assertIn('runtime:word_pos=0',output)
+        # New requests reset summaries instead of inheriting another prompt.
+        new=state.step(unit('<BOI>','structure'))
+        self.assertIn('runtime:completed_line:0=0',new)
+
+
+class BoundedIdentityReadoutTests(RuntimeSignatureTests):
+    identity_readout=True
+
+    def test_query_keys_receive_gradients_and_future_cannot_enter_memory(self):
+        helper,t,m=self.setup_model()
+        left=_build_window_samples_from_text(t,'<BOI>red apple fruit<EOI><BOO>apple<EOO>',seq_len=256,max_samples=1,hierarchy_vector_dtype='float32')[0]
+        right=_build_window_samples_from_text(t,'<BOI>red apple fruit<EOI><BOO>green<EOO>',seq_len=256,max_samples=1,hierarchy_vector_dtype='float32')[0]
+        first=next(i for i,(a,b) in enumerate(zip(left.input_ids,right.input_ids)) if a!=b)
+        with torch.no_grad():
+            a=m(left.input_ids[None],**helper.inputs(left))
+            b=m(right.input_ids[None],**helper.inputs(right))
+            torch.testing.assert_close(a.logits[:,:first],b.logits[:,:first],rtol=0,atol=0)
+            self.assertTrue(all(len(s.entries)<=m.cfg.identity_readout_capacity for s in a.bounded_identity_state))
+            self.assertEqual(a.bounded_identity_state[0].entries,b.bounded_identity_state[0].entries)
+        m.train()
+        loss,_=m.compute_loss(left.input_ids[None],left.labels[None],**helper.inputs(left),loss_mask=left.loss_mask[None],collect_telemetry=False)
+        loss.backward()
+        for head in (m.bounded_identity_readout.query,m.bounded_identity_readout.key,m.bounded_identity_readout.gate):
+            self.assertIsNotNone(head.weight.grad)
+            self.assertTrue(torch.isfinite(head.weight.grad).all())
+            self.assertGreater(float(head.weight.grad.abs().sum()),0.)
+
+    def test_capacity_eviction_request_isolation_and_empty_memory_fallback(self):
+        helper,t,m=self.setup_model()
+        m.bounded_identity_readout.capacity=2
+        p=t.prepare_generation_hierarchy('red apple fruit')
+        vals={k:torch.tensor([getattr(p,k)]) for k in ('signature_ids','signature_family_ids',
+            'signature_level_ids','signature_relation_ids','parent_signature_ids','hierarchy_vectors')}
+        with torch.no_grad():
+            first=m(torch.tensor([p.token_ids]),**vals)
+            entries=list(first.bounded_identity_state[0].entries)
+            lexical=[i for i in p.token_ids if t.construction_units[i].kind in {'piece','word','phrase','char','digit','byte'}]
+            self.assertEqual([e[0] for e in entries],lexical[-2:])
+            # New BOI clears a supplied earlier request's cache without mutating it.
+            second=m(torch.tensor([p.token_ids]),**vals,bounded_identity_state=first.bounded_identity_state)
+            self.assertEqual(first.bounded_identity_state[0].entries,entries)
+            self.assertEqual(second.bounded_identity_state[0].entries,entries)
+            empty=t.prepare_generation_hierarchy('')
+            empty_vals={k:torch.tensor([getattr(empty,k)]) for k in vals}
+            enabled=m(torch.tensor([empty.token_ids]),**empty_vals)
+            head=m.bounded_identity_readout
+            m.bounded_identity_readout=None
+            disabled=m(torch.tensor([empty.token_ids]),**empty_vals)
+            m.bounded_identity_readout=head
+            torch.testing.assert_close(enabled.logits,disabled.logits,rtol=0,atol=0)
 
 
 if __name__=='__main__':
