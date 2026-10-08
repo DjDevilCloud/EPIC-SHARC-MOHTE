@@ -1075,7 +1075,7 @@ class SmokeTests(unittest.TestCase):
         model.prepare_capacity_for_tokenizer(tokenizer)
         model.set_capacity_growth_locked(True)
 
-        self.assertGreaterEqual(model.registry.family_embedding.num_embeddings, tokenizer.signature_vocab_size)
+        self.assertGreaterEqual(model.registry.family_embedding.num_embeddings, tokenizer.signature_family_vocab_size)
         self.assertGreaterEqual(model.registry.parent_embedding.num_embeddings, tokenizer.signature_vocab_size)
         self.assertGreaterEqual(model.registry.level_embedding.num_embeddings, tokenizer.signature_level_vocab_size)
         self.assertGreaterEqual(model.registry.relation_embedding.num_embeddings, tokenizer.signature_relation_vocab_size)

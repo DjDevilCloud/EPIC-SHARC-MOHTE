@@ -67,6 +67,34 @@ class TransitionPrecomputeTests(unittest.TestCase):
         self.assertTrue(cfg.training_precompute_torus_inputs)
         cfg.training_precompute_torus_inputs = False
         self.assertFalse(PrismalWaveConfig.from_dict(cfg.to_dict()).training_precompute_torus_inputs)
+        self.assertTrue(cfg.training_precompute_torus_metadata)
+        cfg.training_precompute_torus_metadata = False
+        self.assertFalse(PrismalWaveConfig.from_dict(cfg.to_dict()).training_precompute_torus_metadata)
+
+    def test_metadata_matches_previous_prepared_path(self):
+        cfg = PrismalWaveConfig(d_model=8, n_paths=1, torus_depth=2, torus_height=3, torus_width=2)
+        core = PrismalTorusCore(cfg, QuantizationConfig(enabled=False)).train()
+        hidden = torch.randn(3, 4, 8)
+        cfg.training_precompute_torus_metadata = False
+        previous = core.prepare_transition_sequence(hidden, path_index=0)
+        cfg.training_precompute_torus_metadata = True
+        current = core.prepare_transition_sequence(hidden, path_index=0)
+
+        def token(values, index):
+            return {key: value if key in {'active_offsets', 'active_radius'} else value[:, index]
+                    for key, value in values.items()}
+
+        for index in range(4):
+            state = core.init_state(3, hidden.device)
+            left = core.step(hidden[:, index], state, path_index=0, step_index=index,
+                             prepared_inputs=token(previous, index))
+            right = core.step(hidden[:, index], state, path_index=0, step_index=index,
+                              prepared_inputs=token(current, index))
+            torch.testing.assert_close(left[0], right[0])
+            torch.testing.assert_close(left[1].field, right[1].field)
+            torch.testing.assert_close(left[1].bus, right[1].bus)
+            for key in left[2]:
+                torch.testing.assert_close(left[2][key], right[2][key], msg=key)
 
     def test_multitoken_context_summary_is_preserved(self):
         cfg = PrismalWaveConfig(d_model=8, n_paths=1, torus_depth=2, torus_height=2, torus_width=2)

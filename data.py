@@ -74,6 +74,7 @@ def _plain_lines(text: str) -> Iterator[str]:
 
 
 def _fitting_content_lines(text: str) -> Iterator[str]:
+    text = _normalize_role_marked_text(text)
     for part in _structure_parts(text):
         if part in STRUCTURE_MARKER_TEXTS:
             continue
@@ -779,6 +780,29 @@ def _compose_record_text(payload: Dict[str, Any]) -> str:
 _ROLE_MARKER_RE = re.compile(r"<extra_id_1>(User|Assistant)\s*\r?\n", re.IGNORECASE)
 
 
+def normalize_qa_text(text: str, *, generation_prefix: bool = False) -> str:
+    """Recognize a leading textual QA record without rewriting ordinary prose.
+
+    Preserve the question/answer verbatim apart from whitespace adjoining the
+    field labels. Existing explicit spans take precedence. An empty output is
+    accepted only when preparing an unfinished generation prompt.
+    """
+    if any(marker in text for marker in ("<BOI>", "<EOI>", "<BOO>", "<EOO>")):
+        return text
+    leading = re.match(r"\s*input\s*:\s*", text, flags=re.IGNORECASE)
+    if leading is None:
+        return text
+    output = re.search(r"\s+output\s*:\s*", text[leading.end():], flags=re.IGNORECASE)
+    if output is None:
+        return text
+    offset = leading.end()
+    question = text[offset:offset + output.start()].strip()
+    answer = text[offset + output.end():].strip()
+    if not question or (not answer and not generation_prefix):
+        return text
+    return f"<BOI>{question}<EOI><BOO>{answer}" + ("" if generation_prefix else "<EOO>")
+
+
 def _normalize_role_marked_text(text: str) -> str:
     """Convert NVIDIA-style User/Assistant records to supervised span markers.
 
@@ -791,7 +815,7 @@ def _normalize_role_marked_text(text: str) -> str:
     if len(matches) < 2 or not any(match.group(1).lower() == "user" for match in matches) or not any(
         match.group(1).lower() == "assistant" for match in matches
     ):
-        return text
+        return normalize_qa_text(text)
 
     spans: List[str] = []
     for index, match in enumerate(matches):
@@ -1034,7 +1058,7 @@ class PrismalTokenizer:
     """Byte tokenizer with a handcrafted base alphabet plus learned construction units."""
 
     base_vocab_size: int = 0
-    codec_version: int = 9
+    codec_version: int = 10
     _COMMON_WORDS_AS_WHOLE_UNITS = CONTROL_TOKEN_TEXTS
     _CONSTRUCTION_PIECES: tuple[str, ...] = (
         "tion",
@@ -1321,6 +1345,11 @@ class PrismalTokenizer:
 
     def output_hierarchy_frame(self, history: Sequence[int], next_token: int) -> tuple[int, int, int, int, int]:
         """Replay the emitted output prefix, including for forked beam/draft paths."""
+        state = self.prepare_output_hierarchy_state(history)
+        return state.step(int(next_token))
+
+    def prepare_output_hierarchy_state(self, history: Sequence[int]) -> CausalOutputHierarchy:
+        """Seed a request-local state once; replay remains the branching oracle."""
         state = CausalOutputHierarchy(self)
         start = 0
         for index, token_id in enumerate(history):
@@ -1328,7 +1357,7 @@ class PrismalTokenizer:
                 start = index
         for token_id in history[start:]:
             state.step(int(token_id))
-        return state.step(int(next_token))
+        return state
 
     @property
     def vocab_size(self) -> int:
@@ -2384,6 +2413,7 @@ class PrismalTokenizer:
             )
 
     def encode_hierarchy_bundle(self, text: str, add_special_tokens: bool = True, span_role: str = "input") -> HierarchyEncoding:
+        text = _normalize_role_marked_text(text)
         token_ids: List[int] = []
         signature_ids: List[int] = []
         signature_level_ids: List[int] = []
@@ -2491,69 +2521,41 @@ class PrismalTokenizer:
     ) -> tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
         return self.encode_hierarchy_bundle(text, add_special_tokens=add_special_tokens, span_role=span_role).as_tuple()
 
-    def prepare_generation_hierarchy(self, text: str) -> HierarchyEncoding:
-        bundle = self.encode_hierarchy_bundle(text, add_special_tokens=False)
-        token_ids = [self.bos_id, self.special_tokens["<BOI>"], *bundle.token_ids]
-        signature_ids = [self.signature_bos_id, self.signature_boi_id, *bundle.signature_ids]
-        signature_level_ids = [
-            self.signature_level_to_id["special"],
-            self.signature_level_to_id["special"],
-            *bundle.signature_level_ids,
-        ]
-        signature_relation_ids = [
-            self.signature_relation_to_id["special"],
-            self.signature_relation_to_id["special"],
-            *bundle.signature_relation_ids,
-        ]
-        parent_signature_ids = [self.signature_bos_id, self.signature_boi_id, *bundle.parent_signature_ids]
-        signature_family_ids = [
-            self.signature_family_to_id["special"],
-            self.signature_family_to_id["boundary"],
-            *bundle.signature_family_ids,
-        ]
-        token_ids.append(self.special_tokens["<EOI>"])
-        signature_ids.append(self.signature_eoi_id)
-        signature_level_ids.append(self.signature_level_to_id["special"])
-        signature_relation_ids.append(self.signature_relation_to_id["special"])
-        parent_signature_ids.append(self.signature_eoi_id)
-        signature_family_ids.append(self.signature_family_to_id["boundary"])
-        token_ids.append(self.special_tokens["<BOO>"])
-        signature_ids.append(self.signature_boo_id)
-        signature_level_ids.append(self.signature_level_to_id["special"])
-        signature_relation_ids.append(self.signature_relation_to_id["special"])
-        parent_signature_ids.append(self.signature_boo_id)
-        signature_family_ids.append(self.signature_family_to_id["boundary"])
-        # Training emits a <LINE> frame before the first output line. Seed its
-        # neutral form here: the first frame is contextual, while subsequent
-        # line frames are supervised and generated after each <EOL>.
-        token_ids.append(self.special_tokens["<LINE>"])
-        signature_ids.append(self.signature_blo_id)
-        signature_level_ids.append(self.signature_level_to_id["line"])
-        signature_relation_ids.append(self.signature_relation_to_id["containment"])
-        parent_signature_ids.append(self.signature_blo_id)
-        signature_family_ids.append(self.signature_family_to_id["line"])
-        hierarchy_vectors = _build_hierarchy_vector_tensor(
-            torch.tensor(token_ids, dtype=torch.long),
-            torch.tensor(signature_ids, dtype=torch.long),
-            torch.tensor(signature_level_ids, dtype=torch.long),
-            torch.tensor(signature_relation_ids, dtype=torch.long),
-            torch.tensor(parent_signature_ids, dtype=torch.long),
-            torch.tensor(signature_family_ids, dtype=torch.long),
-            **self.hierarchy_normalization_capacities,
-            low_rank_enabled=self.hierarchy_vector_low_rank_enabled,
-            low_rank_dim=self.hierarchy_vector_low_rank_dim,
-        ).tolist()
-        prompt_bundle = HierarchyEncoding(
-            token_ids=token_ids,
-            signature_ids=signature_ids,
-            signature_level_ids=signature_level_ids,
-            signature_relation_ids=signature_relation_ids,
-            parent_signature_ids=parent_signature_ids,
-            signature_family_ids=signature_family_ids,
-            hierarchy_vectors=hierarchy_vectors,
-        )
-        prompt_bundle.validate(context="generation prompt")
-        return prompt_bundle
+    def prepare_generation_hierarchy(self, text: str, *, mode: str = "answer") -> HierarchyEncoding:
+        """Build an open output prefix with the same codec used for training.
+
+        Answer mode accepts a plain question, textual input/output fields, or
+        explicit spans. Continuation mode keeps observed document text inside
+        the output span rather than treating it as a new question.
+        """
+        if mode not in {"answer", "continuation"}:
+            raise ValueError("generation mode must be answer or continuation")
+        if mode == "answer":
+            text = normalize_qa_text(text, generation_prefix=True)
+        explicit = any(marker in text for marker in ("<BOI>", "<EOI>", "<BOO>", "<EOO>"))
+        if not explicit:
+            text = (f"<BOI>{text}<EOI><BOO><LINE>" if mode == "answer"
+                    else f"<BOI><EOI><BOO>{text}")
+        else:
+            # Preserve existing turns and output prefill instead of wrapping them.
+            last_open = text.rfind("<BOO>")
+            last_close = text.rfind("<EOO>")
+            if last_open <= last_close:
+                if not text.rstrip().endswith("<EOI>"):
+                    text += "<EOI>"
+                text += "<BOO><LINE>"
+            elif text.rstrip().endswith("<BOO>"):
+                text = text.rstrip() + "<LINE>"
+        if text.endswith("<BOO>"):
+            text += "<LINE>"
+        bundle = self.encode_hierarchy_bundle(text, add_special_tokens=True)
+        bundle = bundle.trim_trailing_tokens({self.eos_id})
+        # The text codec closes its final line. An unfinished output prefill
+        # must retain the emitted prefix, without injecting a premature EOL.
+        if not text.endswith(("<LINE>", "<EOL>", "\n", "<EOI>", "<BOO>")):
+            bundle = bundle.trim_trailing_tokens({self.special_tokens["<EOL>"]})
+        bundle.validate(context="generation prompt")
+        return bundle
 
     def encode_with_signatures(self, text: str, add_special_tokens: bool = True) -> tuple[List[int], List[int]]:
         token_ids, signature_ids, _, _, _, _ = self.encode_hierarchy(text, add_special_tokens=add_special_tokens)
@@ -3011,9 +3013,20 @@ class PrismalTokenizer:
             signature_counts = self._collect_construction_signature_counts(texts)
 
         signature_limit = None if max_signature_tokens is None or int(max_signature_tokens) <= 0 else int(max_signature_tokens)
-        self.signature_tokens = []
+        # Fitting counts were collected before the learned units existed.
+        # Their intrinsic profiles are mandatory, independent of the optional
+        # whole-word/line profile budget, and must never resolve to OTHER.
+        mandatory = set(self.signature_to_id)
+        for unit_id, unit in enumerate(self.construction_units):
+            if unit.signature and unit.signature not in mandatory:
+                mandatory.add(unit.signature)
+                self.signature_tokens.append(SignatureToken(
+                    code=unit.signature, kind="intrinsic",
+                    frequency=max(1, self.token_frequency_by_id.get(unit_id, 1)),
+                    family=self._signature_family_key(unit.signature),
+                ))
         for code, freq in signature_counts.most_common(signature_limit):
-            if code in self.signature_to_id:
+            if code in mandatory:
                 continue
             self.signature_tokens.append(
                 SignatureToken(code=code, kind="construction", frequency=freq, family=self._signature_family_key(code))
@@ -3067,6 +3080,7 @@ class PrismalTokenizer:
             max_signature_tokens=max_signature_tokens,
             signature_counts=signature_counts,
         )
+        self.codec_version = type(self).codec_version
         # Freeze once after initial learning. Extending a tokenizer preserves
         # the existing feature scale instead of rescaling every older token.
         self.hierarchy_normalization_capacities
@@ -3199,6 +3213,9 @@ class PrismalTokenizer:
             hierarchy_vector_low_rank_enabled=bool(payload.get("hierarchy_vector_low_rank_enabled", True)),
             hierarchy_vector_low_rank_dim=int(payload.get("hierarchy_vector_low_rank_dim", DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM)),
         )
+        # Loading preserves the trained representation; only explicit fitting
+        # repairs coverage and upgrades the codec contract.
+        tokenizer.codec_version = int(payload.get("codec_version", cls.codec_version))
         normalization = payload.get("hierarchy_vector_normalization")
         def restore_representation_contract() -> None:
             # Reconstruct legacy IDs once before freezing them. Modern states
@@ -3676,6 +3693,7 @@ def _build_window_samples_from_text(
     low_rank_enabled: Optional[bool] = None,
     low_rank_dim: Optional[int] = None,
 ) -> List[WindowSample]:
+    merged = _normalize_role_marked_text(merged)
     low_rank_enabled = bool(getattr(tokenizer, "hierarchy_vector_low_rank_enabled", True)) if low_rank_enabled is None else bool(low_rank_enabled)
     low_rank_dim = int(getattr(tokenizer, "hierarchy_vector_low_rank_dim", DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM)) if low_rank_dim is None else int(low_rank_dim)
     samples: List[WindowSample] = []

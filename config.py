@@ -36,6 +36,17 @@ class PrismalWaveConfig:
     signature_level_vocab_size: int = 0
     signature_relation_vocab_size: int = 0
     signature_bucket_vocab_size: int = 0
+    registry_family_capacity: int = 0  # checkpoint shape override; fresh models use family vocabulary
+    signature_representation: str = "legacy"  # legacy, compositional_v1, or causal runtime compositional_v2
+    signature_component_buckets: int = 8192
+    use_verified_signature_spans: bool = False
+    signature_span_capacity: int = 256
+    signature_span_context: int = 32
+    signature_span_tokens: int = 8
+    signature_span_min_support: int = 2
+    signature_span_confidence: float = 0.8
+    signature_span_similarity: float = 0.97
+    signature_span_margin: float = 0.05
     max_samples: int = 0
     lr: float = 0.0008
     optimizer: str = "adamw"
@@ -44,6 +55,7 @@ class PrismalWaveConfig:
     training_finite_guard_enabled: bool = True
     training_finite_guard_backend: str = "sync"  # sync or optional CuPy CUDA repair
     training_precompute_torus_inputs: bool = True
+    training_precompute_torus_metadata: bool = True
     inference_finite_guard_enabled: bool = True
     grad_clip_muon: float = 0.25
     grad_clip_scalar: float = 0.2
@@ -317,6 +329,16 @@ class PrismalWaveConfig:
     eos_id: int = 2
 
     def __post_init__(self) -> None:
+        if self.signature_representation not in {"legacy", "compositional_v1", "compositional_v2"}:
+            raise ValueError("signature_representation must be legacy, compositional_v1 or compositional_v2")
+        for name in ("signature_component_buckets", "signature_span_capacity", "signature_span_context", "signature_span_tokens", "signature_span_min_support"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be positive")
+        for name in ("signature_span_confidence", "signature_span_similarity", "signature_span_margin"):
+            if not 0 <= float(getattr(self, name)) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.use_verified_signature_spans and self.signature_representation == "legacy":
+            raise ValueError("verified signature spans require compositional signatures")
         def _sync_alias(canonical_name: str, alias_name: str) -> None:
             fields = type(self).__dataclass_fields__
             canonical_default = fields[canonical_name].default
@@ -392,6 +414,7 @@ class PrismalWaveConfig:
             self.gradient_accumulation_steps = 1
         self.training_finite_guard_enabled = bool(self.training_finite_guard_enabled)
         self.training_precompute_torus_inputs = bool(self.training_precompute_torus_inputs)
+        self.training_precompute_torus_metadata = bool(self.training_precompute_torus_metadata)
         self.training_finite_guard_backend = str(self.training_finite_guard_backend).lower()
         if self.training_finite_guard_backend not in {"sync", "cuda"}:
             raise ValueError("training_finite_guard_backend must be sync or cuda")

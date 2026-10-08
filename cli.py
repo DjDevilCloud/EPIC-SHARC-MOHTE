@@ -114,6 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_model_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--signature-representation", choices=("legacy", "compositional_v1", "compositional_v2"), default="legacy")
+        p.add_argument("--signature-component-buckets", type=int, default=8192)
+        p.add_argument("--verified-signature-spans", action="store_true",
+                       help="Collect training-only continuation evidence and verify greedy span proposals.")
         p.add_argument("--d-model", type=int, default=default_cfg.d_model)
         p.add_argument("--n-layers", type=int, default=default_cfg.n_layers)
         p.add_argument("--n-emitters", type=int, default=default_cfg.n_emitters)
@@ -662,6 +666,8 @@ def build_parser() -> argparse.ArgumentParser:
     infer_p = sub.add_parser("infer", help="Generate from a checkpoint")
     infer_p.add_argument("--checkpoint", required=True)
     infer_p.add_argument("--prompt", required=True)
+    infer_p.add_argument("--prompt-mode", choices=("answer", "continuation"), default="answer",
+                         help="Answer a question or continue text inside its existing output span.")
     infer_p.add_argument("--max-new-tokens", type=int, default=64)
     infer_p.add_argument("--min-new-tokens", type=int, default=1)
     infer_p.add_argument("--temperature", type=float, default=0.9)
@@ -720,6 +726,9 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
     cfg = PrismalWaveConfig(
         base_vocab_size=getattr(tokenizer, "base_vocab_size", PrismalWaveConfig.base_vocab_size),
         vocab_size=0,
+        signature_representation=getattr(args, "signature_representation", "legacy"),
+        signature_component_buckets=getattr(args, "signature_component_buckets", 8192),
+        use_verified_signature_spans=getattr(args, "verified_signature_spans", False),
         max_samples=getattr(args, "max_samples", PrismalWaveConfig.max_samples),
         lr=getattr(args, "lr", PrismalWaveConfig.lr),
         optimizer=getattr(args, "optimizer", None) if getattr(args, "optimizer", None) is not None else default_cfg.optimizer,
@@ -1050,6 +1059,7 @@ def main(argv: List[str] | None = None) -> int:
             speculative_draft_tokens=args.speculative_draft_tokens,
             speculative_temperature=args.speculative_temperature,
             template_prompt=args.template_prompt,
+            prompt_mode=args.prompt_mode,
         )
         print(text)
         return 0

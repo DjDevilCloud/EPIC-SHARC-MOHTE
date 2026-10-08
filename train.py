@@ -174,7 +174,7 @@ def _tokenizer_cache_key(
     hierarchy_vector_low_rank_dim: int,
 ) -> str:
     payload = {
-        "cache_version": 8,
+        "cache_version": 10,
         "base_tokenizer": base_tokenizer_fingerprint,
         "source": _tokenizer_source_fingerprint(source),
         "settings": {
@@ -837,7 +837,7 @@ def build_tokenizer_from_source(
     )
     try:
         cache_payload = {
-            "cache_version": 8,
+            "cache_version": 10,
             "source": str(Path(source).resolve()),
             "base_tokenizer": base_fingerprint,
             "settings": {
@@ -1124,6 +1124,7 @@ def save_checkpoint(
             "training_finite_guard_enabled",
             "training_finite_guard_backend",
             "training_precompute_torus_inputs",
+            "training_precompute_torus_metadata",
             "inference_finite_guard_enabled",
             "grad_clip_muon",
             "grad_clip_scalar",
@@ -1766,6 +1767,15 @@ def _infer_runtime_sizes_from_state(
                 return int(value.shape[0])
         return None
 
+    if runtime_cfg.signature_representation in {"compositional_v1", "compositional_v2"}:
+        for field, key in (("signature_vocab_size", "shared_signature_bank.signature_components"),
+                           ("signature_bucket_vocab_size", "shared_signature_bank.family_components"),
+                           ("signature_level_vocab_size", "registry.level_activity"),
+                           ("signature_relation_vocab_size", "registry.relation_activity")):
+            size = _first_dim(key)
+            if size is not None:
+                setattr(runtime_cfg, field, size)
+
     vocab_weight = state.get("construction_head.weight")
     if isinstance(vocab_weight, torch.Tensor):
         runtime_cfg.vocab_size = max(int(getattr(runtime_cfg, "vocab_size", 0)), int(vocab_weight.shape[0]))
@@ -1778,7 +1788,11 @@ def _infer_runtime_sizes_from_state(
         "registry.family_embedding._base_weight_radii",
     )
     if family_dim is not None:
-        runtime_cfg.signature_vocab_size = max(int(getattr(runtime_cfg, "signature_vocab_size", 0)), family_dim)
+        runtime_cfg.registry_family_capacity = family_dim
+        parent_dim = _first_dim("registry.parent_embedding.weight",
+                                "registry.parent_embedding._base_weight_dense",
+                                "registry.parent_embedding._base_weight_radii")
+        runtime_cfg.signature_vocab_size = max(int(getattr(runtime_cfg, "signature_vocab_size", 0)), parent_dim or family_dim)
     elif tokenizer is not None and runtime_cfg.signature_vocab_size <= 0:
         runtime_cfg.signature_vocab_size = tokenizer.signature_vocab_size
 
@@ -1820,6 +1834,8 @@ def _infer_runtime_sizes_from_state(
 def _bind_checkpoint_hierarchy(model: PrismalWaveModel, tokenizer: PrismalTokenizer, payload: Dict[str, object]) -> None:
     model._prismal_tokenizer = tokenizer
     _unwrap_model(model)._prismal_tokenizer = tokenizer
+    if model.shared_signature_bank is not None:
+        model.shared_signature_bank.configure(tokenizer)
     if not model.cfg.hierarchy_vector_normalization:
         model.cfg.hierarchy_vector_normalization = tokenizer.hierarchy_normalization_capacities
     tokenizer_state = payload.get("tokenizer_state")
@@ -1925,7 +1941,7 @@ def load_bundle_from_checkpoint(
         model.resize_vocab(tokenizer.vocab_size)
 
     if hasattr(model, "registry") and hasattr(model.registry, "_ensure_capacity"):
-        target_family_vocab = max(int(getattr(model.registry, "family_vocab_size", 0)), int(getattr(tokenizer, "signature_vocab_size", 0)))
+        target_family_vocab = max(int(getattr(model.registry, "family_vocab_size", 0)), int(getattr(tokenizer, "signature_family_vocab_size", 0)))
         target_level_vocab = max(int(getattr(model.registry.level_embedding, "num_embeddings", 0)), int(getattr(tokenizer, "signature_level_vocab_size", 0)))
         target_relation_vocab = max(int(getattr(model.registry.relation_embedding, "num_embeddings", 0)), int(getattr(tokenizer, "signature_relation_vocab_size", 0)))
         if (
@@ -3140,9 +3156,11 @@ def generate_text(
     speculative_temperature: Optional[float] = None,
     template_prompt: bool = False,
     fast_context_state: Optional[Dict[str, object]] = None,
+    prompt_mode: str = "answer",
 ) -> str:
     model.eval()
-    prompt = _format_generation_prompt(prompt, template_prompt=template_prompt)
+    if prompt_mode == "answer":
+        prompt = _format_generation_prompt(prompt, template_prompt=template_prompt)
     model._prismal_tokenizer = tokenizer
     _unwrap_model(model)._prismal_tokenizer = tokenizer
     if not model.cfg.hierarchy_vector_normalization:
@@ -3152,7 +3170,7 @@ def generate_text(
         cfg=getattr(model, "cfg", PrismalWaveConfig()),
         fast_context_state=fast_context_state,
     )
-    prompt_bundle = tokenizer.prepare_generation_hierarchy(conditioning_prompt)
+    prompt_bundle = tokenizer.prepare_generation_hierarchy(conditioning_prompt, mode=prompt_mode)
     hierarchy_dtype = _hierarchy_vector_dtype_from_config(getattr(model, "cfg", PrismalWaveConfig()))
     (
         prompt_ids,

@@ -116,6 +116,16 @@ Set `--no-sparse-emitter-routing` if you want the older dense emitter scoring pa
 
 Training and generation share a token-by-token output hierarchy transition. Prompt spans may retain complete observed signatures; answer features use only the emitted prefix. Hierarchy normalization capacities are frozen after tokenizer fitting and saved with the checkpoint. Legacy pretokenized arrays must be rebuilt for this protocol. See [`CAUSAL_PROTOCOL_RESTORATION.md`](./review_artifacts/CAUSAL_PROTOCOL_RESTORATION.md) for the changes and checks.
 
+Leading `input: … output: …` QA records are normalized into explicit input/output spans before tokenizer fitting and encoding. Only the answer span is supervised. Explicit generation prompts such as `<BOI>question<EOI><BOO>` are preserved without adding duplicate boundaries. Rebuild pretokenized QA datasets and refit tokenizers made before this normalization change; existing checkpoint weights do not acquire the corrected task automatically.
+
+Inference defaults to answering a question. To continue a raw document inside its output span, use `python cli.py infer --checkpoint <model.pt> --prompt "Document prefix " --prompt-mode continuation`. The Python API accepts `generate_text(..., prompt_mode="continuation")`. Preserve trailing whitespace when the next token starts a new word. The all-category NVIDIA evaluation now selects complete-word document prefixes, uses the appropriate mode, and records raw continuations separately from decoder cleanup.
+
+Codec 10 registers every construction unit's intrinsic signature independently of the optional word/line profile budget and preserves signature IDs through tokenizer extension and save/load. Fresh registry family tables are sized by family count; parent tables are sized by signature count. Existing checkpoints retain their trained table shapes and tokenizer mappings. Ordinary generation now advances a request-local causal hierarchy state instead of replaying the output prefix for each token; beam and speculative paths retain replay. Refit and retrain to evaluate corrected intrinsic signatures—loading old weights alone does not repair missing trained features.
+
+Fresh models can opt into the shared component table and verified greedy continuation proposals with `--signature-representation compositional_v1 --verified-signature-spans`. The new representation shares feature parameters across routing and memory consumers instead of learning separate signature/parent tables. Proposals use training-only evidence and per-slot verification; every emitted token still advances the torus. See [Compositional signatures v1](./COMPOSITIONAL_SIGNATURES_V1.md) for behavior, configuration, validation and current limits.
+
+`--signature-representation compositional_v2` adds causal runtime properties for unfamiliar and partial words, bypassing whole-profile registration in root hierarchy conditioning and torus parent context. Use fresh training with individual tokens and ordinary decoding. See [Runtime compositional signatures v2](./COMPOSITIONAL_SIGNATURES_V2.md) for state handling, supported modes, and the held-out recombination control (4/8 exact versus v1's 2/8; fruit rule selection remains unresolved).
+
 Precision support is backend-specific:
 
 - Ada-class GPUs can use the hierarchical float8 path where supported
@@ -240,6 +250,14 @@ and data loading. Loss matched exactly, parameter gradients and route stats
 passed comparison, and logits differed by at most 0.0014 under the existing
 precision policy because batched GEMMs can round differently. No additional
 CUDA library is needed.
+
+The prepared path also batches patch indices, write multipliers, and stencil
+entropy/effective-count statistics. Patch-index construction runs once per path
+and its result is reused for both field reads. `training_precompute_torus_metadata`
+defaults to `true`; set it to `false` in config to retain only the earlier
+projection batching. This extension measured another 1.19× and 1.45×
+forward/backward throughput over that earlier optimized path in two local
+comparisons. The state-dependent recurrence remains sequential.
 
 If you want to inspect the implementation, start here:
 

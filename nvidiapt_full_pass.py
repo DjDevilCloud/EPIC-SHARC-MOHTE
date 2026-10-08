@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
 import math
 import os
 import random
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -14,17 +16,20 @@ import torch
 
 from config import PrismalWaveConfig
 from data import (PrismalTokenizer, StreamingTextCorpusDataset, _build_window_samples_from_text,
-                  iter_text_corpus)
+                  iter_text_corpus, normalize_qa_text)
 from model import PrismalWaveModel
 from train import (build_train_val_dataloaders, generate_text, load_bundle_from_checkpoint,
                    resolve_runtime_config, save_checkpoint, train_model)
 
 
 ROOT = Path(__file__).resolve().parent
-RUN = ROOT / "review_artifacts" / "nvidiapt_full_pass"
-SOURCE = RUN / "all_categories_shuffled.jsonl"
+RUN = Path(os.environ.get("NVIDIAPT_RUN_DIR", ROOT / "review_artifacts" / "nvidiapt_full_pass"))
+SOURCE = Path(os.environ.get("NVIDIAPT_SOURCE_FILE", RUN / "all_categories_shuffled.jsonl"))
 TEMPLATE_CHECKPOINT = ROOT / "checkpoints" / "nvidia_tiny_prototype" / "run16_cosine_taper_64" / "model.pt"
-SAVE_DIR = ROOT / "checkpoints" / "nvidia_tiny_prototype" / "full_nvidiapt_all_categories"
+SAVE_DIR = Path(os.environ.get(
+    "NVIDIAPT_CHECKPOINT_DIR",
+    ROOT / "checkpoints" / "nvidia_tiny_prototype" / "full_nvidiapt_all_categories",
+))
 TRACKS = ("signature_ids", "signature_level_ids", "signature_relation_ids",
           "parent_signature_ids", "signature_family_ids")
 SEED = 31
@@ -53,6 +58,7 @@ def main() -> None:
                  "signature_relation_vocab_size", "signature_bucket_vocab_size"):
         setattr(cfg, name, 0)
     cfg.hierarchy_vector_normalization = {}
+    cfg.registry_family_capacity = 0
     cfg.optimizer = "adamw"
     cfg.lr = 0.001
     cfg.max_samples = 0
@@ -110,7 +116,7 @@ def main() -> None:
         for index, line in enumerate(stream):
             record = json.loads(line)
             category = str(record["category"])
-            text = str(record["text"])
+            text = normalize_qa_text(str(record["text"]))
             split_name = "val" if val_ref._include_record(index) else "train"
             record_counts[split_name] += 1
             category_counts.setdefault(category, Counter())[split_name] += 1
@@ -223,15 +229,19 @@ def main() -> None:
             category = str(record["category"])
             if category in examples:
                 continue
-            text = str(record["text"])
+            text = normalize_qa_text(str(record["text"]))
             if "<BOO>" in text:
                 prompt = text.split("<BOO>", 1)[0] + "<BOO>"
-            elif "output:" in text.lower():
-                offset = text.lower().find("output:") + len("output:")
-                prompt = text[:offset]
+                mode = "answer"
             else:
-                prompt = text[:160]
-            examples[category] = dict(prompt=prompt, expected_record_prefix=text[:240])
+                # Cut at a complete word and preserve the original whitespace.
+                words = list(re.finditer(r"\S+\s*", text))
+                prefix_end = words[min(31, len(words) - 2)].end() if len(words) > 1 else 0
+                prompt = text[:prefix_end]
+                mode = "continuation"
+            reference = text.split("<BOO>", 1)[1].split("<EOO>", 1)[0] if mode == "answer" else text[len(prompt):]
+            examples[category] = dict(prompt=prompt, prompt_mode=mode,
+                expected_continuation=reference[:240], expected_record_prefix=text[:240])
             if len(examples) == len(category_counts):
                 break
     generations = []
@@ -240,9 +250,15 @@ def main() -> None:
             loaded, loaded_tokenizer, item["prompt"], device, max_new_tokens=MAX_GENERATION_TOKENS,
             min_new_tokens=0, top_k=1, top_p=1.0, temperature=0.0,
             repetition_penalty=1.0, no_repeat_ngram_size=0,
+            prompt_mode=item["prompt_mode"],
         )
+        continuation_ids = ast.literal_eval(generated.split("Continuation token IDs: ", 1)[1])
         generations.append(dict(category=category, prompt=item["prompt"],
-                                generated=generated, expected_record_prefix=item["expected_record_prefix"]))
+            prompt_mode=item["prompt_mode"], generated=generated,
+            raw_generated=loaded_tokenizer.decode(continuation_ids, clean_text=False),
+            continuation_token_ids=continuation_ids,
+            expected_continuation=item["expected_continuation"],
+            expected_record_prefix=item["expected_record_prefix"]))
     result = dict(checkpoint=str(checkpoint), fresh_load=True,
         categories=sorted(category_counts), record_counts=dict(record_counts),
         window_counts=dict(window_counts), generations=generations,
