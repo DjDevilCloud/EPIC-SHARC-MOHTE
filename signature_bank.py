@@ -272,12 +272,50 @@ class BoundedIdentityReadout(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.capacity = cfg.identity_readout_capacity
+        self.rule = cfg.identity_readout_rule
+        self.candidate_policy = cfg.identity_readout_candidate_policy
+        self._tokenizer_contract = None
+        if self.rule == 'preserve_structure_v1':
+            self.register_buffer('lexical_mask',torch.zeros(cfg.vocab_size or cfg.base_vocab_size,dtype=torch.bool))
         self.query = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.key = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.gate = nn.Linear(cfg.d_model, 1)
         nn.init.constant_(self.gate.bias, -2.)
 
+    def configure(self, tokenizer, vocab_size):
+        if self.rule != 'preserve_structure_v1':
+            return
+        contract=(id(tokenizer),tokenizer.vocab_size,vocab_size,self.candidate_policy)
+        if self._tokenizer_contract==contract:
+            return
+        mask=torch.zeros(vocab_size,dtype=torch.bool,device=self.lexical_mask.device)
+        for index,unit in enumerate(tokenizer.construction_units):
+            if index < vocab_size and self.is_candidate(unit):
+                mask[index]=True
+        self.lexical_mask=mask
+        self._tokenizer_contract=contract
+
+    def is_candidate(self, unit):
+        if self.candidate_policy == 'lexical_bytes_v2':
+            return unit.is_lexical
+        return unit.kind in {'piece','word','phrase','char','digit','byte'}
+
+    def mix_probabilities(self, logits, copied_probabilities, gate):
+        base=F.log_softmax(logits.float(),-1)
+        if self.rule == 'mixture_v1':
+            return torch.logaddexp(base+F.logsigmoid(-gate),
+                copied_probabilities.clamp_min(1e-30).log()+F.logsigmoid(gate)).to(logits.dtype)
+        # Copying redistributes lexical probability only. Formatting and punctuation
+        # retain their exact base probabilities, and total lexical mass is conserved.
+        mask=self.lexical_mask
+        lexical_mass=torch.logsumexp(base[mask],dim=-1)
+        result=base.clone()
+        result[mask]=torch.logaddexp(base[mask]+F.logsigmoid(-gate),
+            copied_probabilities[mask].clamp_min(1e-30).log()+F.logsigmoid(gate)+lexical_mass)
+        return result.to(logits.dtype)
+
     def forward(self, logits, hidden, input_ids, features, tokenizer, bank, states=None):
+        self.configure(tokenizer,logits.size(-1))
         if states is not None and len(states) != input_ids.size(0):
             raise ValueError('Identity readout state batch size differs from input.')
         states = [IdentityReadoutState(list(s.entries), s.role) for s in states] if states is not None else [
@@ -294,7 +332,7 @@ class BoundedIdentityReadout(nn.Module):
                 elif unit.text=='<EOI>':state.role='outside'
                 elif unit.text=='<BOO>':state.role='output'
                 elif unit.text=='<EOO>':state.role='outside'
-                if state.role=='input' and unit.kind in {'piece','word','phrase','char','digit','byte'}:
+                if state.role=='input' and self.is_candidate(unit):
                     state.entries.append((token, tuple(feature_rows[row][position])))
                     state.entries=state.entries[-self.capacity:]
                 current=logits[row,position]
@@ -309,9 +347,7 @@ class BoundedIdentityReadout(nn.Module):
                     attention=F.softmax(scores.float(),-1)
                     copy=torch.zeros_like(current,dtype=torch.float32).scatter_add(0,ids,attention)
                     gate=self.gate(h).float().squeeze(-1)
-                    vocabulary=F.log_softmax(current.float(),-1)+F.logsigmoid(-gate)
-                    copied=copy.clamp_min(1e-30).log()+F.logsigmoid(gate)
-                    current=torch.logaddexp(vocabulary,copied).to(logits.dtype)
+                    current=self.mix_probabilities(current,copy,gate)
                 steps.append(current)
             rows.append(torch.stack(steps))
         return torch.stack(rows),states

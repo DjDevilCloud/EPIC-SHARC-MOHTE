@@ -118,6 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--signature-component-buckets", type=int, default=8192)
         p.add_argument("--bounded-identity-readout", action="store_true")
         p.add_argument("--identity-readout-capacity", type=int, default=16)
+        p.add_argument("--identity-readout-rule", choices=("mixture_v1","preserve_structure_v1"), default="mixture_v1")
+        p.add_argument("--identity-readout-candidate-policy", choices=("all_bytes_v1", "lexical_bytes_v2"),
+                       default=default_cfg.identity_readout_candidate_policy)
         p.add_argument("--verified-signature-spans", action="store_true",
                        help="Collect training-only continuation evidence and verify greedy span proposals.")
         p.add_argument("--d-model", type=int, default=default_cfg.d_model)
@@ -129,6 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--top-k-slots", type=int, default=default_cfg.top_k_slots)
         p.add_argument("--max-seq-len", type=int, default=default_cfg.max_seq_len)
         p.add_argument("--position-embedding-init-size", type=int, default=default_cfg.position_embedding_init_size)
+        p.add_argument("--no-absolute-position-embeddings", dest="use_absolute_position_embeddings",
+                       action="store_false", default=default_cfg.use_absolute_position_embeddings,
+                       help="Experimental: retain recurrent order and hierarchy features without learned absolute positions.")
         p.add_argument("--dropout", type=float, default=default_cfg.dropout)
         p.add_argument("--ff-mult", type=int, default=default_cfg.ff_mult)
         p.add_argument("--no-factorized-embedding", action="store_true")
@@ -731,6 +737,8 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         signature_representation=getattr(args, "signature_representation", "legacy"),
         use_bounded_identity_readout=getattr(args, "bounded_identity_readout", False),
         identity_readout_capacity=getattr(args, "identity_readout_capacity", 16),
+        identity_readout_rule=getattr(args, "identity_readout_rule", "mixture_v1"),
+        identity_readout_candidate_policy=getattr(args, "identity_readout_candidate_policy", "lexical_bytes_v2"),
         signature_component_buckets=getattr(args, "signature_component_buckets", 8192),
         use_verified_signature_spans=getattr(args, "verified_signature_spans", False),
         max_samples=getattr(args, "max_samples", PrismalWaveConfig.max_samples),
@@ -774,6 +782,7 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         top_k_slots=args.top_k_slots,
         max_seq_len=args.max_seq_len,
         position_embedding_init_size=args.position_embedding_init_size,
+        use_absolute_position_embeddings=getattr(args, "use_absolute_position_embeddings", True),
         dropout=args.dropout,
         ff_mult=args.ff_mult,
         use_factorized_embedding=not args.no_factorized_embedding,

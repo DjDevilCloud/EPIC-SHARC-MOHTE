@@ -7973,7 +7973,7 @@ class PrismalWaveModel(nn.Module):
                 pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device).unsqueeze(0)
                 if self.cfg.max_seq_len > 0:
                     pos = pos.clamp(max=self.cfg.max_seq_len - 1)
-                return pooled + self.position_embedding(pos)
+                return pooled + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings))
 
             if timings is not None:
                 hidden = _profile_stage(
@@ -8000,10 +8000,10 @@ class PrismalWaveModel(nn.Module):
                     input_ids.device,
                     timings,
                     "timing_encode_embed_ms",
-                    lambda: self.construction_embedding(input_ids) + self.position_embedding(pos),
+                    lambda: self.construction_embedding(input_ids) + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings)),
                 )
             else:
-                hidden = self.construction_embedding(input_ids) + self.position_embedding(pos)
+                hidden = self.construction_embedding(input_ids) + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings))
         hierarchy_context = self._hierarchy_embedding_context(
             input_ids,
             signature_ids=signature_ids,
@@ -8093,7 +8093,7 @@ class PrismalWaveModel(nn.Module):
             position_index = max(0, int(position_index))
             self._ensure_position_embedding_capacity(position_index + 1)
         pos = torch.full((batch, 1), position_index, device=input_ids.device, dtype=torch.long)
-        hidden = self.construction_embedding(input_ids[:, :1]) + self.position_embedding(pos)
+        hidden = self.construction_embedding(input_ids[:, :1]) + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings))
         hierarchy_context = self._hierarchy_embedding_context(
             input_ids[:, :1],
             signature_ids=signature_ids[:, :1] if signature_ids is not None else None,

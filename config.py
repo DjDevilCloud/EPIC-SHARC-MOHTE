@@ -41,6 +41,8 @@ class PrismalWaveConfig:
     signature_component_buckets: int = 8192
     use_bounded_identity_readout: bool = False
     identity_readout_capacity: int = 16
+    identity_readout_rule: str = "mixture_v1"
+    identity_readout_candidate_policy: str = "lexical_bytes_v2"
     use_verified_signature_spans: bool = False
     signature_span_capacity: int = 256
     signature_span_context: int = 32
@@ -92,6 +94,7 @@ class PrismalWaveConfig:
     top_k_slots: int = 2
     max_seq_len: int = 0
     position_embedding_init_size: int = 64
+    use_absolute_position_embeddings: bool = True
     dropout: float = 0.005
     ff_mult: int = 4
     use_factorized_embedding: bool = True
@@ -335,6 +338,10 @@ class PrismalWaveConfig:
             raise ValueError('Bounded identity readout requires runtime compositional signatures.')
         if self.identity_readout_capacity < 1:
             raise ValueError('identity_readout_capacity must be positive')
+        if self.identity_readout_rule not in {'mixture_v1','preserve_structure_v1'}:
+            raise ValueError('identity_readout_rule must be mixture_v1 or preserve_structure_v1')
+        if self.identity_readout_candidate_policy not in {'all_bytes_v1', 'lexical_bytes_v2'}:
+            raise ValueError('identity_readout_candidate_policy must be all_bytes_v1 or lexical_bytes_v2')
         if self.signature_representation not in {"legacy", "compositional_v1", "compositional_v2", "compositional_v3"}:
             raise ValueError("signature_representation must be legacy, compositional_v1, compositional_v2 or compositional_v3")
         for name in ("signature_component_buckets", "signature_span_capacity", "signature_span_context", "signature_span_tokens", "signature_span_min_support"):
@@ -729,6 +736,8 @@ class PrismalWaveConfig:
     def from_dict(cls, payload: Dict[str, Any]) -> "PrismalWaveConfig":
         fields = {f.name for f in cls.__dataclass_fields__.values()}
         data = {k: v for k, v in payload.items() if k in fields}
+        # Preserve the readout behavior of checkpoints written before byte classification.
+        data.setdefault("identity_readout_candidate_policy", "all_bytes_v1")
         if "Torus_SHARC_Router" not in data and "use_torus_sharc_router" in payload:
             data["Torus_SHARC_Router"] = payload["use_torus_sharc_router"]
         if "torus_local_field_radius" not in data and "torus_write_radius" in payload:

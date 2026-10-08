@@ -2030,6 +2030,24 @@ def evaluate_model(
     usage_entropy = []
     usage_concentration = []
     aux_breakdown_sums = {key: 0.0 for key in AUX_BREAKDOWN_KEYS}
+    # Complement batch-averaged CE with token-weighted lexical/surface diagnostics.
+    tokenizer = getattr(runtime_model, '_prismal_tokenizer', None)
+    class_lookups = {}
+    class_totals = {}
+    if isinstance(tokenizer, PrismalTokenizer):
+        units = tokenizer.construction_units
+        lexical_kinds = {'piece','word','phrase','char','digit','byte'}
+        endings = {tokenizer.special_tokens.get('<EOL>'),tokenizer.special_tokens.get('<EOO>'),tokenizer.eos_id}
+        for name in ('lexical','surface','case','space','ending','punctuation'):
+            flags=[]
+            for index in range(runtime_model.vocab_size):
+                kind=units[index].semantic_kind if index < len(units) else 'special'
+                flags.append(kind in lexical_kinds if name=='lexical' else
+                    kind not in lexical_kinds if name=='surface' else
+                    index in endings if name=='ending' else kind=={'case':'case','space':'space','punctuation':'punct'}[name])
+            class_lookups[name]=torch.tensor(flags,dtype=torch.bool,device=device)
+            class_totals[name]=[0.,0.,0.]
+        class_totals['all']=[0.,0.,0.]
     try:
         for batch in dataloader:
             (
@@ -2067,6 +2085,18 @@ def evaluate_model(
                 )
             losses.append(float(loss.item()))
             ce_losses.append(float(output.ce_loss.item()))
+            if class_lookups:
+                weights=loss_mask.float()*labels.ne(runtime_model.cfg.pad_id).float()
+                if float(weights.sum())==0:
+                    weights=labels.ne(runtime_model.cfg.pad_id).float()
+                token_nll=torch.nn.functional.cross_entropy(output.logits.float().transpose(1,2),labels,reduction='none')
+                correct=output.logits.argmax(-1).eq(labels).float()
+                class_weights={'all':weights}
+                class_weights.update({name:weights*lookup[labels].float() for name,lookup in class_lookups.items()})
+                for name,weighted in class_weights.items():
+                    class_totals[name][0]+=float((token_nll*weighted).sum())
+                    class_totals[name][1]+=float((correct*weighted).sum())
+                    class_totals[name][2]+=float(weighted.sum())
             aux_losses.append(float(output.aux_loss.item()))
             sig_agree.append(float(output.route_stats["signature_agreement"].mean().item()))
             entropy.append(float(output.route_stats["avg_entropy"].item()))
@@ -2091,6 +2121,9 @@ def evaluate_model(
         return {
             "loss": sum(losses) / max(len(losses), 1),
             "ce_loss": sum(ce_losses) / max(len(ce_losses), 1),
+            **{field:value for name,(nll,correct,count) in class_totals.items() if count>0
+                for field,value in ((f'{name}_ce_loss',nll/count),(f'{name}_token_accuracy',correct/count),
+                                    (f'{name}_supervised_tokens',count))},
             "aux_loss": sum(aux_losses) / max(len(aux_losses), 1),
             "signature_agreement": sum(sig_agree) / max(len(sig_agree), 1),
             "avg_entropy": sum(entropy) / max(len(entropy), 1),
@@ -2464,9 +2497,14 @@ def train_model(
             val_local_r = int(getattr(torus_core, "local_field_radius", getattr(model, "local_field_radius", 0)))
             val_scout_r = int(getattr(torus_core, "scout_read_radius", getattr(model, "scout_read_radius", 0)))
             val_relay_r = int(getattr(torus_core, "relay_write_radius", getattr(model, "relay_write_radius", 0)))
+            surface_summary = (
+                f"val_lexical_ce={val_metrics['lexical_ce_loss']:.4f} "
+                f"val_surface_ce={val_metrics['surface_ce_loss']:.4f} "
+            ) if 'lexical_ce_loss' in val_metrics and 'surface_ce_loss' in val_metrics else ''
             print(
                 f"[Prismal] {label} "
                 f"val_total={val_metrics['loss']:.4f} val_ce={val_metrics.get('ce_loss', 0.0):.4f} val_aux={val_metrics.get('aux_loss', 0.0):.4f} "
+                f"{surface_summary}"
                 f"val_sig={val_metrics['signature_agreement']:.4f} "
                 f"val_active={val_raw_active:.2f} "
                 f"val_soft_active={val_soft_active:.2f} "
@@ -2956,6 +2994,8 @@ def train_model(
         "val_total_loss": float(val_losses[-1]) if val_losses else float("nan"),
         "val_ce_loss": float(last_val_metrics["ce_loss"]) if last_val_metrics is not None else float("nan"),
         "val_aux_loss": float(last_val_metrics["aux_loss"]) if last_val_metrics is not None else float("nan"),
+        **{f"val_{key}": float(value) for key, value in (last_val_metrics or {}).items()
+           if key.startswith(('all_', 'lexical_', 'surface_', 'case_', 'space_', 'ending_', 'punctuation_'))},
         **{
             f"final_{key}": _tensor_float(last_aux_component_values.get(key))
             for key in AUX_BREAKDOWN_KEYS

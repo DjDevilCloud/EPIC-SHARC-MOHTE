@@ -128,6 +128,10 @@ Fresh models can opt into the shared component table and verified greedy continu
 
 The optional `--bounded-identity-readout` adds a learned read of observed input units after the torus recurrence, using the same shared bank. On a fresh two-seed selection control it answered 12/12 unseen combinations in each seed, versus matched v2 baselines of 7/12 and 6/12. See [Bounded identity readout](./BOUNDED_IDENTITY_READOUT.md) for checkpoints, limitations and usage. Structural-only `compositional_v3` retains short word positions and completed summaries, but its separate control showed mixed quality results; it remains experimental.
 
+Later answer-form controls include two-word and canonical nine-word answers, field/query order, separators and whitespace. Evaluation now separates lexical and surface-token loss; `preserve_structure_v1` copy mixing remains experimental because it underperformed the default. A fresh-training `--no-absolute-position-embeddings` ablation preserves recurrent order and hierarchy features. See [Bounded identity readout](./BOUNDED_IDENTITY_READOUT.md#answer-forms-and-formatting-diagnostics) for usage, evidence and limits.
+
+Fresh readout models use `lexical_bytes_v2` candidate classification so ASCII byte-fallback separators cannot enter lexical copying. Frozen-weight pipe tests improve from 12/48 to 48/48 in the failing seed; old checkpoints retain their original policy. See [the byte-candidate repair](./BOUNDED_IDENTITY_READOUT.md#fallback-byte-candidate-repair) for corrected bundles and Unicode limits.
+
 Precision support is backend-specific:
 
 - Ada-class GPUs can use the hierarchical float8 path where supported

@@ -12,6 +12,8 @@ from tests import test_causal_protocol as fixtures
 class RuntimeSignatureTests(unittest.TestCase):
     representation='compositional_v2'
     identity_readout=False
+    readout_rule='mixture_v1'
+    absolute_positions=True
     def setup_model(self):
         helper=fixtures.CausalProtocolTests()
         t=helper.tokenizer()
@@ -19,6 +21,8 @@ class RuntimeSignatureTests(unittest.TestCase):
         cfg.signature_representation=self.representation
         cfg.signature_component_buckets=512
         cfg.use_bounded_identity_readout=self.identity_readout
+        cfg.identity_readout_rule=self.readout_rule
+        cfg.use_absolute_position_embeddings=self.absolute_positions
         model=PrismalWaveModel(cfg)
         model._prismal_tokenizer=t
         model.prepare_capacity_for_tokenizer(t)
@@ -87,6 +91,8 @@ class RuntimeSignatureTests(unittest.TestCase):
                 restored,_,cfg=load_bundle_from_checkpoint(path,device='cpu',load_training_state=False)
                 restored.set_capacity_growth_locked(True)
                 self.assertEqual(cfg.signature_representation,self.representation)
+                self.assertEqual(cfg.use_absolute_position_embeddings,self.absolute_positions)
+                self.assertEqual(cfg.identity_readout_candidate_policy,m.cfg.identity_readout_candidate_policy)
                 self.assertEqual(restored.registry.family_vocab_size,m.registry.family_vocab_size)
                 torch.testing.assert_close(full.logits,restored(s.input_ids[None],**vals).logits,rtol=0,atol=0)
         m.train()
@@ -203,6 +209,37 @@ class BoundedIdentityReadoutTests(RuntimeSignatureTests):
             disabled=m(torch.tensor([empty.token_ids]),**empty_vals)
             m.bounded_identity_readout=head
             torch.testing.assert_close(enabled.logits,disabled.logits,rtol=0,atol=0)
+
+
+class AbsolutePositionAblationTests(unittest.TestCase):
+    def test_disabled_positions_full_incremental_training_and_reload(self):
+        helper=RuntimeSignatureTests()
+        helper.identity_readout=True
+        helper.absolute_positions=False
+        helper.test_full_incremental_logits_gradients_and_reload()
+
+
+class StructurePreservingReadoutTests(BoundedIdentityReadoutTests):
+    readout_rule='preserve_structure_v1'
+
+    def test_structural_mass_is_preserved_under_confident_copy(self):
+        _,t,m=self.setup_model()
+        head=m.bounded_identity_readout
+        head.configure(t,t.vocab_size)
+        logits=torch.randn(t.vocab_size,requires_grad=True)
+        copy=torch.zeros(t.vocab_size)
+        lexical=head.lexical_mask.nonzero().flatten()
+        copy[lexical[0]]=1.
+        base=logits.softmax(-1)
+        mixed=head.mix_probabilities(logits,copy,torch.tensor(12.)).softmax(-1)
+        torch.testing.assert_close(mixed[~head.lexical_mask],base[~head.lexical_mask],rtol=1e-5,atol=1e-7)
+        torch.testing.assert_close(mixed[head.lexical_mask].sum(),base[head.lexical_mask].sum(),rtol=1e-5,atol=1e-7)
+        self.assertAlmostEqual(float(mixed.sum()),1.,places=6)
+        cap=t.special_tokens['<CAP>']
+        (-mixed[cap].log()).backward()
+        self.assertGreater(float(logits.grad.abs().sum()),0.)
+        self.assertFalse(head.lexical_mask[cap])
+        self.assertFalse(head.lexical_mask[t.eos_id])
 
 
 if __name__=='__main__':

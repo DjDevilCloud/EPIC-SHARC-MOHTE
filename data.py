@@ -361,6 +361,25 @@ class ConstructionUnit:
     signature: str = ""
     pronunciation: str = ""
 
+    @property
+    def semantic_kind(self) -> str:
+        """Classify ASCII byte fallbacks without changing their reversible codec."""
+        if self.kind != "byte":
+            return self.kind
+        value = int(self.text[6:-1], 16)
+        if value >= 128:
+            return "byte"  # Keep partial UTF-8 eligible; a byte is not a code point.
+        character = chr(value)
+        if character.isalnum():
+            return "digit" if character.isdigit() else "char"
+        if character.isspace():
+            return "space"
+        return "punct" if character.isprintable() else "control"
+
+    @property
+    def is_lexical(self) -> bool:
+        return self.semantic_kind in {"piece", "word", "phrase", "char", "digit", "byte"}
+
 
 @dataclass
 class ConstructionFrame:

@@ -117,16 +117,16 @@ identity state at a nonzero position raises an error. The flags are opt-in;
 existing checkpoints load their existing architecture. New readout weights require
 training rather than flipping an inference setting.
 
-This establishes retrieval and rule selection for one-word answers on a fixed
-template with known lexical values. It does not establish novel-word copying,
-longer answers, varied field order, broad QA, factual knowledge, or recovery from
-arbitrary bad prefixes. The 16-slot cache can evict needed early units in longer
+The initial control establishes retrieval and rule selection for one-word answers
+on a fixed template with known lexical values. It did not establish novel-word
+copying, longer answers, varied field order, broad QA, factual knowledge, or
+recovery from arbitrary bad prefixes. Later answer-form controls are described below. The 16-slot cache can evict needed early units in longer
 questions. The learned gate is not calibrated confidence. The implementation
 adds attention/projection work and still computes vocabulary logits; CPU training
 in this control took roughly 50–51 seconds with the readout versus 40–42 without.
 No generation-speed gain is claimed, and optional quantization/compiled execution
-remain unverified for this new head. The next quality control should vary field
-order, query placement and answer length on a newly reserved split.
+remain unverified for this new head. The subsequent format controls vary field order, query placement and answer
+length on separately reserved combinations.
 
 Evidence and reproducible scripts:
 
@@ -139,3 +139,69 @@ Evidence and reproducible scripts:
 - `review_artifacts/run_identity_readout_control.py`
 - `review_artifacts/verify_identity_readout_control.py`
 - `tests/test_runtime_signatures.py`
+
+## Answer forms and formatting diagnostics
+
+The later six-layout control trains four answer rules: color, fruit, pair, and a
+canonical nine-word sentence. The original mixture reaches 45/48 and 47/48
+reserved-value exact answers across two seeds, including 12/12 sentence answers
+in each. However, a four-space stress layout reduces exactness to 12/48 and 8/48.
+This is bounded rule learning, not general language understanding.
+
+Official evaluation now returns `lexical_ce_loss` and `surface_ce_loss`, their
+token accuracies and supervised counts, plus `case`, `space`, `punctuation` and
+`ending` subgroups. Surface includes all nonlexical construction units. The
+original CE remains batch-averaged; the new class metrics are token-weighted and
+respect the existing supervision masks. Trainer progress prints lexical/surface
+CE and its returned metrics retain these fields under `val_` prefixes. Missing
+groups are omitted. Check raw generated IDs and uncleaned decoding separately;
+teacher-forced scores alone do not guarantee the right answer form.
+
+`--identity-readout-rule preserve_structure_v1` is an experimental alternative.
+It redistributes lexical mass while preserving each nonlexical base probability.
+It does not guarantee that a structural token remains the argmax. Its matched
+control is weaker overall (35/48 and 37/48 versus 45/48 and 47/48), so retain the
+default `mixture_v1`. It adds a tokenizer-derived Boolean buffer, no learned rows.
+
+`--no-absolute-position-embeddings` is a separate fresh-training ablation. The
+checkpoint records `use_absolute_position_embeddings=False`; ordinary inference
+and resume preserve that setting. Old checkpoints default to `True`. Disabling
+positions retains recurrent order and runtime hierarchy properties, and retains
+the existing position table for compatible parameter shapes. It does not skip
+whitespace tokens, recurrence, or cache updates, and is not a speed optimization.
+
+Full manifests, checkpoint comparisons, reserved formatting results, first-error
+probabilities and untrimmed text are documented in
+[the answer-form and whitespace review](./review_artifacts/ANSWER_FORM_AND_WHITESPACE_REVIEW_20261008.md).
+
+With the same six-layout training and a separately reserved split, disabling
+absolute positions improves five-space exactness from 5/48 to 39/48 (seed 47)
+and from 12/48 to 48/48 (seed 83). Both disabled-position models answer 48/48
+held-out value combinations correctly. This is the recommended next fresh
+control configuration with v2/readout and `mixture_v1`, not a default change or
+an inference toggle for old weights. Pipe/multiline failures persist in seed 83,
+including a repeating output; uppercase pair answers regress in that seed.
+Keep those stress checks before scaling and do not claim arbitrary formatting
+robustness or that repetition has been solved.
+
+## Fallback-byte candidate repair
+
+The subsequent pipe diagnostic isolated a correctness defect: `|` is encoded as
+`<BYTE:7c>`, and the old readout admitted all bytes as lexical content. In the
+failing seed, changing only the separator to a pipe reduced exactness from 48/48
+to 12/48. Newline, indentation and query-tab changes alone remained 48/48.
+
+Fresh models now default to `--identity-readout-candidate-policy lexical_bytes_v2`.
+It excludes nonlexical ASCII byte fallbacks from copying; letters, digits and
+partial non-ASCII UTF-8 bytes remain eligible. Stored kinds, IDs and reversible
+encoding remain unchanged. Evaluation classifies ASCII byte punctuation as
+surface/punctuation loss. Configurations missing the new field load with the
+original `all_bytes_v1` policy for reproducibility. Use a corrected bundle or an
+explicitly recorded new policy to apply the repair to existing weights.
+
+On the same weights, pipe-only and combined pipe/multiline answers become 48/48
+in both seeds, with no pipe tokens generated and all combined outputs reaching
+EOS. Corrected bundles retain bitwise-identical learned parameters and reproduce
+the filtered diagnostic after reload. Five-space and uppercase failures remain
+unchanged. See [the pipe root-cause review](./review_artifacts/PIPE_REPETITION_ROOT_CAUSE_20261008.md)
+for traces, corrected checkpoints and limitations.
