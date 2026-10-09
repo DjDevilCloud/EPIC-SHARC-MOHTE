@@ -693,8 +693,17 @@ def _compose_structured_qa_record(
     return "\n".join(["<BOI>", input_text, "<EOI>", "<BOO>", output_text, "<EOO>"]).strip()
 
 
-def _compose_record_text(payload: Dict[str, Any]) -> str:
+def _compose_record_text(payload: Dict[str, Any], *, text_is_response: bool = False) -> str:
     raw_text = _clean_record_value(payload.get("text") or payload.get("content"))
+    # Cosmopedia stores the instruction in prompt and the generated answer in text.
+    # Recognize its schema explicitly; generic prompt/text records can use text as context.
+    cosmopedia_fields = {"prompt", "text", "seed_data", "format", "audience"}
+    if text_is_response or cosmopedia_fields.issubset(payload):
+        if raw_text and _clean_record_value(payload.get("prompt")) and not any(
+            _clean_record_value(payload.get(key))
+            for key in ("response", "output", "answer", "completion", "target")
+        ):
+            return f"<BOI>{_clean_record_value(payload['prompt'])}<EOI><BOO>{raw_text}<EOO>"
     if raw_text:
         normalized_raw_text = _normalize_role_marked_text(raw_text)
         if normalized_raw_text != raw_text:
@@ -915,7 +924,19 @@ def _iter_jsonl_texts(path: Path) -> Iterator[str]:
                 yield _normalize_role_marked_text(payload.strip())
 
 
+def _normalize_diverse_qa_record(text: str) -> str:
+    """Adapt the known DiverseQA document + trailing Question/Answer format."""
+    match = re.search(r"(?:^|\n)Question:\s*(.*?)\nAnswer:\s*(.*)\Z", text, re.DOTALL)
+    if match is None or not match.group(1).strip() or not match.group(2).strip():
+        return _normalize_role_marked_text(text)
+    context = text[:match.start()].strip()
+    question, answer = (value.strip() for value in match.groups())
+    prompt = (f"Context:\n{context}\n" if context else "") + f"Question:\n{question}"
+    return f"<BOI>{prompt}<EOI><BOO>{answer}<EOO>"
+
+
 def _iter_parquet_texts(path: Path) -> Iterator[str]:
+    diverse_qa = path.parent.name.casefold() == "diverseqa"
     projected_columns = [
         "text",
         "content",
@@ -939,6 +960,7 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
 
     if pq is not None:
         parquet_file = pq.ParquetFile(path)
+        text_is_response = {"prompt", "text", "seed_data", "format", "audience"}.issubset(parquet_file.schema.names)
         available_columns = [name for name in projected_columns if name in parquet_file.schema.names]
         if available_columns:
             # Project just the likely text columns first. Most corpora only need a
@@ -950,21 +972,21 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
                     for value in batch.column(0).to_pylist():
                         merged = _clean_record_value(value)
                         if merged:
-                            yield _normalize_role_marked_text(merged)
+                            yield _normalize_diverse_qa_record(merged) if diverse_qa else _normalize_role_marked_text(merged)
                 return
 
             for batch in parquet_file.iter_batches(columns=available_columns):
                 columns = {name: batch.column(index).to_pylist() for index, name in enumerate(available_columns)}
                 for row_index in range(batch.num_rows):
                     payload = {name: values[row_index] for name, values in columns.items()}
-                    merged = _compose_record_text(payload)
+                    merged = _compose_record_text(payload, text_is_response=text_is_response)
                     if merged:
                         yield merged
             return
 
         for batch in parquet_file.iter_batches():
             for payload in batch.to_pylist():
-                merged = _compose_record_text(payload)
+                merged = _compose_record_text(payload, text_is_response=text_is_response)
                 if merged:
                     yield merged
         return
@@ -977,20 +999,21 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
     df = pd.read_parquet(path)
     if df.empty:
         return
+    text_is_response = {"prompt", "text", "seed_data", "format", "audience"}.issubset(df.columns)
 
     available_columns = [name for name in projected_columns if name in df.columns]
     if len(available_columns) == 1 and available_columns[0] in {"text", "content", "body", "document"}:
         for value in df[available_columns[0]].tolist():
             merged = _clean_record_value(value)
             if merged:
-                yield _normalize_role_marked_text(merged)
+                yield _normalize_diverse_qa_record(merged) if diverse_qa else _normalize_role_marked_text(merged)
         return
 
     # `itertuples()` keeps the scan much lighter while preserving the same payload shape.
     columns = list(df.columns)
     for row in df.itertuples(index=False, name=None):
         payload = {key: value for key, value in zip(columns, row)}
-        merged = _compose_record_text(payload)
+        merged = _compose_record_text(payload, text_is_response=text_is_response)
         if merged:
             yield merged
 

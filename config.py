@@ -43,6 +43,13 @@ class PrismalWaveConfig:
     identity_readout_capacity: int = 16
     identity_readout_rule: str = "mixture_v1"
     identity_readout_candidate_policy: str = "lexical_bytes_v2"
+    identity_readout_binding: str = "independent_v1"
+    identity_readout_context_units: int = 2
+    identity_readout_query_units: int = 4
+    identity_readout_binding_confidence: float = 0.99
+    binding_adapter_training: bool = False
+    # Serialized output addresses, not structural features. Bound before optimizer creation.
+    identity_readout_surface_ids: list[int] = field(default_factory=list)
     use_verified_signature_spans: bool = False
     signature_span_capacity: int = 256
     signature_span_context: int = 32
@@ -342,6 +349,25 @@ class PrismalWaveConfig:
             raise ValueError('identity_readout_rule must be mixture_v1 or preserve_structure_v1')
         if self.identity_readout_candidate_policy not in {'all_bytes_v1', 'lexical_bytes_v2'}:
             raise ValueError('identity_readout_candidate_policy must be all_bytes_v1 or lexical_bytes_v2')
+        if self.identity_readout_binding not in {'independent_v1', 'lexical_binding_v1'}:
+            raise ValueError('identity_readout_binding must be independent_v1 or lexical_binding_v1')
+        if self.binding_adapter_training and self.identity_readout_binding != 'lexical_binding_v1':
+            raise ValueError('binding_adapter_training requires lexical_binding_v1')
+        if self.identity_readout_binding == 'lexical_binding_v1':
+            if not self.use_bounded_identity_readout or self.identity_readout_candidate_policy != 'lexical_bytes_v2':
+                raise ValueError('lexical binding requires bounded identity readout with lexical_bytes_v2')
+            if self.identity_readout_rule != 'mixture_v1':
+                raise ValueError('lexical binding requires mixture_v1')
+            if not all(1 <= n <= self.identity_readout_capacity for n in
+                       (self.identity_readout_context_units, self.identity_readout_query_units)):
+                raise ValueError('binding windows must be positive and no larger than readout capacity')
+            if not .5 < self.identity_readout_binding_confidence <= 1.:
+                raise ValueError('binding confidence must be greater than .5 and at most 1')
+        if len(set(self.identity_readout_surface_ids)) != len(self.identity_readout_surface_ids) or any(
+            not isinstance(i, int) or i < 0 or (self.vocab_size > 0 and i >= self.vocab_size)
+            for i in self.identity_readout_surface_ids
+        ):
+            raise ValueError('identity_readout_surface_ids must be unique valid vocabulary addresses')
         if self.signature_representation not in {"legacy", "compositional_v1", "compositional_v2", "compositional_v3"}:
             raise ValueError("signature_representation must be legacy, compositional_v1, compositional_v2 or compositional_v3")
         for name in ("signature_component_buckets", "signature_span_capacity", "signature_span_context", "signature_span_tokens", "signature_span_min_support"):

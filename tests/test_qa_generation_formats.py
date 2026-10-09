@@ -108,6 +108,55 @@ class QAGenerationFormatTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PrismalTokenizer().prepare_generation_hierarchy('Hello', mode='invalid')
 
+    def test_cosmopedia_schema_preserves_prompt_and_response_and_masks_input(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        row = dict(prompt='Explain this code:\n\tprint("rain")',
+                   text='Certainly!\n\tIt prints "rain".', seed_data='test', format='textbook', audience='general')
+        expected = f"<BOI>{row['prompt']}<EOI><BOO>{row['text']}<EOO>"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'cosmo.parquet'
+            pq.write_table(pa.Table.from_pylist([row]), path)
+            self.assertEqual(list(iter_text_corpus(path)), [expected])
+            json_path = Path(directory) / 'cosmo.jsonl'
+            json_path.write_text(json.dumps(row), encoding='utf-8')
+            self.assertEqual(list(iter_text_corpus(json_path)), [expected])
+        t = PrismalTokenizer()
+        t.learn_from_texts([expected], min_frequency=1, max_new_tokens=32)
+        p = t.prepare_generation_hierarchy(row['prompt'])
+        sample = self.assert_prefix(t, expected, p)
+        self.assertEqual(float(sample.loss_mask[:len(p.token_ids)-1].sum()), 0.)
+        self.assertGreater(float(sample.loss_mask[len(p.token_ids)-1:].sum()), 0.)
+
+    def test_generic_prompt_text_is_not_assumed_to_be_a_response(self):
+        from data import _compose_record_text
+        self.assertNotIn('<BOO>', _compose_record_text(dict(prompt='Summarize this.', text='Context document.')))
+
+    def test_diverseqa_adapter_retains_context_and_supervises_only_answer(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        raw = 'The expedition visited Lima.\n\nQuestion: Which city was visited?\nAnswer: Lima'
+        expected = '<BOI>Context:\nThe expedition visited Lima.\nQuestion:\nWhich city was visited?<EOI><BOO>Lima<EOO>'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'DiverseQA' / 'part.parquet'
+            path.parent.mkdir()
+            pq.write_table(pa.Table.from_pylist([dict(id='one', text=raw)]), path)
+            self.assertEqual(list(iter_text_corpus(path)), [expected])
+            other = Path(directory) / 'ordinary.parquet'
+            pq.write_table(pa.Table.from_pylist([dict(text=raw)]), other)
+            self.assertEqual(list(iter_text_corpus(other)), [raw])
+        t = PrismalTokenizer()
+        t.learn_from_texts([expected], min_frequency=1, max_new_tokens=32)
+        p = t.prepare_generation_hierarchy('Context:\nThe expedition visited Lima.\nQuestion:\nWhich city was visited?')
+        s = self.assert_prefix(t, expected, p)
+        self.assertEqual(float(s.loss_mask[:len(p.token_ids)-1].sum()), 0.)
+        self.assertGreater(float(s.loss_mask[len(p.token_ids)-1:].sum()), 0.)
+
+    def test_diverseqa_incomplete_record_retains_original_text(self):
+        from data import _normalize_diverse_qa_record
+        text = 'Document.\nQuestion: Missing response\nAnswer:'
+        self.assertEqual(_normalize_diverse_qa_record(text), text)
+
 
 if __name__ == '__main__':
     unittest.main()

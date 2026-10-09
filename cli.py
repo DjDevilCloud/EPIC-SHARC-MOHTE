@@ -121,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-rule", choices=("mixture_v1","preserve_structure_v1"), default="mixture_v1")
         p.add_argument("--identity-readout-candidate-policy", choices=("all_bytes_v1", "lexical_bytes_v2"),
                        default=default_cfg.identity_readout_candidate_policy)
+        p.add_argument("--identity-readout-binding", choices=("independent_v1", "lexical_binding_v1"), default="independent_v1")
+        p.add_argument("--identity-readout-context-units", type=int, default=2)
+        p.add_argument("--identity-readout-query-units", type=int, default=4)
+        p.add_argument("--identity-readout-binding-confidence", type=float, default=.99)
+        p.add_argument("--binding-adapter-training", action="store_true",
+                       help="Train only binding adapters and freeze retained registry observations.")
         p.add_argument("--verified-signature-spans", action="store_true",
                        help="Collect training-only continuation evidence and verify greedy span proposals.")
         p.add_argument("--d-model", type=int, default=default_cfg.d_model)
@@ -739,6 +745,11 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         identity_readout_capacity=getattr(args, "identity_readout_capacity", 16),
         identity_readout_rule=getattr(args, "identity_readout_rule", "mixture_v1"),
         identity_readout_candidate_policy=getattr(args, "identity_readout_candidate_policy", "lexical_bytes_v2"),
+        identity_readout_binding=getattr(args, "identity_readout_binding", "independent_v1"),
+        identity_readout_context_units=getattr(args, "identity_readout_context_units", 2),
+        identity_readout_query_units=getattr(args, "identity_readout_query_units", 4),
+        identity_readout_binding_confidence=getattr(args, "identity_readout_binding_confidence", .99),
+        binding_adapter_training=getattr(args, "binding_adapter_training", False),
         signature_component_buckets=getattr(args, "signature_component_buckets", 8192),
         use_verified_signature_spans=getattr(args, "verified_signature_spans", False),
         max_samples=getattr(args, "max_samples", PrismalWaveConfig.max_samples),

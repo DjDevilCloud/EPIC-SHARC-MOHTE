@@ -205,3 +205,99 @@ EOS. Corrected bundles retain bitwise-identical learned parameters and reproduce
 the filtered diagnostic after reload. Five-space and uppercase failures remain
 unchanged. See [the pipe root-cause review](./review_artifacts/PIPE_REPETITION_ROOT_CAUSE_20261008.md)
 for traces, corrected checkpoints and limitations.
+
+## Layout coverage continuation
+
+The remaining five-space and uppercase failures were investigated with frozen
+weights and a budget-matched continuation. Editing only retrieval-key layout
+features did not repair them. The incorrect first retrieval can make a pair end
+as a one-word answer; teacher-forcing its correct first value restores the
+required separator and second value. Original training had no UPPER input controls.
+
+Ten additional presentations per original training record, with single-uppercase
+field labels and space runs 1/2/4/6/8 across varied layouts, produce 48/48 exact
+answers in both seeds on all seven tested layouts. These include untrained
+5/7/9-space runs and the untrained combination of both uppercase labels. The
+budget-matched old-layout continuation still fails longer spacing, and seed 83's
+best validation checkpoint is its initial checkpoint with uppercase failures
+unchanged. No vocabulary, model parameters, tokenizer rewriting or generation
+penalties were added for this experiment.
+
+The preferred follow-up checkpoints are the varied-coverage models in
+`review_artifacts/layout_coverage_control_20261008/`. See
+[the layout-selection review](./review_artifacts/LAYOUT_SELECTION_AND_COVERAGE_REVIEW_20261008.md)
+for exact counts, validation selection, reload/parity checks and scope limits.
+Semantics-preserving format coverage is supported for the controlled QA schema;
+this is not evidence of arbitrary-format or general-language reliability.
+
+## Native QA and long-cache follow-up
+
+The one-seed native-data pilot uses complete targets from ReasoningOff, DiverseQA,
+SFT-Code and short WikiHow-derived Cosmopedia records. It identified and repaired
+Cosmopedia prompt/text target placement, DiverseQA context/question/answer
+adaptation, and a lazy signature-cache scaling defect that attenuated writes
+after roughly 171 updates at decay 0.85. Periodic rebasing now implements the
+intended recurrence through long prefixes and streamed state without a per-update
+CUDA scalar read. It changes no learned parameter shapes.
+
+The real-data comparison still yields 0/16 exact held-out answers for both
+canonical and format-varied training. Validation selects early checkpoints as
+training loss falls and validation later worsens. Full/incremental execution
+agrees on 571/719-step trained probes with finite cache scales, so this result
+cannot be described as an unfixed cache-scale collapse. Both readout and
+vocabulary paths can still repeat on these tasks.
+
+See [the real-QA and cache review](./review_artifacts/REAL_QA_DATA_AND_CACHE_REVIEW_20261008.md)
+for source audits, corrected ingestion, numerical proofs, full-target controls,
+raw outputs and scope limits. The toy format-robustness results above do not
+establish broader native-QA competence.
+
+## Optional lexical binding and retained-state adaptation
+
+`identity_readout_binding="lexical_binding_v1"` adds a bounded, input-only
+context window to each candidate and an explicit recent-input query. It composes
+existing lexical embeddings with the shared token bank. The default windows are
+two preceding eligible units per candidate and four recent input units for the
+query; these are **unit windows**, not a full syntactic or question parser.
+The learned span score links a value to nearby evidence instead of relying only
+on its position. All torus transitions and ordinary token verification remain.
+
+A structural answer-form residual and gate delta use runtime properties, plus
+exact control-marker identity. They exclude the current lexical value's identity.
+This lets a learned answer boundary transfer to values with similar structural
+properties. The residual addresses only nonlexical output units; it does not
+force EOS or copy a complete answer outside normal generation.
+
+A learned applicability gate multiplies all additions. At the default confidence
+of .99, confidently retained requests receive exactly zero additions, confidently
+adapted requests receive the complete path, and uncertain requests blend the
+paths. The gate is trained from input features. In the control, applicability is
+calibrated on old/new **training-input** route labels, then frozen; answer labels
+are not passed to retrieval or routing at generation time.
+
+New query/gate/format deltas and the span scale start at zero, preserving the old
+function at migration. Old checkpoints default to `independent_v1`. Surface token
+addresses are serialized with the configuration and must be bound through
+`prepare_capacity_for_tokenizer` before creating the optimizer. Normal checkpoint
+loading supports the new mode. Do not change modes/windows on an active request;
+restart from its input prefix so the neighbor cache has the correct schema.
+
+Use `model.freeze_binding_backbone()` for retained-checkpoint adaptation, or set
+`binding_adapter_training=True` (`--binding-adapter-training`) with the new mode.
+This freezes original parameters **and registry observation updates**. Merely
+setting `requires_grad=False` does not freeze family activity, promotion or active
+masks, which participate in forward features. The adapter-training flag survives
+checkpoint reload. To retain the calibrated router during further fitting, also
+freeze `model.bounded_identity_readout.applicability` after calibration/loading.
+
+The production control adds 10,210 parameters to the migrated 100,482-parameter
+base. Both seeds score 8/8 on reordered training bindings and 8/8 on held colors,
+while preserving all 48/48 answers and their token IDs on every old layout.
+A fresh 48-record test using four additional objects and two additional colors
+scores 28/48 and 34/48; all terminate, and remaining failures select the wrong
+value. This remains a controlled grammar/known-vocabulary result. Longer or
+question-first prompts, unfamiliar multi-unit entities, and general native QA
+are not established. No end-to-end speed improvement is claimed.
+
+See [the binding and registry review](./review_artifacts/BINDING_AND_REGISTRY_RETENTION_20261009.md)
+for checkpoints, comparisons, frozen-state evidence and limitations.

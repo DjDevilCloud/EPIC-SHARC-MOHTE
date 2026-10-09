@@ -274,6 +274,11 @@ class BoundedIdentityReadout(nn.Module):
         self.capacity = cfg.identity_readout_capacity
         self.rule = cfg.identity_readout_rule
         self.candidate_policy = cfg.identity_readout_candidate_policy
+        self.binding_enabled = cfg.identity_readout_binding == 'lexical_binding_v1'
+        self.context_units = cfg.identity_readout_context_units
+        self.query_units = cfg.identity_readout_query_units
+        self.binding_confidence = cfg.identity_readout_binding_confidence
+        self._binding_cfg = cfg
         self._tokenizer_contract = None
         if self.rule == 'preserve_structure_v1':
             self.register_buffer('lexical_mask',torch.zeros(cfg.vocab_size or cfg.base_vocab_size,dtype=torch.bool))
@@ -281,8 +286,26 @@ class BoundedIdentityReadout(nn.Module):
         self.key = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.gate = nn.Linear(cfg.d_model, 1)
         nn.init.constant_(self.gate.bias, -2.)
+        if self.binding_enabled:
+            self.context_query = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+            self.context_gate = nn.Bilinear(cfg.d_model, cfg.d_model, 1, bias=False)
+            self.span_projection = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+            self.applicability = nn.Linear(cfg.d_model, 1)
+            self.span_scale = nn.Parameter(torch.zeros(()))
+            nn.init.zeros_(self.context_query.weight)
+            nn.init.zeros_(self.context_gate.weight)
+            nn.init.eye_(self.span_projection.weight)
+            nn.init.zeros_(self.applicability.weight)
+            nn.init.zeros_(self.applicability.bias)
+            self.register_buffer('surface_ids', torch.tensor(cfg.identity_readout_surface_ids, dtype=torch.long))
+            self.surface_projection = None
+            if self.surface_ids.numel():
+                self.surface_projection = nn.Linear(2 * cfg.d_model, self.surface_ids.numel(), bias=False)
+                nn.init.zeros_(self.surface_projection.weight)
 
     def configure(self, tokenizer, vocab_size):
+        if self.binding_enabled:
+            self._configure_binding_surface(tokenizer, vocab_size)
         if self.rule != 'preserve_structure_v1':
             return
         contract=(id(tokenizer),tokenizer.vocab_size,vocab_size,self.candidate_policy)
@@ -294,6 +317,57 @@ class BoundedIdentityReadout(nn.Module):
                 mask[index]=True
         self.lexical_mask=mask
         self._tokenizer_contract=contract
+
+    def _configure_binding_surface(self, tokenizer, vocab_size):
+        contract = (id(tokenizer), tokenizer.vocab_size, vocab_size)
+        if getattr(self, '_surface_contract', None) == contract:
+            return
+        ids = [i for i,u in enumerate(tokenizer.construction_units) if i < vocab_size and not u.is_lexical]
+        old_ids = self.surface_ids.tolist()
+        if self.surface_projection is None or ids != old_ids:
+            projection = nn.Linear(2 * self.query.in_features, len(ids), bias=False).to(
+                device=self.query.weight.device, dtype=self.query.weight.dtype)
+            nn.init.zeros_(projection.weight)
+            if self.surface_projection is not None:
+                by_id = {token: i for i,token in enumerate(old_ids)}
+                with torch.no_grad():
+                    for row,token in enumerate(ids):
+                        if token in by_id:
+                            projection.weight[row].copy_(self.surface_projection.weight[by_id[token]])
+                projection.weight.requires_grad_(self.surface_projection.weight.requires_grad)
+            self.surface_projection = projection
+            self.surface_ids = torch.tensor(ids, dtype=torch.long, device=self.query.weight.device)
+        self._binding_cfg.identity_readout_surface_ids = ids
+        self._surface_contract = contract
+
+    def _binding_memory(self, entries, tokenizer, bank, lexical_embeddings, device):
+        """Input-only identity composition; no output labels, hidden history or profile IDs."""
+        if any(len(e) != 3 or len(e[2]) > self.context_units for e in entries):
+            raise ValueError('Lexical binding needs its own request state; restart from the input prefix.')
+        d = self.query.in_features
+        def identity(ids):
+            return F.layer_norm((lexical_embeddings(ids) + bank.encode('token', ids)) / math.sqrt(2.), (d,))
+        ids = torch.tensor([e[0] for e in entries], device=device)
+        previous = torch.tensor([list(e[2]) + [tokenizer.pad_id] * (self.context_units - len(e[2]))
+                                 for e in entries], dtype=torch.long, device=device)
+        lengths = torch.tensor([len(e[2]) for e in entries], device=device)
+        valid = torch.arange(self.context_units, device=device)[None,:] < lengths[:,None]
+        context = (identity(previous) * valid.unsqueeze(-1)).sum(1) / valid.sum(-1,keepdim=True).clamp_min(1)
+        context = F.layer_norm(context, (d,))
+        question = F.layer_norm(identity(ids[-self.query_units:]).mean(0), (d,))
+        span_scores = (self.span_projection(context) * self.span_projection(question)).sum(-1) / math.sqrt(d)
+        return question, span_scores, identity
+
+    def _binding_structure(self, token, unit, runtime_features, bank, identity, hidden):
+        # Preserve meaningful marker identity while keeping lexical value identity out of formatting.
+        control = identity(torch.tensor(token,device=hidden.device)) if not unit.is_lexical else torch.zeros_like(hidden)
+        return F.layer_norm(bank.encode_runtime(runtime_features) + control, (hidden.size(-1),))
+
+    def binding_activation(self, question):
+        probability = self.applicability(question).sigmoid().squeeze(-1)
+        # Confident retained-task routing is exactly neutral; uncertain requests stay blended.
+        return torch.where(probability <= 1. - self.binding_confidence, torch.zeros_like(probability),
+                           torch.where(probability >= self.binding_confidence, torch.ones_like(probability), probability))
 
     def is_candidate(self, unit):
         if self.candidate_policy == 'lexical_bytes_v2':
@@ -314,7 +388,9 @@ class BoundedIdentityReadout(nn.Module):
             copied_probabilities[mask].clamp_min(1e-30).log()+F.logsigmoid(gate)+lexical_mass)
         return result.to(logits.dtype)
 
-    def forward(self, logits, hidden, input_ids, features, tokenizer, bank, states=None):
+    def forward(self, logits, hidden, input_ids, features, tokenizer, bank, states=None, *, lexical_embeddings=None):
+        if self.binding_enabled and lexical_embeddings is None:
+            raise ValueError('Lexical binding requires the model lexical embedding channel.')
         self.configure(tokenizer,logits.size(-1))
         if states is not None and len(states) != input_ids.size(0):
             raise ValueError('Identity readout state batch size differs from input.')
@@ -324,17 +400,23 @@ class BoundedIdentityReadout(nn.Module):
         feature_rows=features.tolist()
         for row,(tokens,state) in enumerate(zip(input_ids.tolist(),states)):
             steps=[]
+            binding_memory = None
             for position,token in enumerate(tokens):
                 unit=tokenizer.construction_units[token]
                 if token==tokenizer.bos_id or unit.text=='<BOI>':
                     state.entries=[]
+                    binding_memory = None
                     state.role='input' if unit.text=='<BOI>' else 'outside'
                 elif unit.text=='<EOI>':state.role='outside'
                 elif unit.text=='<BOO>':state.role='output'
                 elif unit.text=='<EOO>':state.role='outside'
                 if state.role=='input' and self.is_candidate(unit):
-                    state.entries.append((token, tuple(feature_rows[row][position])))
+                    entry = (token, tuple(feature_rows[row][position]))
+                    if self.binding_enabled:
+                        entry += (tuple(e[0] for e in state.entries[-self.context_units:]),)
+                    state.entries.append(entry)
                     state.entries=state.entries[-self.capacity:]
+                    binding_memory = None
                 current=logits[row,position]
                 if state.role=='output' and state.entries:
                     ids=torch.tensor([e[0] for e in state.entries],device=logits.device)
@@ -343,10 +425,24 @@ class BoundedIdentityReadout(nn.Module):
                     keys=self.key(candidates)
                     h=hidden[row,position]
                     # All bounded candidates participate in training, so q/k receive gradients.
-                    scores=(keys*self.query(h)).sum(-1)/math.sqrt(keys.size(-1))
+                    query = self.query(h)
+                    gate=self.gate(h).float().squeeze(-1)
+                    if self.binding_enabled:
+                        if binding_memory is None:
+                            binding_memory = self._binding_memory(state.entries, tokenizer, bank, lexical_embeddings, logits.device)
+                        question, span_scores, identity = binding_memory
+                        activation = self.binding_activation(question)
+                        # Formatting depends on causal properties, not a particular value's identity.
+                        structure = self._binding_structure(token, unit, features[row,position], bank, identity, h)
+                        query = query + activation * self.context_query(question)
+                        gate = (self.gate(h) + activation * self.context_gate(structure,question)).float().squeeze(-1)
+                        delta = activation * self.surface_projection(torch.cat((structure, structure * question)))
+                        current = current.index_add(0, self.surface_ids, delta)
+                    scores=(keys*query).sum(-1)/math.sqrt(keys.size(-1))
+                    if self.binding_enabled:
+                        scores = scores + activation * self.span_scale * span_scores
                     attention=F.softmax(scores.float(),-1)
                     copy=torch.zeros_like(current,dtype=torch.float32).scatter_add(0,ids,attention)
-                    gate=self.gate(h).float().squeeze(-1)
                     current=self.mix_probabilities(current,copy,gate)
                 steps.append(current)
             rows.append(torch.stack(steps))

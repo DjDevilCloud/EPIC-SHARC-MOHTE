@@ -271,3 +271,24 @@ If you want to inspect the implementation, start here:
 - `./model.py`
 - `./train.py`
 
+
+Native-data follow-up: Cosmopedia prompt/text records now preserve separate input
+and output spans; the named DiverseQA parquet adapter preserves source context
+and supervises its trailing answer. Long signature-cache decay uses bounded-scale
+rebasing rather than attenuating new writes at a normalization floor. These
+correctness fixes pass long/streamed/gradient/reduced-precision tests. The small
+native-QA pilot still produces no exact held-out answers; see
+[the real-QA and cache review](./review_artifacts/REAL_QA_DATA_AND_CACHE_REVIEW_20261008.md)
+before treating the synthetic controls as broad QA validation.
+# Retained-checkpoint binding control
+
+The optional `lexical_binding_v1` identity readout retains nearby input-unit
+context and an explicit input-tail query. Its learned answer-form residual uses
+compositional structural properties. Adapter-only training freezes the original
+registry observations as well as weights; registry promotion buffers otherwise
+change forward behavior even with frozen parameters.
+
+The two-seed control retains all seven old 48/48 layouts and answers 8/8 held
+bindings with reversed passages. A further unseen-object/value combination test
+scores 28/48 and 34/48, so broader QA remains unproven. Details and loadable
+checkpoints: [binding and registry retention](./review_artifacts/BINDING_AND_REGISTRY_RETENTION_20261009.md).

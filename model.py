@@ -2558,6 +2558,8 @@ class SignatureEmitterRegistry(nn.Module):
         return int(self.family_embedding.num_embeddings)
 
     def _touch_ids(self, buffer_name: str, mask_name: str, ids: torch.Tensor) -> None:
+        if not getattr(self, 'observation_updates_enabled', True):
+            return
         if ids is None or ids.numel() == 0:
             return
         flat = ids.detach().long().reshape(-1)
@@ -4351,6 +4353,7 @@ class SignatureLatticeState:
     prev_parent_bucket: torch.Tensor
     prev_signature_bucket: torch.Tensor
     prev_family_bucket: torch.Tensor
+    cache_scale_phase: Optional[int] = None
 
 
 @dataclass
@@ -4395,6 +4398,10 @@ class SignatureLatticeAttention(nn.Module):
         self.candidates = max(1, min(self.buckets, int(getattr(cfg, "signature_lattice_candidates", 8))))
         self.weight = max(0.0, float(getattr(cfg, "signature_lattice_weight", 0.35)))
         self.decay = max(0.0, min(1.0, float(getattr(cfg, "signature_lattice_decay", 0.92))))
+        # Keep lazy storage within eight times its effective magnitude. A carried
+        # Python phase avoids a CUDA scalar synchronization on every cache update.
+        self.cache_rebase_interval = (16 if self.decay >= 1.0 or self.decay < 0.125 else
+                                      max(1, min(16, int(math.log(0.125) / math.log(self.decay)))))
         self.chunk_len = max(1, int(getattr(cfg, "signature_lattice_chunk_len", getattr(cfg, "torus_chunk_len", 8))))
 
         self.q_proj = create_quantized_linear(d, self.r, bias=False, quantization_config=self.quantization_config)
@@ -4417,6 +4424,7 @@ class SignatureLatticeAttention(nn.Module):
             prev_parent_bucket=torch.zeros(batch_size, device=device, dtype=torch.long),
             prev_signature_bucket=torch.zeros(batch_size, device=device, dtype=torch.long),
             prev_family_bucket=torch.zeros(batch_size, device=device, dtype=torch.long),
+            cache_scale_phase=0,
         )
 
     def _coerce_state(
@@ -4439,6 +4447,13 @@ class SignatureLatticeAttention(nn.Module):
             cache_decay_steps = torch.zeros(cache.size(0), 1, 1, device=device, dtype=torch.long)
         else:
             cache_decay_steps = cache_decay_steps.to(device=device, dtype=torch.long)
+        cache_scale_phase = getattr(state, "cache_scale_phase", None)
+        if cache_scale_phase is None:
+            # Older/external states have no known rebase phase. Preserve their
+            # effective cache and begin stable storage from a unit scale.
+            cache = cache * cache_decay_scale
+            cache_decay_scale = torch.ones_like(cache_decay_scale)
+            cache_scale_phase = 0
         counts = state.counts.to(device=device, dtype=dtype)
         prev_parent = state.prev_parent_bucket.to(device=device, dtype=torch.long)
         prev_signature = state.prev_signature_bucket.to(device=device, dtype=torch.long)
@@ -4459,6 +4474,7 @@ class SignatureLatticeAttention(nn.Module):
             prev_parent_bucket=prev_parent,
             prev_signature_bucket=prev_signature,
             prev_family_bucket=prev_family,
+            cache_scale_phase=cache_scale_phase,
         )
 
     def _bucket(self, ids: Optional[torch.Tensor], fallback: torch.Tensor, domain: str = "signature") -> torch.Tensor:
@@ -4557,14 +4573,28 @@ class SignatureLatticeAttention(nn.Module):
 
             write_value = self.v_proj(h_out).to(dtype=cache.dtype)
             write_ids = candidate_ids[:, : min(4, candidate_ids.size(1))]
-            decay_scale = lattice_state.cache_decay_scale * self.decay
             update = write_value.unsqueeze(1).expand(-1, write_ids.size(1), -1) / float(write_ids.size(1))
-            cache_update = update / decay_scale.clamp_min(1e-12)
+            phase = lattice_state.cache_scale_phase
+            if self.decay < 0.125:
+                # Very small (including zero) decay must not divide writes by a
+                # vanishing scale. Materialize the small retained cache instead.
+                cache = cache * (lattice_state.cache_decay_scale * self.decay)
+                decay_scale = torch.ones_like(lattice_state.cache_decay_scale)
+                cache_update = update
+                phase = 0
+            else:
+                decay_scale = lattice_state.cache_decay_scale * self.decay
+                cache_update = update / decay_scale
+                phase += 1
             cache = cache.scatter_add(
                 1,
                 write_ids.unsqueeze(-1).expand(-1, -1, self.r),
                 cache_update,
             )
+            if phase >= self.cache_rebase_interval:
+                cache = cache * decay_scale
+                decay_scale = torch.ones_like(decay_scale)
+                phase = 0
             counts.scatter_add_(
                 1,
                 write_ids.unsqueeze(-1),
@@ -4579,6 +4609,7 @@ class SignatureLatticeAttention(nn.Module):
                 prev_parent_bucket=lattice_state.prev_parent_bucket,
                 prev_signature_bucket=lattice_state.prev_signature_bucket,
                 prev_family_bucket=lattice_state.prev_family_bucket,
+                cache_scale_phase=phase,
             )
             prev_parent = parent_bucket[:, chunk_end - 1]
             prev_signature = sig_bucket[:, chunk_end - 1]
@@ -4597,6 +4628,7 @@ class SignatureLatticeAttention(nn.Module):
                 prev_parent_bucket=prev_parent.detach(),
                 prev_signature_bucket=prev_signature.detach(),
                 prev_family_bucket=prev_family.detach(),
+                cache_scale_phase=phase,
             )
         effective_cache = cache * lattice_state.cache_decay_scale
         if collect_telemetry:
@@ -6586,6 +6618,21 @@ class PrismalWaveModel(nn.Module):
             if self.use_gatetrain
             else None
         )
+        if cfg.binding_adapter_training:
+            self.freeze_binding_backbone()
+
+    def freeze_binding_backbone(self) -> None:
+        """Retain learned weights AND registry promotion state while fitting binding adapters."""
+        if self.bounded_identity_readout is None or not self.bounded_identity_readout.binding_enabled:
+            raise ValueError('Binding adapter training requires lexical_binding_v1.')
+        adapter_roots = tuple('bounded_identity_readout.' + name for name in (
+            'context_query.', 'context_gate.', 'span_projection.', 'span_scale',
+            'surface_projection.', 'applicability.'))
+        for name, parameter in self.named_parameters():
+            if not name.startswith(adapter_roots):
+                parameter.requires_grad_(False)
+        self.registry.observation_updates_enabled = False
+        self.cfg.binding_adapter_training = True
 
     @property
     def token_embedding(self) -> nn.Module:
@@ -7392,6 +7439,8 @@ class PrismalWaveModel(nn.Module):
     def prepare_capacity_for_tokenizer(self, tokenizer: object) -> None:
         if self.shared_signature_bank is not None:
             self.shared_signature_bank.configure(tokenizer)
+        if self.bounded_identity_readout is not None:
+            self.bounded_identity_readout.configure(tokenizer, self.vocab_size)
         router = getattr(self, "router", None)
         registry = getattr(self, "registry", None)
         signature_vocab_size = max(1, int(getattr(tokenizer, "signature_vocab_size", self.signature_vocab_size) or self.signature_vocab_size))
@@ -7471,6 +7520,8 @@ class PrismalWaveModel(nn.Module):
             print("[Prismal] pre-grew transfer capacities: " + ", ".join(expansions), flush=True)
         else:
             print("[Prismal] pre-grew transfer capacities: no expansion required", flush=True)
+        if self.cfg.binding_adapter_training:
+            self.freeze_binding_backbone()
 
     def _signature_family_targets(self, family_ids: torch.Tensor) -> torch.Tensor:
         bucket_vocab = max(1, int(self.signature_bucket_vocab_size))
@@ -9600,9 +9651,11 @@ class PrismalWaveModel(nn.Module):
         output = self._forward_impl(input_ids, *args, **kwargs)
         output.runtime_signature_state = states
         if self.bounded_identity_readout is not None:
+            binding_args = ({'lexical_embeddings': self.construction_embedding}
+                            if self.bounded_identity_readout.binding_enabled else {})
             output.logits, output.bounded_identity_state = self.bounded_identity_readout(
                 output.logits, output.readout_hidden, input_ids, features,
-                self._prismal_tokenizer, self.shared_signature_bank, bounded_identity_state)
+                self._prismal_tokenizer, self.shared_signature_bank, bounded_identity_state, **binding_args)
         return output
 
     def _forward_impl(
