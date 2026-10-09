@@ -274,7 +274,8 @@ class BoundedIdentityReadout(nn.Module):
         self.capacity = cfg.identity_readout_capacity
         self.rule = cfg.identity_readout_rule
         self.candidate_policy = cfg.identity_readout_candidate_policy
-        self.binding_enabled = cfg.identity_readout_binding == 'lexical_binding_v1'
+        self.binding_enabled = cfg.identity_readout_binding in {'lexical_binding_v1', 'lexical_binding_v2'}
+        self.positional_binding = cfg.identity_readout_binding == 'lexical_binding_v2'
         self.context_units = cfg.identity_readout_context_units
         self.query_units = cfg.identity_readout_query_units
         self.binding_confidence = cfg.identity_readout_binding_confidence
@@ -297,6 +298,12 @@ class BoundedIdentityReadout(nn.Module):
             nn.init.eye_(self.span_projection.weight)
             nn.init.zeros_(self.applicability.weight)
             nn.init.zeros_(self.applicability.bias)
+            if self.positional_binding:
+                self.context_slot_logits = nn.Parameter(torch.zeros(self.context_units))
+                self.query_slot_logits = nn.Parameter(torch.zeros(self.query_units))
+                # Migration is exactly neutral until the input router is calibrated.
+                neutral_bias = min(-20., math.log1p(-self.binding_confidence) - 2.)
+                nn.init.constant_(self.applicability.bias, neutral_bias)
             self.register_buffer('surface_ids', torch.tensor(cfg.identity_readout_surface_ids, dtype=torch.long))
             self.surface_projection = None
             if self.surface_ids.numel():
@@ -348,14 +355,28 @@ class BoundedIdentityReadout(nn.Module):
         def identity(ids):
             return F.layer_norm((lexical_embeddings(ids) + bank.encode('token', ids)) / math.sqrt(2.), (d,))
         ids = torch.tensor([e[0] for e in entries], device=device)
-        previous = torch.tensor([list(e[2]) + [tokenizer.pad_id] * (self.context_units - len(e[2]))
-                                 for e in entries], dtype=torch.long, device=device)
         lengths = torch.tensor([len(e[2]) for e in entries], device=device)
-        valid = torch.arange(self.context_units, device=device)[None,:] < lengths[:,None]
-        context = (identity(previous) * valid.unsqueeze(-1)).sum(1) / valid.sum(-1,keepdim=True).clamp_min(1)
-        context = F.layer_norm(context, (d,))
         question = F.layer_norm(identity(ids[-self.query_units:]).mean(0), (d,))
-        span_scores = (self.span_projection(context) * self.span_projection(question)).sum(-1) / math.sqrt(d)
+        if self.positional_binding:
+            # Right-align bounded windows: slot meaning survives short prefixes.
+            aligned = torch.tensor([[tokenizer.pad_id] * (self.context_units - len(e[2])) + list(e[2])
+                                    for e in entries], dtype=torch.long, device=device)
+            mask = torch.arange(self.context_units, device=device)[None,:] >= self.context_units - lengths[:,None]
+            slot_logits = self.context_slot_logits.expand(len(entries), -1)
+            weights = slot_logits.masked_fill(~mask, torch.finfo(slot_logits.dtype).min).softmax(-1) * mask
+            relation = (identity(aligned) * weights.unsqueeze(-1)).sum(1)
+            query_ids = ids[-self.query_units:]
+            query_weights = self.query_slot_logits[-query_ids.numel():].softmax(-1)
+            requested = (identity(query_ids) * query_weights.unsqueeze(-1)).sum(0)
+            span_scores = F.cosine_similarity(self.span_projection(relation),
+                                             (self.span_projection(requested) + self.context_query(question))[None,:], dim=-1) * math.sqrt(d)
+        else:
+            previous = torch.tensor([list(e[2]) + [tokenizer.pad_id] * (self.context_units - len(e[2]))
+                                     for e in entries], dtype=torch.long, device=device)
+            valid = torch.arange(self.context_units, device=device)[None,:] < lengths[:,None]
+            context = (identity(previous) * valid.unsqueeze(-1)).sum(1) / valid.sum(-1,keepdim=True).clamp_min(1)
+            context = F.layer_norm(context, (d,))
+            span_scores = (self.span_projection(context) * self.span_projection(question)).sum(-1) / math.sqrt(d)
         return question, span_scores, identity
 
     def _binding_structure(self, token, unit, runtime_features, bank, identity, hidden):
@@ -440,7 +461,12 @@ class BoundedIdentityReadout(nn.Module):
                         current = current.index_add(0, self.surface_ids, delta)
                     scores=(keys*query).sum(-1)/math.sqrt(keys.size(-1))
                     if self.binding_enabled:
-                        scores = scores + activation * self.span_scale * span_scores
+                        if self.positional_binding:
+                            # A confident relation selects by its context, never the value's identity.
+                            # Uncertain requests interpolate with the retained independent readout.
+                            scores = (1. - activation) * scores + activation * self.span_scale.clamp(-4.,4.).exp() * span_scores
+                        else:
+                            scores = scores + activation * self.span_scale * span_scores
                     attention=F.softmax(scores.float(),-1)
                     copy=torch.zeros_like(current,dtype=torch.float32).scatter_add(0,ids,attention)
                     current=self.mix_probabilities(current,copy,gate)

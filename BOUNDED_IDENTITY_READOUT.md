@@ -301,3 +301,31 @@ are not established. No end-to-end speed improvement is claimed.
 
 See [the binding and registry review](./review_artifacts/BINDING_AND_REGISTRY_RETENTION_20261009.md)
 for checkpoints, comparisons, frozen-state evidence and limitations.
+
+### Context-only relational selection
+
+`identity_readout_binding="lexical_binding_v2"` replaces the active selection
+score with position-aware context/query similarity. Learned softmax weights over
+the two preceding and four recent eligible units preserve order. A shared
+projection and cosine similarity prevent vector magnitude from becoming a
+similarity shortcut. The query has a learned residual; the candidate's own
+identity is excluded from its relational score. A learned bounded log temperature
+controls attention sharpness. Copying still emits the observed token ID through
+the ordinary probability mixture and recurrent generation path.
+
+Confident adapted requests use relational attention; uncertain requests blend
+with the independent readout; confidently retained requests reproduce the old
+scores exactly. v2 initializes applicability off, so migration is neutral even
+though relational temperature starts at one. Calibrate applicability from
+training inputs before answer adaptation. v2 confidence must remain below one
+so a finite initial classifier can select the exactly neutral route.
+v1 checkpoint behavior and the
+`independent_v1` default are unchanged.
+
+The two-seed control improves the diagnosed wider set from 28/48 and 34/48 to
+48/48 in both seeds. Subsequent frozen-weight challenges reach 96/96 crossed
+assignments and 72/72 three-fact questions in both seeds. All seven old layouts
+retain 48/48 with identical output token IDs. This adds six position weights over
+v1, for 110,698 total parameters in this control. See
+[the selection review](./review_artifacts/RELATIONAL_SELECTION_FIX_20261009.md)
+for raw results, checkpoints, verification and remaining limits.

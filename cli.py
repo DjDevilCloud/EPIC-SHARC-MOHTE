@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-rule", choices=("mixture_v1","preserve_structure_v1"), default="mixture_v1")
         p.add_argument("--identity-readout-candidate-policy", choices=("all_bytes_v1", "lexical_bytes_v2"),
                        default=default_cfg.identity_readout_candidate_policy)
-        p.add_argument("--identity-readout-binding", choices=("independent_v1", "lexical_binding_v1"), default="independent_v1")
+        p.add_argument("--identity-readout-binding", choices=("independent_v1", "lexical_binding_v1", "lexical_binding_v2"), default="independent_v1")
         p.add_argument("--identity-readout-context-units", type=int, default=2)
         p.add_argument("--identity-readout-query-units", type=int, default=4)
         p.add_argument("--identity-readout-binding-confidence", type=float, default=.99)

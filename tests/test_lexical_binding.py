@@ -9,6 +9,7 @@ from train import save_checkpoint, load_bundle_from_checkpoint
 from tests import test_runtime_signatures as runtime_fixtures
 
 class LexicalBindingTests(unittest.TestCase):
+    binding_mode='lexical_binding_v1'
     def setup_model(self):
         fixture=runtime_fixtures.RuntimeSignatureTests();fixture.identity_readout=True
         helper,t,m=fixture.setup_model()
@@ -16,7 +17,7 @@ class LexicalBindingTests(unittest.TestCase):
 
     def enable(self,m,t,active=False):
         old=m.bounded_identity_readout
-        m.cfg.identity_readout_binding='lexical_binding_v1'
+        m.cfg.identity_readout_binding=self.binding_mode
         with torch.random.fork_rng():head=BoundedIdentityReadout(m.cfg)
         head.load_state_dict(old.state_dict(),strict=False)
         m.bounded_identity_readout=head;m.prepare_capacity_for_tokenizer(t)
@@ -25,6 +26,10 @@ class LexicalBindingTests(unittest.TestCase):
                 for layer in (head.context_query,head.context_gate,head.surface_projection,head.applicability):
                     layer.weight.normal_(0,.03)
                 head.span_scale.fill_(.7)
+                head.applicability.bias.zero_()
+                if head.positional_binding:
+                    head.context_slot_logits.copy_(torch.linspace(-.3,.3,head.context_units))
+                    head.query_slot_logits.copy_(torch.linspace(-.3,.3,head.query_units))
         return head
 
     def test_zero_migration_and_parameters_bound_before_optimizer(self):
@@ -66,13 +71,18 @@ class LexicalBindingTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 path=save_checkpoint(m,directory,tokenizer=t)
                 restored,_,cfg=load_bundle_from_checkpoint(path,device='cpu',load_training_state=False)
-                self.assertEqual(cfg.identity_readout_binding,'lexical_binding_v1')
+                self.assertEqual(cfg.identity_readout_binding,self.binding_mode)
                 torch.testing.assert_close(full.logits,restored(left.input_ids[None],**vals).logits,atol=0,rtol=0)
         m.train();loss,_=m.compute_loss(left.input_ids[None],left.labels[None],**vals,loss_mask=left.loss_mask[None],collect_telemetry=False);loss.backward()
         for layer in (head.context_query,head.context_gate,head.span_projection,head.surface_projection,head.applicability):
             self.assertIsNotNone(layer.weight.grad)
             self.assertTrue(torch.isfinite(layer.weight.grad).all())
             self.assertGreater(float(layer.weight.grad.abs().sum()),0)
+        if head.positional_binding:
+            for parameter in (head.context_slot_logits,head.query_slot_logits):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+                self.assertGreater(float(parameter.grad.abs().sum()),0.)
 
     def test_memory_eviction_and_branch_isolation_with_neighbors(self):
         helper,t,m=self.setup_model();head=self.enable(m,t,active=True);head.capacity=3
@@ -137,5 +147,53 @@ class LexicalBindingTests(unittest.TestCase):
             self.assertFalse(restored.registry.observation_updates_enabled)
             self.assertFalse(restored.shared_signature_bank.embedding.weight.requires_grad)
             self.assertTrue(restored.bounded_identity_readout.context_query.weight.requires_grad)
+
+class PositionalBindingTests(LexicalBindingTests):
+    binding_mode='lexical_binding_v2'
+
+    def test_neutral_initial_route_respects_configured_confidence(self):
+        helper,t,m=self.setup_model()
+        m.cfg.identity_readout_binding=self.binding_mode
+        m.cfg.identity_readout_binding_confidence=1.-1e-12
+        head=BoundedIdentityReadout(m.cfg)
+        self.assertEqual(float(head.binding_activation(torch.zeros(m.cfg.d_model))),0.)
+        payload=m.cfg.to_dict();payload['identity_readout_binding_confidence']=1.
+        with self.assertRaisesRegex(ValueError,'confidence below 1'):
+            PrismalWaveConfig.from_dict(payload)
+
+    def test_normalized_matching_is_invariant_to_projection_magnitude(self):
+        helper,t,m=self.setup_model();head=self.enable(m,t,active=True)
+        p=t.prepare_generation_hierarchy('red apple green fruit')
+        features,_=m.shared_signature_bank.runtime_features(torch.tensor([p.token_ids]),t)
+        entries=[]
+        for i,token in enumerate(p.token_ids):
+            if head.is_candidate(t.construction_units[token]):
+                entries.append((token,tuple(features[0,i].tolist()),tuple(e[0] for e in entries[-head.context_units:])))
+        with torch.no_grad():
+            head.context_query.weight.zero_()
+            before=head._binding_memory(entries,t,m.shared_signature_bank,m.construction_embedding,torch.device('cpu'))[1]
+            head.span_projection.weight.mul_(100)
+            after=head._binding_memory(entries,t,m.shared_signature_bank,m.construction_embedding,torch.device('cpu'))[1]
+        torch.testing.assert_close(before,after,atol=1e-5,rtol=1e-5)
+        self.assertTrue(torch.isfinite(after).all())
+        self.assertLessEqual(float(after.abs().max()),m.cfg.d_model**.5+1e-5)
+
+    def test_candidate_identity_cannot_override_its_relational_score(self):
+        helper,t,m=self.setup_model();head=self.enable(m,t,active=True)
+        p=t.prepare_generation_hierarchy('red apple green fruit red apple green fruit')
+        features,_=m.shared_signature_bank.runtime_features(torch.tensor([p.token_ids]),t)
+        entries=[]
+        for i,token in enumerate(p.token_ids):
+            if head.is_candidate(t.construction_units[token]):
+                entries.append((token,tuple(features[0,i].tolist()),tuple(e[0] for e in entries[-head.context_units:])))
+        candidate=2
+        self.assertGreater(len(entries)-candidate,head.query_units)
+        changed=list(entries)
+        other=next(e[0] for e in entries if e[0]!=entries[candidate][0])
+        changed[candidate]=(other,entries[candidate][1],entries[candidate][2])
+        with torch.no_grad():
+            a=head._binding_memory(entries,t,m.shared_signature_bank,m.construction_embedding,torch.device('cpu'))[1]
+            b=head._binding_memory(changed,t,m.shared_signature_bank,m.construction_embedding,torch.device('cpu'))[1]
+        torch.testing.assert_close(a[candidate],b[candidate],atol=0,rtol=0)
 
 if __name__=='__main__':unittest.main()

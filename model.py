@@ -6624,10 +6624,11 @@ class PrismalWaveModel(nn.Module):
     def freeze_binding_backbone(self) -> None:
         """Retain learned weights AND registry promotion state while fitting binding adapters."""
         if self.bounded_identity_readout is None or not self.bounded_identity_readout.binding_enabled:
-            raise ValueError('Binding adapter training requires lexical_binding_v1.')
+            raise ValueError('Binding adapter training requires lexical binding.')
         adapter_roots = tuple('bounded_identity_readout.' + name for name in (
             'context_query.', 'context_gate.', 'span_projection.', 'span_scale',
-            'surface_projection.', 'applicability.'))
+            'surface_projection.', 'applicability.', 'context_slot_logits',
+            'query_slot_logits'))
         for name, parameter in self.named_parameters():
             if not name.startswith(adapter_roots):
                 parameter.requires_grad_(False)
