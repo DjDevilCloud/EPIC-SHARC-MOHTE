@@ -265,6 +265,97 @@ class SignatureBankView(nn.Module):
 class IdentityReadoutState:
     entries: list
     role: str = 'outside'
+    words: object = None
+    output_units: object = None
+    binding_cache: object = None
+    source_mask: object = None
+
+
+class WordSpanState:
+    """Request-local causal word boundaries and bounded clause spans; no entity parser."""
+    def __init__(self, capacity=512):
+        self.capacity=capacity
+        self.pending=[]
+        self.clause=[]
+        self.last_clause=[]
+        self.records=[];self.serial=0;self.clause_index=0
+
+    def clone(self):
+        result=WordSpanState(self.capacity)
+        result.pending=list(self.pending);result.clause=list(self.clause);result.last_clause=list(self.last_clause)
+        result.records=list(self.records);result.serial=self.serial;result.clause_index=self.clause_index
+        return result
+
+    def boundary(self, clause=False):
+        if self.pending:
+            self.records.append((self.serial,self.clause_index,tuple(self.pending)));self.serial+=1
+            while sum(len(r[2]) for r in self.records)>self.capacity:self.records.pop(0)
+            self.clause.append(tuple(self.pending));self.pending=[]
+            while sum(map(len,self.clause))>self.capacity:self.clause.pop(0)
+        if clause and self.clause:
+            self.last_clause=list(self.clause);self.clause=[]
+            self.clause_index+=1
+
+    def observe(self, token, unit):
+        if unit.is_lexical:
+            self.pending.append(token)
+            # Explicit bounded memory: an over-capacity word retains its causal tail.
+            self.pending=self.pending[-self.capacity:]
+        elif unit.kind not in {'case','signature'}:
+            self.boundary(clause=unit.text in {'<EOL>','<EOI>'} or any(c in '.!?\n' for c in unit.render))
+
+    def question(self):
+        current=self.clause+([tuple(self.pending)] if self.pending else [])
+        return current or self.last_clause
+
+    def source_candidate_mask(self, entries):
+        """Final observed clause is the query, as in question(); retain earlier sources.
+
+        A one-clause input has no separate source, so keep its original retrieval
+        behavior. No source answer is inferred or required by this partition.
+        """
+        if not self.records:return [True]*len(entries)
+        clauses={serial:clause for serial,clause,_ in self.records}
+        query_clause=self.records[-1][1]
+        mask=[clauses.get(entry[3],query_clause)!=query_clause for entry in entries]
+        return mask if any(mask) else [True]*len(entries)
+
+    @staticmethod
+    def ordered_agreement(question, context):
+        """Longest contiguous identity agreement, over complete words, not ID distances.
+
+        IDs are used solely as exact retrieval keys. Reusable properties and
+        learned semantic scores still handle rewording and nonliteral requests.
+        """
+        best=0;prior=[0]*(len(context)+1)
+        for word in question:
+            row=[0]*(len(context)+1)
+            for j,other in enumerate(context):
+                if word==other:
+                    row[j+1]=prior[j]+1;best=max(best,row[j+1])
+            prior=row
+        return best
+
+
+class WordTaskRouter(nn.Module):
+    """Learned task-cue attention over complete observed question words."""
+    def __init__(self, width, neutral_bias):
+        super().__init__();self.width=width
+        self.attention=nn.Linear(width,1,bias=False)
+        self.classifier=nn.Sequential(nn.Linear(2*width,width),nn.Tanh(),nn.Linear(width,1))
+        nn.init.zeros_(self.attention.weight)
+        with torch.no_grad():
+            self.classifier[0].weight.copy_(torch.cat((torch.eye(width),torch.eye(width)),dim=1)/2)
+        nn.init.zeros_(self.classifier[0].bias);nn.init.zeros_(self.classifier[-1].weight)
+        nn.init.constant_(self.classifier[-1].bias,neutral_bias)
+
+    def forward(self, features):
+        values=features[...,:self.width];mask=features[...,self.width]>0
+        logits=self.attention(values).squeeze(-1)
+        weights=logits.masked_fill(~mask,torch.finfo(logits.dtype).min).softmax(-1)*mask
+        attended=(values*weights.unsqueeze(-1)).sum(-2)
+        mean=(values*mask.unsqueeze(-1)).sum(-2)/mask.sum(-1,keepdim=True).clamp_min(1)
+        return self.classifier(torch.cat((F.layer_norm(mean,(self.width,)),F.layer_norm(attended,(self.width,))),dim=-1))
 
 
 class BoundedIdentityReadout(nn.Module):
@@ -274,8 +365,11 @@ class BoundedIdentityReadout(nn.Module):
         self.capacity = cfg.identity_readout_capacity
         self.rule = cfg.identity_readout_rule
         self.candidate_policy = cfg.identity_readout_candidate_policy
-        self.binding_enabled = cfg.identity_readout_binding in {'lexical_binding_v1', 'lexical_binding_v2'}
-        self.positional_binding = cfg.identity_readout_binding == 'lexical_binding_v2'
+        self.binding_enabled = cfg.identity_readout_binding in {'lexical_binding_v1', 'lexical_binding_v2','word_span_v3','word_span_v4','word_span_v5'}
+        self.word_binding = cfg.identity_readout_binding in {'word_span_v3','word_span_v4','word_span_v5'}
+        self.observed_span_binding = cfg.identity_readout_binding in {'word_span_v4','word_span_v5'}
+        self.native_route = cfg.identity_readout_binding == 'word_span_v5'
+        self.positional_binding = cfg.identity_readout_binding in {'lexical_binding_v2','word_span_v3','word_span_v4','word_span_v5'}
         self.context_units = cfg.identity_readout_context_units
         self.query_units = cfg.identity_readout_query_units
         self.binding_confidence = cfg.identity_readout_binding_confidence
@@ -304,11 +398,32 @@ class BoundedIdentityReadout(nn.Module):
                 # Migration is exactly neutral until the input router is calibrated.
                 neutral_bias = min(-20., math.log1p(-self.binding_confidence) - 2.)
                 nn.init.constant_(self.applicability.bias, neutral_bias)
+            if self.word_binding:
+                self.context_word_attention=nn.Linear(cfg.d_model,1,bias=False)
+                self.question_word_attention=nn.Linear(cfg.d_model,1,bias=False)
+                nn.init.zeros_(self.context_word_attention.weight)
+                nn.init.zeros_(self.question_word_attention.weight)
+                if cfg.identity_readout_ordered_agreement:
+                    self.word_agreement_scale=nn.Parameter(torch.zeros(()))
+            if self.observed_span_binding:
+                self.right_context_projection=nn.Linear(cfg.d_model,cfg.d_model,bias=False)
+                nn.init.zeros_(self.right_context_projection.weight)
+                self.continuation_scale=nn.Parameter(torch.zeros(()))
+            if self.native_route:
+                self.native_query=nn.Linear(cfg.d_model,cfg.d_model,bias=False)
+                self.native_gate=nn.Bilinear(cfg.d_model,cfg.d_model,1,bias=False)
+                self.native_applicability=WordTaskRouter(cfg.d_model,neutral_bias)
+                self.native_scale=nn.Parameter(torch.zeros(()))
+                nn.init.zeros_(self.native_query.weight);nn.init.zeros_(self.native_gate.weight)
+                self.native_surface_projection=None
             self.register_buffer('surface_ids', torch.tensor(cfg.identity_readout_surface_ids, dtype=torch.long))
             self.surface_projection = None
             if self.surface_ids.numel():
                 self.surface_projection = nn.Linear(2 * cfg.d_model, self.surface_ids.numel(), bias=False)
                 nn.init.zeros_(self.surface_projection.weight)
+                if self.native_route:
+                    self.native_surface_projection=nn.Linear(2*cfg.d_model,self.surface_ids.numel(),bias=False)
+                    nn.init.zeros_(self.native_surface_projection.weight)
 
     def configure(self, tokenizer, vocab_size):
         if self.binding_enabled:
@@ -345,6 +460,16 @@ class BoundedIdentityReadout(nn.Module):
             self.surface_projection = projection
             self.surface_ids = torch.tensor(ids, dtype=torch.long, device=self.query.weight.device)
         self._binding_cfg.identity_readout_surface_ids = ids
+        if self.native_route and (self.native_surface_projection is None or ids!=old_ids):
+            native=nn.Linear(2*self.query.in_features,len(ids),bias=False).to(device=self.query.weight.device,dtype=self.query.weight.dtype)
+            nn.init.zeros_(native.weight)
+            if self.native_surface_projection is not None:
+                by_id={token:i for i,token in enumerate(old_ids)}
+                with torch.no_grad():
+                    for row,token in enumerate(ids):
+                        if token in by_id:native.weight[row].copy_(self.native_surface_projection.weight[by_id[token]])
+                native.weight.requires_grad_(self.native_surface_projection.weight.requires_grad)
+            self.native_surface_projection=native
         self._surface_contract = contract
 
     def _binding_memory(self, entries, tokenizer, bank, lexical_embeddings, device):
@@ -379,6 +504,69 @@ class BoundedIdentityReadout(nn.Module):
             span_scores = (self.span_projection(context) * self.span_projection(question)).sum(-1) / math.sqrt(d)
         return question, span_scores, identity
 
+    def _word_binding_memory(self, entries, words, tokenizer, bank, lexical_embeddings, device):
+        """Compositional words share lexical and character features in the existing bank."""
+        d=self.query.in_features
+        def identity(ids):
+            return F.layer_norm((lexical_embeddings(ids)+bank.encode('token',ids))/math.sqrt(2.),(d,))
+        question_words=words.question()
+        contexts=[e[2] for e in entries]
+        right_contexts=[[] for _ in entries]
+        if self.observed_span_binding:
+            if any(len(e)!=5 for e in entries):raise ValueError('Observed-span binding needs its own request state.')
+            records={serial:(clause,index) for index,(serial,clause,_) in enumerate(words.records)}
+            for index,e in enumerate(entries):
+                if e[3] in records:
+                    clause,position=records[e[3]]
+                    for _,other,word in words.records[position+1:position+17]:
+                        if other!=clause:break
+                        right_contexts[index].append(word)
+        unique=list(dict.fromkeys(w for context in contexts+right_contexts+[question_words] for w in context))
+        if not unique:
+            zero=torch.zeros(d,device=device,dtype=self.query.weight.dtype)
+            return zero,torch.zeros(len(entries),device=device),identity
+        addresses={word:i for i,word in enumerate(unique)}
+        vectors=[]
+        for word in unique:
+            ids=torch.tensor(word,device=device)
+            text=tokenizer.decode(list(word),clean_text=False,collapse_structure=False)
+            grams=['word-shape:length='+str(RuntimeStructuralState.bucket(len(text)))]
+            padded='^'+text+'$'
+            for n in (2,3):grams.extend('word-gram:'+padded[i:i+n] for i in range(max(0,len(padded)-n+1)))
+            hashes=torch.tensor([1+stable_key(g)%bank.capacity for g in grams],device=device)
+            vectors.append(F.layer_norm(identity(ids).mean(0)+bank.embedding(hashes).mean(0),(d,)))
+        vectors=torch.stack(vectors)
+        def compose(sequence,attention):
+            if not sequence:return torch.zeros(d,device=device,dtype=vectors.dtype)
+            value=vectors[torch.tensor([addresses[w] for w in sequence],device=device)]
+            return (value*attention(value).squeeze(-1).softmax(-1)[:,None]).sum(0)
+        # Question uses all complete words within the bounded input capacity, not a unit tail.
+        # Keep router/format geometry fixed during adapter fitting; train attention only for matching.
+        question=F.layer_norm(vectors[torch.tensor([addresses[w] for w in question_words],device=device)].mean(0),(d,))
+        requested=compose(question_words,self.question_word_attention)
+        context=torch.stack([compose(c,self.context_word_attention) for c in contexts])
+        if self.observed_span_binding:
+            right=torch.stack([compose(c,self.context_word_attention) for c in right_contexts])
+            if not self.native_route:context=context+self.right_context_projection(right)
+        scores=F.cosine_similarity(self.span_projection(context),
+            (self.span_projection(requested)+self.context_query(question))[None,:],dim=-1)*math.sqrt(d)
+        if self._binding_cfg.identity_readout_ordered_agreement:
+            # Reuse one scalar across all identities and formats. Cache composition
+            # once per input; do not search the source again at every output step.
+            agreement={c:WordSpanState.ordered_agreement(question_words,c) for c in dict.fromkeys(contexts)}
+            scores=scores+self.word_agreement_scale*torch.tensor([agreement[c] for c in contexts],device=device,dtype=scores.dtype)
+        if self.native_route:
+            native_scores=F.cosine_similarity(self.span_projection(context+self.right_context_projection(right)),
+                (self.span_projection(requested)+self.context_query(question)+self.native_query(question))[None,:],dim=-1)*math.sqrt(d)
+            question_vectors=vectors[torch.tensor([addresses[w] for w in question_words],device=device)]
+            # Bounded router preserves both the start/task cue and end/requested span of long clauses.
+            if len(question_vectors)>64:question_vectors=torch.cat((question_vectors[:32],question_vectors[-32:]))
+            route_features=torch.zeros(64,d+1,device=device,dtype=vectors.dtype)
+            route_features[:len(question_vectors),:d]=question_vectors
+            route_features[:len(question_vectors),d]=1
+            return question,scores,identity,native_scores,route_features
+        return question,scores,identity
+
     def _binding_structure(self, token, unit, runtime_features, bank, identity, hidden):
         # Preserve meaningful marker identity while keeping lexical value identity out of formatting.
         control = identity(torch.tensor(token,device=hidden.device)) if not unit.is_lexical else torch.zeros_like(hidden)
@@ -386,6 +574,60 @@ class BoundedIdentityReadout(nn.Module):
 
     def binding_activation(self, question):
         probability = self.applicability(question).sigmoid().squeeze(-1)
+        return self._confidence_activation(probability)
+
+    @staticmethod
+    def retrieval_margin_loss(scores, positive, eligible, margin=2.):
+        """Training-only weak supervision over observed source candidates.
+
+        Answer identity may mark several source occurrences as positive. Query
+        candidates must be excluded by eligible; no output-prefix features enter
+        the scores. This operates before learned attention temperature can hide
+        a fragile source-selection margin behind low token loss.
+        """
+        if margin<=0:raise ValueError('Retrieval margin must be positive')
+        if scores.shape!=positive.shape or scores.shape!=eligible.shape:
+            raise ValueError('Retrieval scores and candidate masks must agree')
+        positive=positive.bool()&eligible.bool();negative=eligible.bool()&~positive
+        if not positive.any(-1).all() or not negative.any(-1).all():
+            raise ValueError('Retrieval supervision needs both positive and competing source candidates')
+        best_positive=scores.masked_fill(~positive,float('-inf')).max(-1).values
+        best_negative=scores.masked_fill(~negative,float('-inf')).max(-1).values
+        return F.relu(margin-best_positive+best_negative).square().mean()
+
+    def calibrate_task_route(self, negative, positive, *, native=False, steps=2000, lr=.003):
+        """Fit an isolated classifier; commit only confidently separated input routes.
+
+        Failed recalibration leaves both the accepted weights and their training
+        flags untouched. Features must come from observed inputs, never answers.
+        """
+        if steps<1 or lr<=0:raise ValueError('Calibration steps and learning rate must be positive')
+        if not self.binding_enabled or (native and not self.native_route):
+            raise ValueError('Requested task route is not available')
+        if not len(negative) or not len(positive):raise ValueError('Both route classes need observed inputs')
+        target=self.native_applicability if native else self.applicability
+        candidate=copy.deepcopy(target).requires_grad_(True)
+        parameter=next(candidate.parameters())
+        negative=negative.detach().to(device=parameter.device,dtype=parameter.dtype)
+        positive=positive.detach().to(device=parameter.device,dtype=parameter.dtype)
+        if not torch.isfinite(negative).all() or not torch.isfinite(positive).all():
+            raise ValueError('Route features must be finite')
+        with torch.enable_grad():
+            optimizer=torch.optim.Adam(candidate.parameters(),lr=lr)
+            for _ in range(steps):
+                optimizer.zero_grad(set_to_none=True)
+                neg=candidate(negative);pos=candidate(positive)
+                loss=.5*F.binary_cross_entropy_with_logits(neg,torch.zeros_like(neg))+.5*F.binary_cross_entropy_with_logits(pos,torch.ones_like(pos))
+                if not torch.isfinite(loss):break
+                loss.backward();optimizer.step()
+        with torch.no_grad():
+            negative_max=float(candidate(negative).sigmoid().max())
+            positive_min=float(candidate(positive).sigmoid().min())
+        accepted=negative_max<=1.-self.binding_confidence and positive_min>=self.binding_confidence
+        if accepted:target.load_state_dict(candidate.state_dict())
+        return dict(accepted=accepted,negative_max=negative_max,positive_min=positive_min,steps=steps)
+
+    def _confidence_activation(self, probability):
         # Confident retained-task routing is exactly neutral; uncertain requests stay blended.
         return torch.where(probability <= 1. - self.binding_confidence, torch.zeros_like(probability),
                            torch.where(probability >= self.binding_confidence, torch.ones_like(probability), probability))
@@ -415,23 +657,47 @@ class BoundedIdentityReadout(nn.Module):
         self.configure(tokenizer,logits.size(-1))
         if states is not None and len(states) != input_ids.size(0):
             raise ValueError('Identity readout state batch size differs from input.')
-        states = [IdentityReadoutState(list(s.entries), s.role) for s in states] if states is not None else [
+        states = [IdentityReadoutState(list(s.entries), s.role, s.words.clone() if s.words is not None else None,
+                                      list(s.output_units) if s.output_units is not None else None,s.binding_cache,s.source_mask) for s in states] if states is not None else [
             IdentityReadoutState([]) for _ in range(input_ids.size(0))]
         rows=[]
         feature_rows=features.tolist()
         for row,(tokens,state) in enumerate(zip(input_ids.tolist(),states)):
             steps=[]
             binding_memory = None
+            cache_stamp=None
+            if self.binding_enabled and self.word_binding and not torch.is_grad_enabled():
+                cache_stamp=(id(self),id(bank),id(lexical_embeddings),
+                    tuple(p._version for p in self.parameters()),tuple(p._version for p in lexical_embeddings.parameters()),bank.embedding.weight._version)
+                if state.binding_cache is not None and state.binding_cache[0]==cache_stamp:
+                    binding_memory=state.binding_cache[1]
             for position,token in enumerate(tokens):
                 unit=tokenizer.construction_units[token]
                 if token==tokenizer.bos_id or unit.text=='<BOI>':
                     state.entries=[]
+                    if self.word_binding:state.words=WordSpanState(self.capacity)
+                    if self.observed_span_binding:state.output_units=[]
                     binding_memory = None
+                    state.binding_cache=None
+                    state.source_mask=None
                     state.role='input' if unit.text=='<BOI>' else 'outside'
                 elif unit.text=='<EOI>':state.role='outside'
                 elif unit.text=='<BOO>':state.role='output'
                 elif unit.text=='<EOO>':state.role='outside'
-                if state.role=='input' and self.is_candidate(unit):
+                if self.word_binding and (state.role=='input' or unit.text=='<EOI>'):
+                    if state.words is None:raise ValueError('Word binding requires its own request state; restart from input.')
+                    if self.is_candidate(unit):
+                        # All fragments in one word receive the same complete preceding-word context.
+                        context=tuple(state.words.clause[-16:])
+                        entry=(token,tuple(feature_rows[row][position]),context)
+                        if self.observed_span_binding:entry+=(state.words.serial,tuple(e[0] for e in state.entries[-8:]))
+                        state.entries.append(entry)
+                        state.entries=state.entries[-self.capacity:]
+                    state.words.observe(token,unit)
+                    binding_memory=None
+                    state.binding_cache=None
+                    state.source_mask=None
+                elif state.role=='input' and self.is_candidate(unit):
                     entry = (token, tuple(feature_rows[row][position]))
                     if self.binding_enabled:
                         entry += (tuple(e[0] for e in state.entries[-self.context_units:]),)
@@ -439,6 +705,8 @@ class BoundedIdentityReadout(nn.Module):
                     state.entries=state.entries[-self.capacity:]
                     binding_memory = None
                 current=logits[row,position]
+                if self.observed_span_binding and state.role=='output' and unit.is_lexical:
+                    state.output_units=(state.output_units+[token])[-8:]
                 if state.role=='output' and state.entries:
                     ids=torch.tensor([e[0] for e in state.entries],device=logits.device)
                     properties=torch.tensor([e[1] for e in state.entries],device=logits.device)
@@ -450,8 +718,10 @@ class BoundedIdentityReadout(nn.Module):
                     gate=self.gate(h).float().squeeze(-1)
                     if self.binding_enabled:
                         if binding_memory is None:
-                            binding_memory = self._binding_memory(state.entries, tokenizer, bank, lexical_embeddings, logits.device)
-                        question, span_scores, identity = binding_memory
+                            binding_memory = (self._word_binding_memory(state.entries,state.words,tokenizer,bank,lexical_embeddings,logits.device)
+                                if self.word_binding else self._binding_memory(state.entries, tokenizer, bank, lexical_embeddings, logits.device))
+                            if cache_stamp is not None:state.binding_cache=(cache_stamp,binding_memory)
+                        question, span_scores, identity = binding_memory[:3]
                         activation = self.binding_activation(question)
                         # Formatting depends on causal properties, not a particular value's identity.
                         structure = self._binding_structure(token, unit, features[row,position], bank, identity, h)
@@ -459,6 +729,10 @@ class BoundedIdentityReadout(nn.Module):
                         gate = (self.gate(h) + activation * self.context_gate(structure,question)).float().squeeze(-1)
                         delta = activation * self.surface_projection(torch.cat((structure, structure * question)))
                         current = current.index_add(0, self.surface_ids, delta)
+                        if self.native_route:
+                            native_activation=self._confidence_activation(self.native_applicability(binding_memory[4]).sigmoid().squeeze(-1))
+                            gate=gate+native_activation*self.native_gate(structure,question).squeeze(-1)
+                            current=current.index_add(0,self.surface_ids,native_activation*self.native_surface_projection(torch.cat((structure,structure*question))))
                     scores=(keys*query).sum(-1)/math.sqrt(keys.size(-1))
                     if self.binding_enabled:
                         if self.positional_binding:
@@ -467,7 +741,28 @@ class BoundedIdentityReadout(nn.Module):
                             scores = (1. - activation) * scores + activation * self.span_scale.clamp(-4.,4.).exp() * span_scores
                         else:
                             scores = scores + activation * self.span_scale * span_scores
+                        if self.native_route:
+                            scores=(1.-native_activation)*scores+native_activation*(self.span_scale+self.native_scale).clamp(-4.,4.).exp()*binding_memory[3]
+                        if self.observed_span_binding and state.output_units:
+                            # Exact observed prefix equality verifies a possible source continuation;
+                            # learned strength competes with ordinary attention, never forces a copy.
+                            matches=[]
+                            for entry in state.entries:
+                                length=0
+                                for n in range(1,min(len(entry[4]),len(state.output_units))+1):
+                                    if tuple(state.output_units[-n:])==entry[4][-n:]:length=n
+                                matches.append(length)
+                            scores=scores+(native_activation if self.native_route else activation)*self.continuation_scale*torch.tensor(matches,device=logits.device,dtype=scores.dtype)
                     attention=F.softmax(scores.float(),-1)
+                    if self.observed_span_binding and self._binding_cfg.identity_readout_exclude_query_candidates:
+                        if state.source_mask is None or state.source_mask.device!=logits.device:
+                            state.source_mask=torch.tensor(state.words.source_candidate_mask(state.entries),device=logits.device,dtype=torch.bool)
+                        source_mask=state.source_mask
+                        source_attention=F.softmax(scores.float().masked_fill(~source_mask,float('-inf')),-1)
+                        # Independent legacy retrieval has its own input contract. Apply
+                        # the source/query partition only through the learned QA routes.
+                        partition_strength=torch.maximum(activation,native_activation) if self.native_route else activation
+                        attention=(1.-partition_strength)*attention+partition_strength*source_attention
                     copy=torch.zeros_like(current,dtype=torch.float32).scatter_add(0,ids,attention)
                     current=self.mix_probabilities(current,copy,gate)
                 steps.append(current)

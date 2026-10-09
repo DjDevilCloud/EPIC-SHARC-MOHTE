@@ -6628,10 +6628,18 @@ class PrismalWaveModel(nn.Module):
         adapter_roots = tuple('bounded_identity_readout.' + name for name in (
             'context_query.', 'context_gate.', 'span_projection.', 'span_scale',
             'surface_projection.', 'applicability.', 'context_slot_logits',
-            'query_slot_logits'))
+            'query_slot_logits','context_word_attention.','question_word_attention.',
+            'right_context_projection.','continuation_scale','word_agreement_scale'))
+        if self.bounded_identity_readout.native_route:
+            adapter_roots=tuple('bounded_identity_readout.'+name for name in (
+                'right_context_projection.','continuation_scale','native_query.','native_gate.',
+                'native_applicability.','native_scale','native_surface_projection.'))
         for name, parameter in self.named_parameters():
             if not name.startswith(adapter_roots):
                 parameter.requires_grad_(False)
+        if self.bounded_identity_readout.native_route:
+            # Routing is a separately calibrated input-only classifier, including after reload.
+            self.bounded_identity_readout.native_applicability.requires_grad_(False)
         self.registry.observation_updates_enabled = False
         self.cfg.binding_adapter_training = True
 
@@ -7383,8 +7391,12 @@ class PrismalWaveModel(nn.Module):
         return self.gate_controller if self.use_gate else None
 
     def _ensure_position_embedding_capacity(self, required_size: int) -> None:
-        if self.cfg.max_seq_len <= 0:
+        if self.cfg.max_seq_len <= 0 and self.cfg.use_absolute_position_embeddings:
             self.position_embedding.ensure_capacity(required_size)
+
+    def _position_context(self, positions):
+        # Disabled position features must not allocate or evaluate a growing unused table.
+        return self.position_embedding(positions) if self.cfg.use_absolute_position_embeddings else 0.
 
     def _path_vectors(self, device: torch.device) -> torch.Tensor:
         if self.use_torus_core and self.torus_core is not None:
@@ -8025,7 +8037,7 @@ class PrismalWaveModel(nn.Module):
                 pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device).unsqueeze(0)
                 if self.cfg.max_seq_len > 0:
                     pos = pos.clamp(max=self.cfg.max_seq_len - 1)
-                return pooled + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings))
+                return pooled + self._position_context(pos)
 
             if timings is not None:
                 hidden = _profile_stage(
@@ -8052,10 +8064,10 @@ class PrismalWaveModel(nn.Module):
                     input_ids.device,
                     timings,
                     "timing_encode_embed_ms",
-                    lambda: self.construction_embedding(input_ids) + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings)),
+                    lambda: self.construction_embedding(input_ids) + self._position_context(pos),
                 )
             else:
-                hidden = self.construction_embedding(input_ids) + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings))
+                hidden = self.construction_embedding(input_ids) + self._position_context(pos)
         hierarchy_context = self._hierarchy_embedding_context(
             input_ids,
             signature_ids=signature_ids,
@@ -8145,7 +8157,7 @@ class PrismalWaveModel(nn.Module):
             position_index = max(0, int(position_index))
             self._ensure_position_embedding_capacity(position_index + 1)
         pos = torch.full((batch, 1), position_index, device=input_ids.device, dtype=torch.long)
-        hidden = self.construction_embedding(input_ids[:, :1]) + (self.position_embedding(pos) * float(self.cfg.use_absolute_position_embeddings))
+        hidden = self.construction_embedding(input_ids[:, :1]) + self._position_context(pos)
         hierarchy_context = self._hierarchy_embedding_context(
             input_ids[:, :1],
             signature_ids=signature_ids[:, :1] if signature_ids is not None else None,

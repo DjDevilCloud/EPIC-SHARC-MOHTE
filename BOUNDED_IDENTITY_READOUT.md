@@ -329,3 +329,57 @@ retain 48/48 with identical output token IDs. This adds six position weights ove
 v1, for 110,698 total parameters in this control. See
 [the selection review](./review_artifacts/RELATIONAL_SELECTION_FIX_20261009.md)
 for raw results, checkpoints, verification and remaining limits.
+
+### Complete-word and native task-cue paths
+
+`word_span_v3` groups lexical fragments into causal words and uses bounded
+clause contexts plus the final question clause. Existing lexical embeddings and
+character ngram properties share the existing bank; whole-profile registration
+is not required. `word_span_v5` freezes this branch and adds input-only learned
+task-cue routing, observed right context, learned source-prefix continuation,
+and separate native query/gate/format residuals. In adapter-only mode the native
+router stays frozen on reload; its explicit calibration phase enables it
+temporarily. Both modes retain ordinary recurrence and token generation.
+
+The matched two-seed control reaches 24/24 on all three tested longer-name groups
+while the equally trained unit-window path fails. Native curriculum reaches 3/3
+one-word answers in both seeds, then 4/6 and 6/6 training answers, while retaining
+the longer-name gains and all old-layout outputs. Disjoint native QA is still
+0/22. Inference composes input memory once per request, and disabled absolute
+position features no longer grow an unused table. See
+[the word-span and native review](./review_artifacts/WORD_SPANS_AND_NATIVE_CURRICULUM_20261009.md)
+for checkpoints, raw evidence, parameter/buffer retention and remaining limits.
+
+## Calibration and source/query experiments
+
+`calibrate_task_route` trains a private classifier and commits only after its
+training inputs meet both confidence thresholds. Failed calibration retains
+the accepted weights and gradient flags. Always replay retained raw outputs:
+training-input separation alone does not establish held-out routing stability.
+
+`identity_readout_exclude_query_candidates` is an opt-in v4/v5 experiment. It
+uses the existing final-clause question assumption and a request-cached source
+mask, blended through the learned QA route so independent legacy behavior stays
+neutral. The partition-only experiment did not improve accuracy. It is enabled
+alongside ordered entity agreement in the newer controlled baseline. See
+[the boundary and grammar control](review_artifacts/ANSWER_BOUNDARIES_AND_GRAMMAR_20261009.md).
+
+## Ordered entity ownership baseline
+
+`identity_readout_ordered_agreement` adds one zero-initialized, shared scalar for
+exact contiguous agreement of complete source/query words. Existing semantic
+and structural bank features remain in use; IDs serve only as identity keys.
+This preserves word order and modifiers that pooled attention can lose. The
+source/query partition prevents the query prefix from authorizing source copying.
+Both features default off for checkpoint compatibility.
+
+Training-only `retrieval_margin_loss` separates positive source-answer identity
+groups from competing eligible source candidates before attention temperature.
+Question candidates are ineligible. Deliberately ambiguous training names,
+including reversed word orders, give this feature useful supervision while all
+preexisting learned state remains frozen. Native relation scores are unchanged.
+The scalar stays frozen during v5 native-adapter fitting, protecting retained
+word binding. See
+[the stable controlled baseline](review_artifacts/FUNCTIONAL_BINDING_BASELINE_20261009.md)
+for both-seed retention, fresh entity combinations, reload/streaming verification,
+recommended checkpoints and remaining native-QA limitations.

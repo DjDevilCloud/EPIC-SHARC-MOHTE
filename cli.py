@@ -121,7 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-rule", choices=("mixture_v1","preserve_structure_v1"), default="mixture_v1")
         p.add_argument("--identity-readout-candidate-policy", choices=("all_bytes_v1", "lexical_bytes_v2"),
                        default=default_cfg.identity_readout_candidate_policy)
-        p.add_argument("--identity-readout-binding", choices=("independent_v1", "lexical_binding_v1", "lexical_binding_v2"), default="independent_v1")
+        p.add_argument("--identity-readout-binding", choices=("independent_v1", "lexical_binding_v1", "lexical_binding_v2", "word_span_v3", "word_span_v4", "word_span_v5"), default="independent_v1")
+        p.add_argument("--identity-readout-exclude-query-candidates", action="store_true", help="Exclude final query clause from observed-span source copying")
+        p.add_argument("--identity-readout-ordered-agreement", action="store_true", help="Learn ordered complete-word agreement in bounded retrieval")
         p.add_argument("--identity-readout-context-units", type=int, default=2)
         p.add_argument("--identity-readout-query-units", type=int, default=4)
         p.add_argument("--identity-readout-binding-confidence", type=float, default=.99)
@@ -746,6 +748,8 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         identity_readout_rule=getattr(args, "identity_readout_rule", "mixture_v1"),
         identity_readout_candidate_policy=getattr(args, "identity_readout_candidate_policy", "lexical_bytes_v2"),
         identity_readout_binding=getattr(args, "identity_readout_binding", "independent_v1"),
+        identity_readout_exclude_query_candidates=getattr(args, "identity_readout_exclude_query_candidates", False),
+        identity_readout_ordered_agreement=getattr(args, "identity_readout_ordered_agreement", False),
         identity_readout_context_units=getattr(args, "identity_readout_context_units", 2),
         identity_readout_query_units=getattr(args, "identity_readout_query_units", 4),
         identity_readout_binding_confidence=getattr(args, "identity_readout_binding_confidence", .99),

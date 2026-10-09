@@ -27,7 +27,9 @@ class LexicalBindingTests(unittest.TestCase):
                     layer.weight.normal_(0,.03)
                 head.span_scale.fill_(.7)
                 head.applicability.bias.zero_()
-                if head.positional_binding:
+                if head.native_route:
+                    head.native_applicability.classifier[-1].weight.normal_(0,.03);head.native_applicability.classifier[-1].bias.zero_()
+                if head.positional_binding and not head.word_binding:
                     head.context_slot_logits.copy_(torch.linspace(-.3,.3,head.context_units))
                     head.query_slot_logits.copy_(torch.linspace(-.3,.3,head.query_units))
         return head
@@ -60,7 +62,7 @@ class LexicalBindingTests(unittest.TestCase):
             first=next(i for i,(a,b) in enumerate(zip(left.input_ids,right.input_ids)) if a!=b)
             torch.testing.assert_close(full.logits[:,:first],alternative.logits[:,:first],atol=0,rtol=0)
             self.assertEqual(full.bounded_identity_state[0].entries,alternative.bounded_identity_state[0].entries)
-            self.assertTrue(all(len(e)==3 and len(e[2])<=head.context_units for e in full.bounded_identity_state[0].entries))
+            self.assertTrue(all(len(e)==(5 if head.observed_span_binding else 3) and len(e[2])<=(16 if head.word_binding else head.context_units) for e in full.bounded_identity_state[0].entries))
             state=identity=slots=lattice=None;parts=[]
             for i in range(left.input_ids.numel()):
                 _,slots,o=m.forward_incremental(left.input_ids[i:i+1][None],
@@ -79,7 +81,8 @@ class LexicalBindingTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(layer.weight.grad).all())
             self.assertGreater(float(layer.weight.grad.abs().sum()),0)
         if head.positional_binding:
-            for parameter in (head.context_slot_logits,head.query_slot_logits):
+            parameters=(head.context_word_attention.weight,head.question_word_attention.weight) if head.word_binding else (head.context_slot_logits,head.query_slot_logits)
+            for parameter in parameters:
                 self.assertIsNotNone(parameter.grad)
                 self.assertTrue(torch.isfinite(parameter.grad).all())
                 self.assertGreater(float(parameter.grad.abs().sum()),0.)
@@ -96,7 +99,7 @@ class LexicalBindingTests(unittest.TestCase):
             self.assertEqual(len(entries),3)
             eligible=[i for i in p.token_ids if head.is_candidate(t.construction_units[i])]
             self.assertEqual([e[0] for e in entries],eligible[-3:])
-            self.assertEqual(entries[-1][2],tuple(eligible[-3:-1]))
+            if not head.word_binding:self.assertEqual(entries[-1][2],tuple(eligible[-3:-1]))
 
     def test_surface_structure_does_not_encode_lexical_value_identity(self):
         helper,t,m=self.setup_model()
@@ -121,6 +124,8 @@ class LexicalBindingTests(unittest.TestCase):
         s=_build_window_samples_from_text(t,'<BOI>red apple<EOI><BOO>red apple<EOO>',seq_len=256,max_samples=1,hierarchy_vector_dtype='float32')[0]
         with torch.no_grad():
             head.applicability.weight.zero_();head.applicability.bias.fill_(-20)
+            if head.native_route:
+                head.native_applicability.classifier[-1].weight.zero_();head.native_applicability.classifier[-1].bias.fill_(-20)
             head.binding_enabled=False;retained=m(s.input_ids[None],**helper.inputs(s)).logits
             head.binding_enabled=True;neutral=m(s.input_ids[None],**helper.inputs(s)).logits
             torch.testing.assert_close(retained,neutral,atol=0,rtol=0)
@@ -140,13 +145,15 @@ class LexicalBindingTests(unittest.TestCase):
         for name,value in m.registry.named_buffers():torch.testing.assert_close(value,buffers[name],atol=0,rtol=0)
         self.assertFalse(m.shared_signature_bank.embedding.weight.requires_grad)
         self.assertIsNone(m.shared_signature_bank.embedding.weight.grad)
-        self.assertGreater(float(head.context_query.weight.grad.abs().sum()),0.)
+        adapter=head.native_query if head.native_route else head.context_query
+        self.assertGreater(float(adapter.weight.grad.abs().sum()),0.)
         with tempfile.TemporaryDirectory() as directory:
             restored,_,cfg=load_bundle_from_checkpoint(save_checkpoint(m,directory,tokenizer=t),device='cpu',load_training_state=False)
             self.assertTrue(cfg.binding_adapter_training)
             self.assertFalse(restored.registry.observation_updates_enabled)
             self.assertFalse(restored.shared_signature_bank.embedding.weight.requires_grad)
-            self.assertTrue(restored.bounded_identity_readout.context_query.weight.requires_grad)
+            restored_head=restored.bounded_identity_readout
+            self.assertTrue((restored_head.native_query if head.native_route else restored_head.context_query).weight.requires_grad)
 
 class PositionalBindingTests(LexicalBindingTests):
     binding_mode='lexical_binding_v2'

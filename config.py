@@ -44,6 +44,8 @@ class PrismalWaveConfig:
     identity_readout_rule: str = "mixture_v1"
     identity_readout_candidate_policy: str = "lexical_bytes_v2"
     identity_readout_binding: str = "independent_v1"
+    identity_readout_exclude_query_candidates: bool = False
+    identity_readout_ordered_agreement: bool = False
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
     identity_readout_binding_confidence: float = 0.99
@@ -349,11 +351,15 @@ class PrismalWaveConfig:
             raise ValueError('identity_readout_rule must be mixture_v1 or preserve_structure_v1')
         if self.identity_readout_candidate_policy not in {'all_bytes_v1', 'lexical_bytes_v2'}:
             raise ValueError('identity_readout_candidate_policy must be all_bytes_v1 or lexical_bytes_v2')
-        if self.identity_readout_binding not in {'independent_v1', 'lexical_binding_v1', 'lexical_binding_v2'}:
-            raise ValueError('identity_readout_binding must be independent_v1, lexical_binding_v1 or lexical_binding_v2')
+        if self.identity_readout_binding not in {'independent_v1', 'lexical_binding_v1', 'lexical_binding_v2','word_span_v3','word_span_v4','word_span_v5'}:
+            raise ValueError('Unknown identity_readout_binding mode')
+        if self.identity_readout_exclude_query_candidates and self.identity_readout_binding not in {'word_span_v4','word_span_v5'}:
+            raise ValueError('Query-candidate exclusion requires observed word spans')
+        if self.identity_readout_ordered_agreement and self.identity_readout_binding not in {'word_span_v3','word_span_v4','word_span_v5'}:
+            raise ValueError('Ordered agreement requires complete word spans')
         if self.binding_adapter_training and self.identity_readout_binding == 'independent_v1':
             raise ValueError('binding_adapter_training requires lexical binding')
-        if self.identity_readout_binding in {'lexical_binding_v1', 'lexical_binding_v2'}:
+        if self.identity_readout_binding in {'lexical_binding_v1', 'lexical_binding_v2','word_span_v3','word_span_v4','word_span_v5'}:
             if not self.use_bounded_identity_readout or self.identity_readout_candidate_policy != 'lexical_bytes_v2':
                 raise ValueError('lexical binding requires bounded identity readout with lexical_bytes_v2')
             if self.identity_readout_rule != 'mixture_v1':
@@ -363,7 +369,7 @@ class PrismalWaveConfig:
                 raise ValueError('binding windows must be positive and no larger than readout capacity')
             if not .5 < self.identity_readout_binding_confidence <= 1.:
                 raise ValueError('binding confidence must be greater than .5 and at most 1')
-            if self.identity_readout_binding == 'lexical_binding_v2' and self.identity_readout_binding_confidence == 1.:
+            if self.identity_readout_binding in {'lexical_binding_v2','word_span_v3','word_span_v4','word_span_v5'} and self.identity_readout_binding_confidence == 1.:
                 raise ValueError('lexical_binding_v2 requires confidence below 1 for neutral migration')
         if len(set(self.identity_readout_surface_ids)) != len(self.identity_readout_surface_ids) or any(
             not isinstance(i, int) or i < 0 or (self.vocab_size > 0 and i >= self.vocab_size)
