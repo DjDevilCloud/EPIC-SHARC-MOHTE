@@ -55,6 +55,7 @@ class PrismalWaveConfig:
     identity_readout_source_boundary_readout: str = 'residual_v1'
     identity_readout_source_ownership: bool = False
     identity_readout_source_start_features: str = 'word_neighbors_v1'
+    identity_readout_word_path_readout: str = 'bias_v1'
     identity_readout_source_boundary_adapter: bool = False
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
@@ -383,8 +384,12 @@ class PrismalWaveConfig:
             raise ValueError('Categorical source boundaries require categorical native spans')
         if self.identity_readout_source_ownership and (not self.identity_readout_native_word_paths or not self.identity_readout_exclude_query_candidates):
             raise ValueError('Source ownership requires native word paths and source/query partitioning')
-        if self.identity_readout_source_start_features not in {'word_neighbors_v1','span_roles_v2'}:
+        if self.identity_readout_source_start_features not in {'word_neighbors_v1','span_roles_v2','context_roles_v3'}:
             raise ValueError('Unknown source-start features')
+        if self.identity_readout_word_path_readout not in {'bias_v1','posterior_v2'}:
+            raise ValueError('Unknown word-path readout')
+        if self.identity_readout_word_path_readout=='posterior_v2' and not self.identity_readout_native_word_paths:
+            raise ValueError('Posterior word-path readout requires native word paths')
         if self.identity_readout_source_boundary_adapter and (not self.identity_readout_source_boundaries or self.identity_readout_source_boundary_readout!='categorical_v1'):
             raise ValueError('Source boundary adapter requires categorical source boundaries')
         if not .5 < self.identity_readout_native_span_confidence <= 1.:

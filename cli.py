@@ -132,7 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-source-boundaries", action="store_true", help="Add observed source separator and endpoint evidence to native boundaries")
         p.add_argument("--identity-readout-source-boundary-readout", choices=("residual_v1","categorical_v1"), default="residual_v1")
         p.add_argument("--identity-readout-source-ownership", action="store_true", help="Preserve a source-start posterior and verify occurrence continuation")
-        p.add_argument("--identity-readout-source-start-features", choices=("word_neighbors_v1","span_roles_v2"), default="word_neighbors_v1")
+        p.add_argument("--identity-readout-source-start-features", choices=("word_neighbors_v1","span_roles_v2","context_roles_v3"), default="word_neighbors_v1")
+        p.add_argument("--identity-readout-word-path-readout", choices=("bias_v1","posterior_v2"), default="bias_v1")
         p.add_argument("--identity-readout-source-boundary-adapter", action="store_true", help="Confident grammar proposals retain the validated source formatter on uncertainty")
         p.add_argument("--identity-readout-context-units", type=int, default=2)
         p.add_argument("--identity-readout-query-units", type=int, default=4)
@@ -769,6 +770,7 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         identity_readout_source_boundary_readout=getattr(args, "identity_readout_source_boundary_readout", 'residual_v1'),
         identity_readout_source_ownership=getattr(args, "identity_readout_source_ownership", False),
         identity_readout_source_start_features=getattr(args, "identity_readout_source_start_features", 'word_neighbors_v1'),
+        identity_readout_word_path_readout=getattr(args, "identity_readout_word_path_readout", 'bias_v1'),
         identity_readout_source_boundary_adapter=getattr(args, "identity_readout_source_boundary_adapter", False),
         identity_readout_context_units=getattr(args, "identity_readout_context_units", 2),
         identity_readout_query_units=getattr(args, "identity_readout_query_units", 4),

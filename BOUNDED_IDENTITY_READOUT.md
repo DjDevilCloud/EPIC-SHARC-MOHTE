@@ -516,3 +516,27 @@ controlled token IDs. Final untrained names/wordings score 15/24 and 21/24;
 broader QA scores 0/22 and 1/22, including a held database-answer regression.
 This is a controlled baseline, not general QA acceptance. See
 [the ownership repair report](review_artifacts/SOURCE_OWNERSHIP_REPAIR_20261010.md).
+
+## Verified source-word posterior repair (2026-10-10)
+
+The earlier 15/24 and 21/24 confirmation scores above describe the parent checkpoint.
+The next repair separates selecting a source word from reading its lexical units.
+`--identity-readout-word-path-readout posterior_v2` carries word posterior mass
+onto that occurrence's verified next fragment, rather than adding a bias to all
+source units. It preserves uncertainty across words and falls back when unsupported.
+`bias_v1` remains the default for compatibility and controlled comparison.
+
+`--identity-readout-source-start-features context_roles_v3` omits candidate spelling,
+fragment count, next value identity and span length from the start correction.
+Preceding complete words and clause/line roles remain. Source-boundary features
+also retain supported cursor ownership over repeated suffix occurrences.
+
+After format variation and boundary calibration with the final selection path,
+both seeds pass 24/24 previously failing development cases and 24/24 separately
+reserved fragmented-name/length cases. This establishes controlled span transfer;
+general native QA and generation speed require separate acceptance.
+Final acceptance retains 492 prior native output sequences and 840 controlled
+sequences per seed. Broader QA scores 1/22 and 2/22; the database regression is
+recovered, but broader transfer remains a separate blocker to unrestricted scaling.
+See [the verified continuation repair](review_artifacts/REMAINING_ARCHITECTURE_REPAIR_20261010.md)
+and its executable retained-task gate for checkpoint provenance and final diagnostics.

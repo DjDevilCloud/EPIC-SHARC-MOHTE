@@ -601,7 +601,7 @@ class BoundedIdentityReadout(nn.Module):
                         if other!=clause:break
                         right_contexts[index].append(word)
         unique=list(dict.fromkeys(w for context in contexts+right_contexts+[question_words] for w in context))
-        if self._binding_cfg.identity_readout_source_ownership and self._binding_cfg.identity_readout_source_start_features=='span_roles_v2':
+        if self._binding_cfg.identity_readout_source_ownership and self._binding_cfg.identity_readout_source_start_features in {'span_roles_v2','context_roles_v3'}:
             unique=list(dict.fromkeys(unique+[word for _,_,word in words.records]))
         if not unique:
             zero=torch.zeros(d,device=device,dtype=self.query.weight.dtype)
@@ -676,21 +676,26 @@ class BoundedIdentityReadout(nn.Module):
                     return vectors[addresses[sequence[index]]] if len(sequence)>=abs(index) and sequence else torch.zeros(d,device=device,dtype=vectors.dtype)
                 role_keys=[]
                 owned_contexts=contexts
-                if self._binding_cfg.identity_readout_source_start_features=='span_roles_v2':
+                context_roles=self._binding_cfg.identity_readout_source_start_features=='context_roles_v3'
+                if self._binding_cfg.identity_readout_source_start_features in {'span_roles_v2','context_roles_v3'}:
                     record_positions={serial:i for i,(serial,_,_) in enumerate(words.records)}
                     owned_contexts=[c or [r[2] for r in words.records[max(0,record_positions.get(e[3],0)-2):record_positions.get(e[3],0)]] for e,c in zip(entries,contexts)]
                 for e,c in zip(entries,contexts):
                     gap=words.following.get(e[3],[])
                     marker=tokenizer.construction_units[gap[0]].text if gap else 'unobserved'
                     keys=['next='+marker,'clause_start='+str(not c)]
-                    if self._binding_cfg.identity_readout_source_start_features=='span_roles_v2':
+                    if context_roles:keys=['clause_start='+str(not c)]
+                    if self._binding_cfg.identity_readout_source_start_features in {'span_roles_v2','context_roles_v3'}:
                         index=record_positions.get(e[3]);clause=words.records[index][1] if index is not None else None;group=[r for r in words.records if clause is not None and r[1]==clause];ending=words.following.get(group[-1][0],[]) if group else []
                         end_marker=tokenizer.construction_units[ending[0]].text if ending else 'unobserved'
                         line_end=any(tokenizer.construction_units[x].text=='<EOL>' for x in ending)
                         keys+=['span_end='+end_marker,'span_line_end='+str(line_end),'span_words='+str(RuntimeStructuralState.bucket(len(group)))]
+                        if context_roles:keys.pop()  # Answer length is not a relation cue.
                     role_keys.append([1+stable_key('source_start:'+key)%bank.capacity for key in keys])
                 roles=bank.embedding(torch.tensor(role_keys,device=device)).mean(1)
-                start_features=torch.cat((torch.stack([neighbor(c,-1) for c in owned_contexts]),torch.stack([neighbor(c,-2) for c in owned_contexts]),torch.stack([neighbor(c,0) for c in right_contexts]),signatures+roles),dim=-1)
+                right=torch.zeros_like(roles) if context_roles else torch.stack([neighbor(c,0) for c in right_contexts])
+                properties=roles if context_roles else signatures+roles
+                start_features=torch.cat((torch.stack([neighbor(c,-1) for c in owned_contexts]),torch.stack([neighbor(c,-2) for c in owned_contexts]),right,properties),dim=-1)
                 correction=(self.native_span_start(start_features)*question).sum(-1)/math.sqrt(d)
                 return result+(packet,correction)
             return result+(packet,) if packet is not None else result
@@ -968,6 +973,10 @@ class BoundedIdentityReadout(nn.Module):
                                 partition_strength=torch.maximum(activation,native_activation)
                                 word_attention=(1.-partition_strength)*word_attention+partition_strength*source_attention
                             attention=word_attention
+                            if self._binding_cfg.identity_readout_word_path_readout=='posterior_v2':
+                                supported_attention=self.word_path_posterior(state.word_prior,nodes[state.word_node],state.entries,starts)
+                                if bool(supported_attention.sum()>0):
+                                    attention=(1.-native_activation)*attention+native_activation*supported_attention
                         if proposal is not None and bool(cursor_strength>0):
                             attention=(1.-cursor_strength)*attention+cursor_strength*proposal
                         if self._binding_cfg.identity_readout_native_span_boundaries:
@@ -1014,6 +1023,22 @@ class BoundedIdentityReadout(nn.Module):
         result=torch.zeros_like(base,dtype=torch.float32).index_copy(0,self.surface_ids,macro[:-1])
         result[mask]=macro[-1]*lexical
         return result
+
+    @staticmethod
+    def word_path_posterior(prior,node,entries,starts):
+        """Move source-word probability onto that occurrence's next fragment.
+
+        A bias over every source unit lets fragment frequency outweigh a selected
+        word. This distribution preserves all candidate uncertainty and contains
+        only next units verified by the emitted whole-word prefix.
+        """
+        result=torch.zeros_like(prior)
+        if not node['next']:return result
+        owners={entries[start][3]:start for start in starts}
+        positions=torch.tensor(node['next'],device=prior.device,dtype=torch.long)
+        parents=torch.tensor([owners[entries[i][3]] for i in node['next']],device=prior.device,dtype=torch.long)
+        result=result.index_add(0,positions,prior[parents])
+        return result/result.sum().clamp_min(1e-30)
 
     def source_boundary_logits(self,features):
         base=self.native_source_boundary(features)
@@ -1087,16 +1112,24 @@ class BoundedIdentityReadout(nn.Module):
             next_marker='LEX' if within or len(emitted)>=len(following) else tokenizer.construction_units[following[len(emitted)]].text
             clause_end=any(u.text=='<EOL>' or any(c in '.!?\n' for c in u.render) for u in (tokenizer.construction_units[x] for x in following))
             line_end=any(tokenizer.construction_units[x].text=='<EOL>' for x in following)
-            occurrences.append((next_marker,clause_end,line_end,within))
+            # A verified cursor retains ownership across repeated text. Suffix
+            # equality alone must not let another occurrence change separators.
+            weight=(state.source_cursor[i] if state.source_cursor is not None else None)
+            occurrences.append(((next_marker,clause_end,line_end,within),weight))
         if not occurrences:return zero
+        cursor_weights=[weight for _,weight in occurrences]
+        use_cursor=all(weight is not None for weight in cursor_weights) and bool(torch.stack(cursor_weights).sum()>0)
+        posterior=(torch.stack(cursor_weights) if use_cursor else zero.new_ones(len(occurrences)))
+        posterior=posterior/posterior.sum().clamp_min(1e-30)
         values={}
-        for marker,end,line,within in occurrences:
+        for ((marker,end,line,within),_),mass in zip(occurrences,posterior):
             for key,value in [('next='+marker,1.),('clause_end',float(end)),('line_end',float(line)),('within_word',float(within)),('supported',1.)]:
-                values[key]=values.get(key,0.)+value/len(occurrences)
+                values[key]=values.get(key,0.)+value*mass
         values['separator_offset='+str(min(len(state.output_separators or []),8))]=1.
-        values['ambiguous']=float(len(set(occurrences))>1)
+        values['ambiguous']=float(len({item for (item,_),mass in zip(occurrences,posterior) if bool(mass>0)})>1)
         keys=torch.tensor([[1+stable_key(salt+'source_boundary:'+key)%bank.capacity for salt in ('a:','b:')] for key in values],device=device)
-        weights=bank.embedding.weight.new_tensor(list(values.values()))
+        weights=torch.stack([value.to(dtype=zero.dtype) if isinstance(value,torch.Tensor) else zero.new_tensor(value)
+                             for value in values.values()])
         return (bank.embedding(keys).mean(1)*weights[:,None]).sum(0)/math.sqrt(8.)
 
     @staticmethod
