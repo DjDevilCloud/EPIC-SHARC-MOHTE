@@ -1584,6 +1584,9 @@ def _format_aux_top_terms(aux_terms: Dict[str, float], top_n: int = 3) -> str:
 def _checkpoint_mismatch_is_tolerable(missing: Sequence[str], unexpected: Sequence[str]) -> bool:
     tolerated_missing_exact = {
         "signature_embedding.weight",
+        # This optional connection is initialized to zero; earlier word-path
+        # checkpoints retain exactly their previous source/format behavior.
+        "bounded_identity_readout.native_word_start_scale",
     }
     tolerated_unexpected_exact = {
         "signature_parent_embedding.weight",

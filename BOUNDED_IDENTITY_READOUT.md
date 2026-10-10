@@ -383,3 +383,136 @@ word binding. See
 [the stable controlled baseline](review_artifacts/FUNCTIONAL_BINDING_BASELINE_20261009.md)
 for both-seed retention, fresh entity combinations, reload/streaming verification,
 recommended checkpoints and remaining native-QA limitations.
+
+## Native source signatures and word-prefix paths
+
+`--identity-readout-native-word-paths` enables an opt-in `word_span_v5`
+extension. It composes source runtime properties, unit position within a word,
+and source word length through the existing shared signature bank. A learned
+projection adds these properties to native retrieval keys. Exact lexical IDs
+serve as bounded word-prefix identity keys; they are not numeric features.
+
+A source-word trie is constructed once per input memory. Request state retains
+the current prefix node and the posterior over candidate word starts. Complete
+and partial prefix mass supplies shared-bank evidence to learned native copy
+and formatting residuals. At word boundaries, a learned scalar introduces the
+expected next-word signature. These are soft scores, not forced completions;
+every generated token still updates recurrent state.
+
+New weights initialize to zero, preserving migration behavior. The optional
+zero-initialized `native_word_start_scale` can be absent in an earlier path
+checkpoint; missing learned source projections remain load errors. The flag
+defaults off. Adapter fitting freezes original word binding, core weights,
+registry observations and calibrated task classifiers.
+
+The two-seed transfer candidates retain prior raw token IDs and learn eight
+native answers plus ten value substitutions in three layouts. Untrained
+whole-word substitutions score 24/24 and 23/24; unfamiliar fragmented values
+score 0/6 and 3/6. Broader native QA remains 0/22. This establishes a useful
+transfer improvement, not general QA or faster generation. See
+[the native transfer report](review_artifacts/NATIVE_QA_TRANSFER_20261010.md).
+
+### Conditioning verified word prefixes
+
+`--identity-readout-native-conditional-prefix` requires native word paths and
+defaults off. At a verified lexical prefix, it renormalizes the source-word
+posterior over exactly compatible complete and partial words. An incompatible
+or unsupported source prefix supplies zero evidence. The prior tensor is not
+mutated, preserving independent request branches and differentiable training.
+
+This separates uncertainty about the initial source selection from uncertainty
+about whether the current observed prefix is a complete word. Previously, a
+small root probability could suppress partial-word evidence after the prefix
+had already identified a source word. The conditional posterior changes soft
+evidence and learned scores; it does not mask or force generated tokens. It adds
+no parameters and retains per-token recurrent updates.
+
+Training-only source-start margin supervision is then evaluated separately
+from native boundary fitting. The diagnosed retrieval failures and isolation
+procedure are in [the frozen-source review](review_artifacts/NATIVE_SOURCE_DIAGNOSIS_20261010.md).
+Final source and boundary controls retain earlier outputs and repair the old
+development substitutions, but unseen name boundaries still fail. See
+[the final control report](review_artifacts/NATIVE_SELECTION_AND_BOUNDARIES_20261010.md)
+for both-seed scores, frozen traces, checkpoint scope, and the remaining gate.
+
+### Verified continuation and categorical boundary decisions
+
+`--identity-readout-native-span-boundaries` adds a canonical span boundary
+channel. It shares the component bank and uses complete/partial word evidence,
+verified prefix continuation, within-word support, causal output word position,
+and separator identity, conditioned on the question. Lexical fragments use a
+common marker; the boundary vector does not encode their individual identities
+or shapes. Selection weights need not change.
+
+The default `residual_v1` readout initializes to zero for neutral migration.
+`--identity-readout-native-span-readout categorical_v2` predicts structural
+tokens plus lexical mass, preserving individual lexical selection through a
+learned copy/base gate. It remains inactive until teacher-feature fitting and
+`commit_span_calibration`. Confidence-selected training positions must all be
+correct; inference below `--identity-readout-native-span-confidence` (default
+0.9) retains the old readout. Unsupported prefixes also retain it. Known inactive
+native routes remain exactly neutral. Teacher features can be cached only with
+frozen upstream state; upstream changes require renewed calibration/replay.
+
+Both seeds now pass the two old held-name cohorts at 72/72, separate fresh names
+at 36/36, and fresh repeated values at 24/24 while retaining previous token IDs.
+The accepted scope is controlled native values and boundaries. Broader native
+QA stays 0/22; variable answer lengths and new question types are not established.
+See [the categorical boundary review](review_artifacts/CATEGORICAL_SPAN_BOUNDARIES_20261010.md)
+for controls, calibration, checkpoints, verification, and limits.
+
+### Observed source separators and endpoints
+
+`--identity-readout-source-boundaries` requires native span boundaries and adds
+a zero-initialized source head. Word state retains observed separators/case
+controls; request state retains emitted separators after the last lexical unit.
+Exact lexical suffix and separator agreement select observed source evidence.
+The existing shared bank composes next-marker, clause/line-ending, within-word,
+support, ambiguity and separator-offset properties. No future output or label
+is consulted at inference, and punctuation alone does not force termination.
+
+The default source readout `residual_v1` adds evidence to prior span logits.
+`--identity-readout-source-boundary-readout categorical_v1` instead uses the
+source categorical prediction when supported and confident, retaining the
+previous span head otherwise. It requires native `categorical_v2` spans. This
+avoids requiring source evidence to overcome a fixed output-position prior at
+untrained lengths. Source selection and recurrent token updates remain intact.
+Checkpoint configurations default this channel off for backward compatibility.
+
+The isolated source-head control freezes every prior weight and registry
+buffer. Both seeds retain all earlier task token IDs and pass 24/24 independent
+four-to-seven-word continuation cases **when supplied the correct first word**.
+Their autonomous raw scores are 21/24 and 23/24; source-start and lexical
+continuation failures remain, including repetition on a short title in seed 47.
+Broader native QA is 0/22 and 2/22. New question/source selection has been traced
+separately and remains incomplete. These are boundary-stage references, not a
+complete raw-QA acceptance. See
+[the source-boundary repair report](review_artifacts/SOURCE_BOUNDARY_REPAIR_20261010.md).
+
+### Source occurrence ownership and safe grammar adaptation
+
+`--identity-readout-source-ownership` adds a neutral source-start correction and
+an occurrence posterior that conditions on emitted lexical units. Continuation
+advances across contiguous observed entries only after verifying the emitted
+separators. Query entries cannot be proposed; unsupported prefixes supply no
+cursor evidence. Repeated source positions remain distinct while shared next
+token identities aggregate confidence. Copy/base mixing and recurrent updates
+continue normally. The cursor scalar initializes to zero.
+
+`--identity-readout-source-start-features span_roles_v2` preserves neighboring
+parent-span words when a clause starts, plus shared-bank ending/line/count
+properties. It avoids discarding the previous line's role at a title's start.
+No whole-profile catalog or categorical ID-distance feature is introduced.
+
+`--identity-readout-source-boundary-adapter` requires categorical source
+boundaries. Confident grammar proposals can replace source logits; uncertainty
+retains the validated source formatter. Its zero initialization preserves old
+outputs. Adapter calibration evaluates its own supported proposals, while raw
+generation and retained-task replay are separate mandatory checks.
+
+Both seeds now pass 54/54 controlled length outputs, 36/36 trained grammar
+outputs and 24/24 earlier independent length cases, retaining all prior
+controlled token IDs. Final untrained names/wordings score 15/24 and 21/24;
+broader QA scores 0/22 and 1/22, including a held database-answer regression.
+This is a controlled baseline, not general QA acceptance. See
+[the ownership repair report](review_artifacts/SOURCE_OWNERSHIP_REPAIR_20261010.md).

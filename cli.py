@@ -124,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-binding", choices=("independent_v1", "lexical_binding_v1", "lexical_binding_v2", "word_span_v3", "word_span_v4", "word_span_v5"), default="independent_v1")
         p.add_argument("--identity-readout-exclude-query-candidates", action="store_true", help="Exclude final query clause from observed-span source copying")
         p.add_argument("--identity-readout-ordered-agreement", action="store_true", help="Learn ordered complete-word agreement in bounded retrieval")
+        p.add_argument("--identity-readout-native-word-paths", action="store_true", help="Use source signatures and verified word prefixes in native QA")
+        p.add_argument("--identity-readout-native-conditional-prefix", action="store_true", help="Condition native word probabilities on verified lexical prefixes")
+        p.add_argument("--identity-readout-native-span-boundaries", action="store_true", help="Use verified continuation and output span role for native boundaries")
+        p.add_argument("--identity-readout-native-span-readout", choices=("residual_v1","categorical_v2"), default="residual_v1")
+        p.add_argument("--identity-readout-native-span-confidence", type=float, default=0.9)
+        p.add_argument("--identity-readout-source-boundaries", action="store_true", help="Add observed source separator and endpoint evidence to native boundaries")
+        p.add_argument("--identity-readout-source-boundary-readout", choices=("residual_v1","categorical_v1"), default="residual_v1")
+        p.add_argument("--identity-readout-source-ownership", action="store_true", help="Preserve a source-start posterior and verify occurrence continuation")
+        p.add_argument("--identity-readout-source-start-features", choices=("word_neighbors_v1","span_roles_v2"), default="word_neighbors_v1")
+        p.add_argument("--identity-readout-source-boundary-adapter", action="store_true", help="Confident grammar proposals retain the validated source formatter on uncertainty")
         p.add_argument("--identity-readout-context-units", type=int, default=2)
         p.add_argument("--identity-readout-query-units", type=int, default=4)
         p.add_argument("--identity-readout-binding-confidence", type=float, default=.99)
@@ -750,6 +760,16 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         identity_readout_binding=getattr(args, "identity_readout_binding", "independent_v1"),
         identity_readout_exclude_query_candidates=getattr(args, "identity_readout_exclude_query_candidates", False),
         identity_readout_ordered_agreement=getattr(args, "identity_readout_ordered_agreement", False),
+        identity_readout_native_word_paths=getattr(args, "identity_readout_native_word_paths", False),
+        identity_readout_native_conditional_prefix=getattr(args, "identity_readout_native_conditional_prefix", False),
+        identity_readout_native_span_boundaries=getattr(args, "identity_readout_native_span_boundaries", False),
+        identity_readout_native_span_readout=getattr(args, "identity_readout_native_span_readout", 'residual_v1'),
+        identity_readout_native_span_confidence=getattr(args, "identity_readout_native_span_confidence", .9),
+        identity_readout_source_boundaries=getattr(args, "identity_readout_source_boundaries", False),
+        identity_readout_source_boundary_readout=getattr(args, "identity_readout_source_boundary_readout", 'residual_v1'),
+        identity_readout_source_ownership=getattr(args, "identity_readout_source_ownership", False),
+        identity_readout_source_start_features=getattr(args, "identity_readout_source_start_features", 'word_neighbors_v1'),
+        identity_readout_source_boundary_adapter=getattr(args, "identity_readout_source_boundary_adapter", False),
         identity_readout_context_units=getattr(args, "identity_readout_context_units", 2),
         identity_readout_query_units=getattr(args, "identity_readout_query_units", 4),
         identity_readout_binding_confidence=getattr(args, "identity_readout_binding_confidence", .99),

@@ -6633,7 +6633,9 @@ class PrismalWaveModel(nn.Module):
         if self.bounded_identity_readout.native_route:
             adapter_roots=tuple('bounded_identity_readout.'+name for name in (
                 'right_context_projection.','continuation_scale','native_query.','native_gate.',
-                'native_applicability.','native_scale','native_surface_projection.'))
+                'native_applicability.','native_scale','native_surface_projection.',
+                'native_source_signature.','native_word_surface.','native_word_gate.','native_word_path_scale','native_word_start_scale',
+                'native_span_surface.','native_span_gate.','native_source_boundary.','native_source_boundary_adapter.','native_span_start.','native_source_cursor_scale'))
         for name, parameter in self.named_parameters():
             if not name.startswith(adapter_roots):
                 parameter.requires_grad_(False)

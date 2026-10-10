@@ -269,6 +269,13 @@ class IdentityReadoutState:
     output_units: object = None
     binding_cache: object = None
     source_mask: object = None
+    word_node: object = None
+    word_prior: object = None
+    output_word_count: int = 0
+    output_in_word: bool = False
+    output_separators: object = None
+    source_initial_prior: object = None
+    source_cursor: object = None
 
 
 class WordSpanState:
@@ -279,17 +286,21 @@ class WordSpanState:
         self.clause=[]
         self.last_clause=[]
         self.records=[];self.serial=0;self.clause_index=0
+        self.following={};self.separator_owner=None
 
     def clone(self):
         result=WordSpanState(self.capacity)
         result.pending=list(self.pending);result.clause=list(self.clause);result.last_clause=list(self.last_clause)
         result.records=list(self.records);result.serial=self.serial;result.clause_index=self.clause_index
+        result.following={k:list(v) for k,v in self.following.items()};result.separator_owner=self.separator_owner
         return result
 
     def boundary(self, clause=False):
         if self.pending:
             self.records.append((self.serial,self.clause_index,tuple(self.pending)));self.serial+=1
-            while sum(len(r[2]) for r in self.records)>self.capacity:self.records.pop(0)
+            self.separator_owner=self.serial-1
+            while sum(len(r[2]) for r in self.records)>self.capacity:
+                removed=self.records.pop(0);self.following.pop(removed[0],None)
             self.clause.append(tuple(self.pending));self.pending=[]
             while sum(map(len,self.clause))>self.capacity:self.clause.pop(0)
         if clause and self.clause:
@@ -298,11 +309,18 @@ class WordSpanState:
 
     def observe(self, token, unit):
         if unit.is_lexical:
+            self.separator_owner=None
             self.pending.append(token)
             # Explicit bounded memory: an over-capacity word retains its causal tail.
             self.pending=self.pending[-self.capacity:]
         elif unit.kind not in {'case','signature'}:
             self.boundary(clause=unit.text in {'<EOL>','<EOI>'} or any(c in '.!?\n' for c in unit.render))
+            if self.separator_owner is not None:
+                self.following.setdefault(self.separator_owner,[]).append(token)
+                self.following[self.separator_owner]=self.following[self.separator_owner][:self.capacity]
+        elif unit.kind=='case' and not self.pending and self.separator_owner is not None:
+            self.following.setdefault(self.separator_owner,[]).append(token)
+            self.following[self.separator_owner]=self.following[self.separator_owner][:self.capacity]
 
     def question(self):
         current=self.clause+([tuple(self.pending)] if self.pending else [])
@@ -416,6 +434,31 @@ class BoundedIdentityReadout(nn.Module):
                 self.native_scale=nn.Parameter(torch.zeros(()))
                 nn.init.zeros_(self.native_query.weight);nn.init.zeros_(self.native_gate.weight)
                 self.native_surface_projection=None
+                if cfg.identity_readout_native_word_paths:
+                    self.native_source_signature=nn.Linear(cfg.d_model,cfg.d_model,bias=False)
+                    self.native_word_surface=nn.Linear(2*cfg.d_model,len(cfg.identity_readout_surface_ids),bias=False)
+                    self.native_word_gate=nn.Bilinear(cfg.d_model,cfg.d_model,1,bias=False)
+                    self.native_word_path_scale=nn.Parameter(torch.zeros(()))
+                    self.native_word_start_scale=nn.Parameter(torch.zeros(()))
+                    nn.init.zeros_(self.native_source_signature.weight)
+                    nn.init.zeros_(self.native_word_surface.weight)
+                    nn.init.zeros_(self.native_word_gate.weight)
+                    if cfg.identity_readout_source_ownership:
+                        self.native_span_start=nn.Linear(4*cfg.d_model,cfg.d_model,bias=False)
+                        nn.init.zeros_(self.native_span_start.weight)
+                        self.native_source_cursor_scale=nn.Parameter(torch.zeros(()))
+                    if cfg.identity_readout_native_span_boundaries:
+                        extra=int(cfg.identity_readout_native_span_readout=='categorical_v2')
+                        self.native_span_surface=nn.Linear(2*cfg.d_model,len(cfg.identity_readout_surface_ids)+extra,bias=False)
+                        self.native_span_gate=nn.Linear(2*cfg.d_model,1,bias=False)
+                        nn.init.zeros_(self.native_span_surface.weight);nn.init.zeros_(self.native_span_gate.weight)
+                        if extra:self.register_buffer('native_span_ready',torch.tensor(False))
+                        if cfg.identity_readout_source_boundaries:
+                            self.native_source_boundary=nn.Linear(2*cfg.d_model,len(cfg.identity_readout_surface_ids)+extra,bias=False)
+                            nn.init.zeros_(self.native_source_boundary.weight)
+                            if cfg.identity_readout_source_boundary_adapter:
+                                self.native_source_boundary_adapter=nn.Linear(2*cfg.d_model,len(cfg.identity_readout_surface_ids)+extra,bias=False)
+                                nn.init.zeros_(self.native_source_boundary_adapter.weight)
             self.register_buffer('surface_ids', torch.tensor(cfg.identity_readout_surface_ids, dtype=torch.long))
             self.surface_projection = None
             if self.surface_ids.numel():
@@ -471,6 +514,42 @@ class BoundedIdentityReadout(nn.Module):
                 native.weight.requires_grad_(self.native_surface_projection.weight.requires_grad)
             self.native_surface_projection=native
         self._surface_contract = contract
+        if self.native_route and self._binding_cfg.identity_readout_native_word_paths and self.native_word_surface.out_features!=len(ids):
+            prior=self.native_word_surface
+            projection=nn.Linear(2*self.query.in_features,len(ids),bias=False).to(device=self.query.weight.device,dtype=self.query.weight.dtype)
+            nn.init.zeros_(projection.weight)
+            with torch.no_grad():
+                for row,token in enumerate(ids):
+                    if token in old_ids:projection.weight[row].copy_(prior.weight[old_ids.index(token)])
+            projection.weight.requires_grad_(prior.weight.requires_grad);self.native_word_surface=projection
+        extra=int(self._binding_cfg.identity_readout_native_span_readout=='categorical_v2')
+        if self.native_route and self._binding_cfg.identity_readout_native_span_boundaries and self.native_span_surface.out_features!=len(ids)+extra:
+            prior=self.native_span_surface
+            projection=nn.Linear(2*self.query.in_features,len(ids)+extra,bias=False).to(device=self.query.weight.device,dtype=self.query.weight.dtype)
+            nn.init.zeros_(projection.weight)
+            with torch.no_grad():
+                for row,token in enumerate(ids):
+                    if token in old_ids:projection.weight[row].copy_(prior.weight[old_ids.index(token)])
+                if extra:projection.weight[-1].copy_(prior.weight[-1])
+            projection.weight.requires_grad_(prior.weight.requires_grad);self.native_span_surface=projection
+        if self.native_route and self._binding_cfg.identity_readout_source_boundaries and self.native_source_boundary.out_features!=len(ids)+extra:
+            prior=self.native_source_boundary
+            projection=nn.Linear(2*self.query.in_features,len(ids)+extra,bias=False).to(device=prior.weight.device,dtype=prior.weight.dtype)
+            nn.init.zeros_(projection.weight)
+            with torch.no_grad():
+                for row,token in enumerate(ids):
+                    if token in old_ids:projection.weight[row].copy_(prior.weight[old_ids.index(token)])
+                if extra:projection.weight[-1].copy_(prior.weight[-1])
+            projection.weight.requires_grad_(prior.weight.requires_grad);self.native_source_boundary=projection
+        if self.native_route and self._binding_cfg.identity_readout_source_boundary_adapter and self.native_source_boundary_adapter.out_features!=len(ids)+extra:
+            prior=self.native_source_boundary_adapter
+            projection=nn.Linear(2*self.query.in_features,len(ids)+extra,bias=False).to(device=prior.weight.device,dtype=prior.weight.dtype)
+            nn.init.zeros_(projection.weight)
+            with torch.no_grad():
+                for row,token in enumerate(ids):
+                    if token in old_ids:projection.weight[row].copy_(prior.weight[old_ids.index(token)])
+                if extra:projection.weight[-1].copy_(prior.weight[-1])
+            projection.weight.requires_grad_(prior.weight.requires_grad);self.native_source_boundary_adapter=projection
 
     def _binding_memory(self, entries, tokenizer, bank, lexical_embeddings, device):
         """Input-only identity composition; no output labels, hidden history or profile IDs."""
@@ -522,6 +601,8 @@ class BoundedIdentityReadout(nn.Module):
                         if other!=clause:break
                         right_contexts[index].append(word)
         unique=list(dict.fromkeys(w for context in contexts+right_contexts+[question_words] for w in context))
+        if self._binding_cfg.identity_readout_source_ownership and self._binding_cfg.identity_readout_source_start_features=='span_roles_v2':
+            unique=list(dict.fromkeys(unique+[word for _,_,word in words.records]))
         if not unique:
             zero=torch.zeros(d,device=device,dtype=self.query.weight.dtype)
             return zero,torch.zeros(len(entries),device=device),identity
@@ -556,7 +637,32 @@ class BoundedIdentityReadout(nn.Module):
             agreement={c:WordSpanState.ordered_agreement(question_words,c) for c in dict.fromkeys(contexts)}
             scores=scores+self.word_agreement_scale*torch.tensor([agreement[c] for c in contexts],device=device,dtype=scores.dtype)
         if self.native_route:
-            native_scores=F.cosine_similarity(self.span_projection(context+self.right_context_projection(right)),
+            native_context=context+self.right_context_projection(right)
+            packet=None
+            if self._binding_cfg.identity_readout_native_word_paths:
+                groups={}
+                for index,e in enumerate(entries):groups.setdefault(e[3],[]).append(index)
+                ordinals={i:j+1 for group in groups.values() for j,i in enumerate(group)}
+                sizes={i:len(group) for group in groups.values() for i in group}
+                props=torch.tensor([e[1] for e in entries],device=device,dtype=torch.long)
+                def count_code(n):return str(n) if n<=16 else 'tail:'+str(RuntimeStructuralState.bucket(n))
+                extra=torch.tensor([[1+stable_key('source:unit_pos='+count_code(ordinals[i]))%bank.capacity,
+                                     1+stable_key('source:word_units='+count_code(sizes[i]))%bank.capacity] for i in range(len(entries))],device=device)
+                signatures=F.layer_norm(bank.encode_runtime(props)+bank.embedding(extra).mean(1),(d,))
+                native_context=native_context+self.native_source_signature(signatures)
+                starts=[group[0] for group in groups.values()]
+                nodes=[dict(children={},next=[],complete=[],partial=[])]
+                for group in groups.values():
+                    node=0;start=group[0]
+                    for index in group:
+                        nodes[node]['next'].append(index);nodes[node]['partial'].append(start)
+                        token=entries[index][0]
+                        if token not in nodes[node]['children']:
+                            nodes[node]['children'][token]=len(nodes);nodes.append(dict(children={},next=[],complete=[],partial=[]))
+                        node=nodes[node]['children'][token]
+                    nodes[node]['complete'].append(start)
+                packet=(starts,nodes)
+            native_scores=F.cosine_similarity(self.span_projection(native_context),
                 (self.span_projection(requested)+self.context_query(question)+self.native_query(question))[None,:],dim=-1)*math.sqrt(d)
             question_vectors=vectors[torch.tensor([addresses[w] for w in question_words],device=device)]
             # Bounded router preserves both the start/task cue and end/requested span of long clauses.
@@ -564,7 +670,30 @@ class BoundedIdentityReadout(nn.Module):
             route_features=torch.zeros(64,d+1,device=device,dtype=vectors.dtype)
             route_features[:len(question_vectors),:d]=question_vectors
             route_features[:len(question_vectors),d]=1
-            return question,scores,identity,native_scores,route_features
+            result=(question,scores,identity,native_scores,route_features)
+            if self._binding_cfg.identity_readout_source_ownership:
+                def neighbor(sequence,index):
+                    return vectors[addresses[sequence[index]]] if len(sequence)>=abs(index) and sequence else torch.zeros(d,device=device,dtype=vectors.dtype)
+                role_keys=[]
+                owned_contexts=contexts
+                if self._binding_cfg.identity_readout_source_start_features=='span_roles_v2':
+                    record_positions={serial:i for i,(serial,_,_) in enumerate(words.records)}
+                    owned_contexts=[c or [r[2] for r in words.records[max(0,record_positions.get(e[3],0)-2):record_positions.get(e[3],0)]] for e,c in zip(entries,contexts)]
+                for e,c in zip(entries,contexts):
+                    gap=words.following.get(e[3],[])
+                    marker=tokenizer.construction_units[gap[0]].text if gap else 'unobserved'
+                    keys=['next='+marker,'clause_start='+str(not c)]
+                    if self._binding_cfg.identity_readout_source_start_features=='span_roles_v2':
+                        index=record_positions.get(e[3]);clause=words.records[index][1] if index is not None else None;group=[r for r in words.records if clause is not None and r[1]==clause];ending=words.following.get(group[-1][0],[]) if group else []
+                        end_marker=tokenizer.construction_units[ending[0]].text if ending else 'unobserved'
+                        line_end=any(tokenizer.construction_units[x].text=='<EOL>' for x in ending)
+                        keys+=['span_end='+end_marker,'span_line_end='+str(line_end),'span_words='+str(RuntimeStructuralState.bucket(len(group)))]
+                    role_keys.append([1+stable_key('source_start:'+key)%bank.capacity for key in keys])
+                roles=bank.embedding(torch.tensor(role_keys,device=device)).mean(1)
+                start_features=torch.cat((torch.stack([neighbor(c,-1) for c in owned_contexts]),torch.stack([neighbor(c,-2) for c in owned_contexts]),torch.stack([neighbor(c,0) for c in right_contexts]),signatures+roles),dim=-1)
+                correction=(self.native_span_start(start_features)*question).sum(-1)/math.sqrt(d)
+                return result+(packet,correction)
+            return result+(packet,) if packet is not None else result
         return question,scores,identity
 
     def _binding_structure(self, token, unit, runtime_features, bank, identity, hidden):
@@ -658,7 +787,8 @@ class BoundedIdentityReadout(nn.Module):
         if states is not None and len(states) != input_ids.size(0):
             raise ValueError('Identity readout state batch size differs from input.')
         states = [IdentityReadoutState(list(s.entries), s.role, s.words.clone() if s.words is not None else None,
-                                      list(s.output_units) if s.output_units is not None else None,s.binding_cache,s.source_mask) for s in states] if states is not None else [
+                                      list(s.output_units) if s.output_units is not None else None,s.binding_cache,s.source_mask,s.word_node,s.word_prior,s.output_word_count,s.output_in_word,
+                                      list(s.output_separators) if s.output_separators is not None else None,s.source_initial_prior,s.source_cursor) for s in states] if states is not None else [
             IdentityReadoutState([]) for _ in range(input_ids.size(0))]
         rows=[]
         feature_rows=features.tolist()
@@ -680,9 +810,18 @@ class BoundedIdentityReadout(nn.Module):
                     binding_memory = None
                     state.binding_cache=None
                     state.source_mask=None
+                    state.word_node=None;state.word_prior=None
+                    state.output_word_count=0;state.output_in_word=False
+                    state.output_separators=[]
+                    state.source_initial_prior=None;state.source_cursor=None
                     state.role='input' if unit.text=='<BOI>' else 'outside'
                 elif unit.text=='<EOI>':state.role='outside'
-                elif unit.text=='<BOO>':state.role='output'
+                elif unit.text=='<BOO>':
+                    state.role='output'
+                    state.output_word_count=0;state.output_in_word=False
+                    state.output_separators=[]
+                    state.source_initial_prior=None;state.source_cursor=None
+                    if self.native_route and self._binding_cfg.identity_readout_native_word_paths:state.word_node=0;state.word_prior=None
                 elif unit.text=='<EOO>':state.role='outside'
                 if self.word_binding and (state.role=='input' or unit.text=='<EOI>'):
                     if state.words is None:raise ValueError('Word binding requires its own request state; restart from input.')
@@ -697,6 +836,7 @@ class BoundedIdentityReadout(nn.Module):
                     binding_memory=None
                     state.binding_cache=None
                     state.source_mask=None
+                    state.word_node=None;state.word_prior=None
                 elif state.role=='input' and self.is_candidate(unit):
                     entry = (token, tuple(feature_rows[row][position]))
                     if self.binding_enabled:
@@ -705,8 +845,18 @@ class BoundedIdentityReadout(nn.Module):
                     state.entries=state.entries[-self.capacity:]
                     binding_memory = None
                 current=logits[row,position]
+                cursor_gap=state.output_separators or []
                 if self.observed_span_binding and state.role=='output' and unit.is_lexical:
                     state.output_units=(state.output_units+[token])[-8:]
+                    state.output_separators=[]
+                elif self.observed_span_binding and state.role=='output' and state.output_units and unit.kind!='signature':
+                    state.output_separators=(state.output_separators or [])+[token]
+                    state.output_separators=state.output_separators[-self.capacity:]
+                if state.role=='output':
+                    if unit.is_lexical:
+                        if not state.output_in_word:state.output_word_count+=1
+                        state.output_in_word=True
+                    elif unit.kind not in {'case','signature'}:state.output_in_word=False
                 if state.role=='output' and state.entries:
                     ids=torch.tensor([e[0] for e in state.entries],device=logits.device)
                     properties=torch.tensor([e[1] for e in state.entries],device=logits.device)
@@ -722,6 +872,11 @@ class BoundedIdentityReadout(nn.Module):
                                 if self.word_binding else self._binding_memory(state.entries, tokenizer, bank, lexical_embeddings, logits.device))
                             if cache_stamp is not None:state.binding_cache=(cache_stamp,binding_memory)
                         question, span_scores, identity = binding_memory[:3]
+                        if self.native_route and self._binding_cfg.identity_readout_native_word_paths:
+                            nodes=binding_memory[5][1]
+                            if unit.is_lexical:
+                                state.word_node=nodes[state.word_node]['children'].get(token) if state.word_node is not None else None
+                            elif unit.kind not in {'case','signature'}:state.word_node=0;state.word_prior=None
                         activation = self.binding_activation(question)
                         # Formatting depends on causal properties, not a particular value's identity.
                         structure = self._binding_structure(token, unit, features[row,position], bank, identity, h)
@@ -743,6 +898,8 @@ class BoundedIdentityReadout(nn.Module):
                             scores = scores + activation * self.span_scale * span_scores
                         if self.native_route:
                             scores=(1.-native_activation)*scores+native_activation*(self.span_scale+self.native_scale).clamp(-4.,4.).exp()*binding_memory[3]
+                            if self._binding_cfg.identity_readout_source_ownership and not state.output_units:
+                                scores=scores+native_activation*binding_memory[6]
                         if self.observed_span_binding and state.output_units:
                             # Exact observed prefix equality verifies a possible source continuation;
                             # learned strength competes with ordinary attention, never forces a copy.
@@ -763,11 +920,211 @@ class BoundedIdentityReadout(nn.Module):
                         # the source/query partition only through the learned QA routes.
                         partition_strength=torch.maximum(activation,native_activation) if self.native_route else activation
                         attention=(1.-partition_strength)*attention+partition_strength*source_attention
+                    if self.native_route and self._binding_cfg.identity_readout_native_word_paths:
+                        starts,nodes=binding_memory[5]
+                        proposal=None;cursor_strength=None
+                        if self._binding_cfg.identity_readout_source_ownership:
+                            if unit.is_lexical:
+                                prior=(state.source_initial_prior if state.source_cursor is None else self.source_cursor_targets(state,cursor_gap,ids))
+                                if prior is None:prior=torch.zeros_like(scores,dtype=torch.float32)
+                                posterior=prior*ids.eq(token)
+                                state.source_cursor=posterior/posterior.sum().clamp_min(1e-30)
+                            proposal=self.source_cursor_targets(state,state.output_separators or [],ids)
+                            token_proposal=torch.zeros_like(current,dtype=torch.float32).scatter_add(0,ids,proposal)
+                            cursor_strength=native_activation*self.native_source_cursor_scale.clamp(0.,1.)*token_proposal.max()
+                        if state.word_node==0:
+                            eligible=state.source_mask if state.source_mask is not None else torch.ones_like(ids,dtype=torch.bool)
+                            start_scores=scores[starts].float().masked_fill(~eligible[starts],float('-inf'))
+                            if not eligible[starts].any():start_scores=scores[starts].float()
+                            prior=torch.zeros_like(scores,dtype=torch.float32).index_add(0,torch.tensor(starts,device=logits.device),start_scores.softmax(-1))
+                            if proposal is not None:prior=(1.-cursor_strength)*prior+cursor_strength*proposal
+                            state.word_prior=prior
+                            if self._binding_cfg.identity_readout_source_ownership and not state.output_units:state.source_initial_prior=prior
+                        if self._binding_cfg.identity_readout_native_conditional_prefix and state.word_node is not None and state.word_node!=0 and state.word_prior is not None:
+                            state.word_prior=self.condition_word_prior(state.word_prior,nodes[state.word_node])
+                        complete=partial=torch.zeros((),device=logits.device)
+                        if state.word_node is not None and state.word_node!=0 and state.word_prior is not None:
+                            node=nodes[state.word_node]
+                            complete=state.word_prior[node['complete']].sum()
+                            partial=state.word_prior[node['partial']].sum()
+                        status=bank.embedding(torch.tensor([1+stable_key('source:word_complete')%bank.capacity,1+stable_key('source:word_partial')%bank.capacity],device=logits.device))
+                        evidence=complete*status[0]+partial*status[1]
+                        if state.word_node==0 and state.word_prior is not None:
+                            # Expected next source-word properties survive a generated
+                            # separator; a zero scalar keeps earlier checkpoints neutral.
+                            source_start=bank.encode_runtime(properties[starts])
+                            expected=(source_start*state.word_prior[starts,None]).sum(0)
+                            evidence=evidence+self.native_word_start_scale*expected
+                        word_structure=structure*evidence
+                        current=current.index_add(0,self.surface_ids,native_activation*self.native_word_surface(torch.cat((word_structure,word_structure*question))))
+                        gate=gate+native_activation*self.native_word_gate(word_structure,question).squeeze(-1)
+                        if state.word_node is not None:
+                            confidence=state.word_prior[starts].max() if state.word_node==0 else (complete+partial)
+                            valid=torch.zeros_like(scores).index_fill(0,torch.tensor(nodes[state.word_node]['next'],device=logits.device,dtype=torch.long),1.)
+                            word_scores=scores+native_activation*self.native_word_path_scale*confidence*valid
+                            word_attention=F.softmax(word_scores.float(),-1)
+                            if state.source_mask is not None:
+                                source_attention=F.softmax(word_scores.float().masked_fill(~state.source_mask,float('-inf')),-1)
+                                partition_strength=torch.maximum(activation,native_activation)
+                                word_attention=(1.-partition_strength)*word_attention+partition_strength*source_attention
+                            attention=word_attention
+                        if proposal is not None and bool(cursor_strength>0):
+                            attention=(1.-cursor_strength)*attention+cursor_strength*proposal
+                        if self._binding_cfg.identity_readout_native_span_boundaries:
+                            span_vector=self.span_boundary_vector(bank,state,unit,complete,partial,attention,
+                                matches if state.output_units else [],nodes)
+                            span_features=torch.cat((span_vector,span_vector*question))
+                            span_logits=self.native_span_surface(span_features)
+                            if self._binding_cfg.identity_readout_source_boundaries:
+                                source_vector=self.source_boundary_vector(bank,state,tokenizer,logits.device)
+                                source_logits=self.source_boundary_logits(torch.cat((source_vector,source_vector*question)))
+                                if self._binding_cfg.identity_readout_source_boundary_readout=='categorical_v1':
+                                    source_confidence=source_logits.float().softmax(-1).max()
+                                    if bool(source_vector.abs().sum()>0) and bool(source_confidence>=self._binding_cfg.identity_readout_native_span_confidence):
+                                        span_logits=source_logits
+                                else:span_logits=span_logits+source_logits
+                            span_gate=self.native_span_gate(span_features).squeeze(-1)
+                            if self._binding_cfg.identity_readout_native_span_readout=='residual_v1':
+                                current=current.index_add(0,self.surface_ids,native_activation*span_logits)
+                                gate=gate+native_activation*span_gate
                     copy=torch.zeros_like(current,dtype=torch.float32).scatter_add(0,ids,attention)
+                    span_base=current
                     current=self.mix_probabilities(current,copy,gate)
+                    if self.native_route and self._binding_cfg.identity_readout_native_span_boundaries and self._binding_cfg.identity_readout_native_span_readout=='categorical_v2' and bool(self.native_span_ready):
+                        supported=state.word_node is not None and state.word_prior is not None and bool(state.word_prior.sum()>0)
+                        if supported:
+                            macro=span_logits.float().softmax(-1)
+                            confidence=macro.max()
+                            strength=native_activation*torch.where(confidence>=self._binding_cfg.identity_readout_native_span_confidence,
+                                self._confidence_activation(confidence),torch.zeros_like(confidence))
+                            if bool(strength>0):
+                                canonical=self.span_categorical_probabilities(span_base,copy,span_gate,macro)
+                                current=((1.-strength)*current.float().exp()+strength*canonical).clamp_min(1e-30).log().to(current.dtype)
                 steps.append(current)
             rows.append(torch.stack(steps))
         return torch.stack(rows),states
+
+
+    def span_categorical_probabilities(self,base,copy,gate,macro):
+        mask=torch.ones_like(base,dtype=torch.bool).index_fill(0,self.surface_ids,False)
+        fallback=base[mask].float().softmax(-1)
+        mass=copy[mask].sum()
+        copied=torch.where(mass>0,copy[mask]/mass.clamp_min(1e-30),fallback)
+        lexical=(1.-gate.float().sigmoid())*fallback+gate.float().sigmoid()*copied
+        result=torch.zeros_like(base,dtype=torch.float32).index_copy(0,self.surface_ids,macro[:-1])
+        result[mask]=macro[-1]*lexical
+        return result
+
+    def source_boundary_logits(self,features):
+        base=self.native_source_boundary(features)
+        if not self._binding_cfg.identity_readout_source_boundary_adapter:return base
+        proposed=base+self.native_source_boundary_adapter(features)
+        selected=proposed.float().softmax(-1).max(-1).values>=self._binding_cfg.identity_readout_native_span_confidence
+        return torch.where(selected.unsqueeze(-1),proposed,base)
+
+    def commit_span_calibration(self,macro_logits,targets):
+        """Training-only guard; uncertain positions retain the previous readout."""
+        if not self._binding_cfg.identity_readout_native_span_boundaries or self._binding_cfg.identity_readout_native_span_readout!='categorical_v2':
+            raise ValueError('Categorical span calibration requires its readout')
+        if macro_logits.ndim!=2 or macro_logits.size(1)!=self.surface_ids.numel()+1 or targets.shape!=macro_logits.shape[:1]:
+            raise ValueError('Span calibration logits and targets differ')
+        with torch.no_grad():
+            p=macro_logits.float().softmax(-1);confidence,prediction=p.max(-1)
+            selected=confidence>=self._binding_cfg.identity_readout_native_span_confidence
+            count=int(selected.sum());correct=int((selected&prediction.eq(targets)).sum())
+            accepted=count>0 and count==correct
+            if accepted:self.native_span_ready.fill_(True)
+        return dict(selected_positions=count,selected_correct=correct,accepted=accepted)
+
+    @staticmethod
+    def source_cursor_targets(state,emitted_separators,ids):
+        """Advance only contiguous, observed source occurrences across verified gaps."""
+        result=torch.zeros(ids.numel(),device=ids.device,dtype=torch.float32)
+        if state.source_cursor is None or state.words is None:return result
+        eligible=state.words.source_candidate_mask(state.entries)
+        previous=[];following=[]
+        for i in range(len(state.entries)-1):
+            if not eligible[i] or not eligible[i+1]:continue
+            serial=state.entries[i][3];other=state.entries[i+1][3]
+            if other not in (serial,serial+1):continue
+            gap=[] if other==serial else state.words.following.get(serial,[])
+            if gap==list(emitted_separators):previous.append(i);following.append(i+1)
+        if previous:
+            positions=torch.tensor(previous,device=ids.device)
+            result=result.index_add(0,torch.tensor(following,device=ids.device),state.source_cursor[positions])
+        return result/result.sum().clamp_min(1e-30)
+
+    @staticmethod
+    def source_boundary_vector(bank,state,tokenizer,device):
+        """Observed source occurrences, aligned to the emitted lexical/surface suffix.
+
+        Matching selects evidence, not output tokens. Repeated occurrences share
+        posterior mass; unsupported prefixes contribute zero. Following separators
+        come only from the already observed input, never future output labels.
+        """
+        zero=bank.embedding.weight.new_zeros(bank.embedding.embedding_dim)
+        if not state.output_units or state.words is None:return zero
+        records={serial:(clause,word) for serial,clause,word in state.words.records}
+        eligible=state.words.source_candidate_mask(state.entries) if state.source_mask is not None else [True]*len(state.entries)
+        occurrences=[];best=0
+        for i,entry in enumerate(state.entries):
+            if not eligible[i]:continue
+            history=entry[4]+(entry[0],)
+            length=0
+            for n in range(1,min(len(history),len(state.output_units))+1):
+                if history[-n:]==tuple(state.output_units[-n:]):length=n
+            if not length or length<best:continue
+            serial=entry[3]
+            if serial not in records:continue
+            word=records[serial][1]
+            # Locate this fragment within its source word using entry order.
+            offset=sum(e[3]==serial for e in state.entries[:i+1])-1
+            within=offset+1<len(word)
+            following=[] if within else state.words.following.get(serial,[])
+            emitted=state.output_separators or []
+            if emitted and (within or following[:len(emitted)]!=emitted):continue
+            if length>best:occurrences=[];best=length
+            next_marker='LEX' if within or len(emitted)>=len(following) else tokenizer.construction_units[following[len(emitted)]].text
+            clause_end=any(u.text=='<EOL>' or any(c in '.!?\n' for c in u.render) for u in (tokenizer.construction_units[x] for x in following))
+            line_end=any(tokenizer.construction_units[x].text=='<EOL>' for x in following)
+            occurrences.append((next_marker,clause_end,line_end,within))
+        if not occurrences:return zero
+        values={}
+        for marker,end,line,within in occurrences:
+            for key,value in [('next='+marker,1.),('clause_end',float(end)),('line_end',float(line)),('within_word',float(within)),('supported',1.)]:
+                values[key]=values.get(key,0.)+value/len(occurrences)
+        values['separator_offset='+str(min(len(state.output_separators or []),8))]=1.
+        values['ambiguous']=float(len(set(occurrences))>1)
+        keys=torch.tensor([[1+stable_key(salt+'source_boundary:'+key)%bank.capacity for salt in ('a:','b:')] for key in values],device=device)
+        weights=bank.embedding.weight.new_tensor(list(values.values()))
+        return (bank.embedding(keys).mean(1)*weights[:,None]).sum(0)/math.sqrt(8.)
+
+    @staticmethod
+    def span_boundary_vector(bank,state,unit,complete,partial,attention,matches,nodes):
+        """Canonical word/span roles: independent of the last fragment's identity/shape."""
+        continuation=torch.zeros_like(complete)
+        if matches:
+            verified=torch.tensor([n>0 for n in matches],device=attention.device,dtype=torch.bool)
+            if state.source_mask is not None:verified=verified&state.source_mask
+            continuation=attention[verified].sum()
+        within=torch.zeros_like(complete)
+        if state.word_node is not None:
+            within=attention[nodes[state.word_node]['next']].sum()
+        marker='lexical' if unit.is_lexical else unit.text
+        position=str(state.output_word_count) if state.output_word_count<=8 else 'tail'
+        values=[('word_complete',complete),('word_partial',partial),('verified_continuation',continuation),
+                ('within_word',within),('root',float(state.word_node==0)),('unmatched',float(state.word_node is None)),
+                ('word_position='+position,1.),('marker='+marker,1.)]
+        keys=torch.tensor([[1+stable_key(salt+'span:'+key)%bank.capacity for salt in ('a:','b:')] for key,_ in values],device=attention.device)
+        weights=torch.stack([v if isinstance(v,torch.Tensor) else complete.new_tensor(v) for _,v in values]).to(bank.embedding.weight.dtype)
+        return (bank.embedding(keys).mean(1)*weights[:,None]).sum(0)/math.sqrt(len(values))
+
+    @staticmethod
+    def condition_word_prior(prior,node):
+        """Verified lexical prefixes condition identity support, not output choices."""
+        supported=torch.zeros_like(prior).index_fill(0,torch.tensor(node['complete']+node['partial'],device=prior.device,dtype=torch.long),1.)
+        posterior=prior*supported
+        return posterior/posterior.sum().clamp_min(torch.finfo(prior.dtype).tiny)
 
 
 class ProjectedSignatureBankView(SignatureBankView):

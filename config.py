@@ -46,6 +46,16 @@ class PrismalWaveConfig:
     identity_readout_binding: str = "independent_v1"
     identity_readout_exclude_query_candidates: bool = False
     identity_readout_ordered_agreement: bool = False
+    identity_readout_native_word_paths: bool = False
+    identity_readout_native_conditional_prefix: bool = False
+    identity_readout_native_span_boundaries: bool = False
+    identity_readout_native_span_readout: str = 'residual_v1'
+    identity_readout_native_span_confidence: float = 0.9
+    identity_readout_source_boundaries: bool = False
+    identity_readout_source_boundary_readout: str = 'residual_v1'
+    identity_readout_source_ownership: bool = False
+    identity_readout_source_start_features: str = 'word_neighbors_v1'
+    identity_readout_source_boundary_adapter: bool = False
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
     identity_readout_binding_confidence: float = 0.99
@@ -357,6 +367,28 @@ class PrismalWaveConfig:
             raise ValueError('Query-candidate exclusion requires observed word spans')
         if self.identity_readout_ordered_agreement and self.identity_readout_binding not in {'word_span_v3','word_span_v4','word_span_v5'}:
             raise ValueError('Ordered agreement requires complete word spans')
+        if self.identity_readout_native_word_paths and self.identity_readout_binding!='word_span_v5':
+            raise ValueError('Native word paths require word_span_v5')
+        if self.identity_readout_native_conditional_prefix and not self.identity_readout_native_word_paths:
+            raise ValueError('Conditional native prefixes require native word paths')
+        if self.identity_readout_native_span_boundaries and not self.identity_readout_native_word_paths:
+            raise ValueError('Native span boundaries require native word paths')
+        if self.identity_readout_native_span_readout not in {'residual_v1','categorical_v2'}:
+            raise ValueError('Unknown native span boundary readout')
+        if self.identity_readout_source_boundaries and not self.identity_readout_native_span_boundaries:
+            raise ValueError('Source boundaries require native span boundaries')
+        if self.identity_readout_source_boundary_readout not in {'residual_v1','categorical_v1'}:
+            raise ValueError('Unknown source boundary readout')
+        if self.identity_readout_source_boundary_readout=='categorical_v1' and self.identity_readout_native_span_readout!='categorical_v2':
+            raise ValueError('Categorical source boundaries require categorical native spans')
+        if self.identity_readout_source_ownership and (not self.identity_readout_native_word_paths or not self.identity_readout_exclude_query_candidates):
+            raise ValueError('Source ownership requires native word paths and source/query partitioning')
+        if self.identity_readout_source_start_features not in {'word_neighbors_v1','span_roles_v2'}:
+            raise ValueError('Unknown source-start features')
+        if self.identity_readout_source_boundary_adapter and (not self.identity_readout_source_boundaries or self.identity_readout_source_boundary_readout!='categorical_v1'):
+            raise ValueError('Source boundary adapter requires categorical source boundaries')
+        if not .5 < self.identity_readout_native_span_confidence <= 1.:
+            raise ValueError('Native span confidence must be above 0.5 and at most 1')
         if self.binding_adapter_training and self.identity_readout_binding == 'independent_v1':
             raise ValueError('binding_adapter_training requires lexical binding')
         if self.identity_readout_binding in {'lexical_binding_v1', 'lexical_binding_v2','word_span_v3','word_span_v4','word_span_v5'}:
