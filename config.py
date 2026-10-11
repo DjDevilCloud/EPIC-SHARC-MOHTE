@@ -63,6 +63,12 @@ class PrismalWaveConfig:
     identity_readout_answer_span_task_router: bool = False
     identity_readout_answer_span_word_encoder: str = 'unit_mean_v1'
     identity_readout_answer_span_kind_conditioned_endpoints: bool = False
+    identity_readout_answer_span_typed_extent_eligibility: bool = False
+    identity_readout_answer_span_owner_context: bool = False
+    identity_readout_answer_span_general_context: bool = False
+    identity_readout_answer_span_general_endpoint: bool = False
+    identity_readout_answer_span_general_roles: bool = False
+    identity_readout_answer_span_general_name_plan: bool = False
     identity_readout_answer_span_kinds: list[str] = field(default_factory=lambda: ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
@@ -409,6 +415,18 @@ class PrismalWaveConfig:
             raise ValueError('Answer-span task routing requires complete answer spans')
         if self.identity_readout_answer_span_kind_conditioned_endpoints and not self.identity_readout_complete_answer_spans:
             raise ValueError('Kind-conditioned endpoints require complete answer spans')
+        if self.identity_readout_answer_span_typed_extent_eligibility and not self.identity_readout_complete_answer_spans:
+            raise ValueError('Typed extent eligibility requires complete answer spans')
+        if self.identity_readout_answer_span_owner_context and not self.identity_readout_complete_answer_spans:
+            raise ValueError('Answer-span owner context requires complete answer spans')
+        if self.identity_readout_answer_span_general_name_plan and (not self.identity_readout_answer_span_general_roles or not self.identity_readout_answer_span_general_context or 'PERSON' not in self.identity_readout_answer_span_kinds):
+            raise ValueError('general name plans require general context and observed source roles')
+        if self.identity_readout_answer_span_general_roles and not self.identity_readout_answer_span_general_context:
+            raise ValueError('general source roles require general source context')
+        if self.identity_readout_answer_span_general_endpoint and not self.identity_readout_answer_span_general_context:
+            raise ValueError('general endpoint scoring requires general source context')
+        if self.identity_readout_answer_span_general_context and (not self.identity_readout_complete_answer_spans or 'TEXT_SPAN' not in self.identity_readout_answer_span_kinds):
+            raise ValueError('General source context requires complete answer spans and TEXT_SPAN kind')
         if self.identity_readout_answer_span_word_encoder not in {'unit_mean_v1','shared_word_v2'}:
             raise ValueError('Unknown answer-span word encoder')
         if not self.identity_readout_answer_span_kinds or len(set(self.identity_readout_answer_span_kinds))!=len(self.identity_readout_answer_span_kinds):

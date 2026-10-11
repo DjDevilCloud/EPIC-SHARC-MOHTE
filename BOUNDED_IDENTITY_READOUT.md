@@ -617,3 +617,85 @@ instead of selecting a replacement endpoint. Commas, sentence boundaries, and
 explicit narrower answer kinds stay distinct. Frozen-checkpoint replay restores
 the prior 9/9 and 3/3 failed name prompts without retraining; broader retained-task
 and fitted transfer checks are recorded in the kind/extent control artifacts.
+
+`identity_readout_answer_span_typed_extent_eligibility` adds opt-in, source-only
+compatibility checks after confident kind prediction. The current narrow contracts
+are `YEAR` (one four-digit calendar-year word) and `INTEGER_PART` (one signed digit
+word, excluding a fractional suffix and retaining an observed unary sign). Other
+kinds and uncertain type predictions preserve the previous scoring path.
+
+Eligible starts are those owning at least one compatible end. The existing learned
+start and endpoint scores choose among these source occurrences; a conditional
+distribution excludes incompatible spans. Proposal confidence additionally includes
+kind confidence. Missing support declines a proposal without NaNs. No answer value,
+gold kind, gold endpoint, checkpoint weights, or tokenizer entries are supplied by
+the check. This resolves structural extent contradictions; choosing the correct
+entity-owned occurrence still needs independent evaluation with changed distractors.
+
+`identity_readout_answer_span_owner_context` supplies the missing causal owner
+channel. A source occurrence retains up to 32 complete preceding word vectors from
+its observed sentence/line prefix. Decimal joins and single-letter initial periods
+do not reset that scope. A small shared GRU encodes ordered source prefixes and
+the complete request (bounded to 64 words). A zero-initialized bilinear residual
+adds their compatibility to the learned start score; source-owned endpoints and
+emission progress remain attached through the existing exact occurrence index.
+
+This adapter is opt-in and currently calibrated for confident numeric/date kinds.
+The independently verified person-name path stays separate. At migration it changes
+no scores, adds 7,360 parameters at width 32, and allocates no new embedding/profile
+rows. Owner-only fitting freezes old question/start/end/kind heads, task routing,
+backbone, shared bank and registry buffers. The prior indistinguishable owner-swap
+pair now changes its source prefix and learned selection score in both seeds.
+Counterfactual value/event assignments and retained-format checks are required to
+distinguish actual ownership learning from date/position shortcuts.
+
+`identity_readout_answer_span_general_context` is an experimental opt-in transfer
+path requiring the `TEXT_SPAN` kind. Its separate ordered question router predicts
+applicability before span confidence. Each candidate sees up to 16 preceding and
+17 current/following complete words within an already observed source sentence,
+with a shared-bank occurrence-role marker. Question/output words are excluded.
+Thus a relation following a person's name is available to selection without using
+future generated tokens or gold endpoints.
+
+A shared ordered encoder supplies start compatibility and endpoint request
+residuals. A zero-initialized endpoint scorer additionally combines the existing
+source endpoint properties with the ordered occurrence/request representation;
+this can learn answer extent while leaving successful start selection frozen.
+Existing request/start/end/kind/owner heads can remain frozen while this
+path learns. Below .99 scope probability, the extra TEXT_SPAN class is excluded
+and prior scoring is retained exactly; above it, the predicted scope probability
+also contributes to proposal confidence. This is learned routing, so independent
+old-task rejection and held-query tests remain necessary. The option defaults to
+off and does not establish broad QA readiness or a generation speed improvement.
+
+`identity_readout_answer_span_general_roles` adds opt-in observed case-chain
+properties to the general path's occurrence marker and endpoint property vector.
+It distinguishes a marked word's left/right continuation through whitespace or
+an observed single-letter initial, and resets across sentence/line boundaries.
+These are reusable properties in the existing shared bank, not name identities
+or rules forcing a start/endpoint. Question/output words cannot contribute.
+Original start/end features are preserved; inactive general routing remains
+neutral. Existing general checkpoints default to the previous feature contract
+and require an explicit adapted fit to use the new roles.
+
+Applicability replay must include every established question family. Identical
+requests must not be labeled as both old- and new-route examples. Historical raw
+QA gates can contain prior training absent from a more recent fit manifest;
+cohort preparation must audit those documents too. Keep newly held QA out of
+the routing fit, and distinguish old-task replay from independent grammar tests.
+
+`identity_readout_answer_span_general_name_plan` adds a learned full-person request
+cue and a source-span planner. Each candidate masks its proposed value before an
+ordered shared encoder scores the surrounding relation. Name identity remains
+in the exact source copy address; complete spans compete jointly, with start
+marginals and endpoint metrics exposed separately. Reusable case continuity,
+initial punctuation, scope, word-count and formatting properties come from the
+shared bank. Compatibility excludes interior starts/ends in an observed case
+chain; the learned scores still predict which occurrence and extent to use.
+
+This route requires PERSON, general context and observed roles. It starts
+inactive and preserves older checkpoint contracts. A confident general task cue
+can independently establish eligibility when the older genre classifier does
+not recognize a supported new request. Source-owned person plans retain physical
+continuation verification without being vetoed by another route's alias prior.
+No evaluation endpoints or name-specific embedding rows enter generation.

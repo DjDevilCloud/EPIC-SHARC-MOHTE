@@ -23,6 +23,7 @@ class AnswerSpanPlan:
     lexical_start: int = -1
     answer_kind: str = ''
     kind_confidence: float = 0.
+    source_owned_person: bool = False
 
     @property
     def next_token(self):
@@ -35,14 +36,39 @@ class AnswerSpanPlan:
             self.progress += 1
 
 
+class OrderedQuestionScope(nn.Module):
+    """Applicability from ordered question words, independent of span confidence."""
+    def __init__(self,width):
+        super().__init__()
+        self.encoder=nn.GRU(width,width,batch_first=True)
+        self.classifier=nn.Sequential(nn.Linear(width,64),nn.Tanh(),nn.Linear(64,1))
+        nn.init.zeros_(self.classifier[-1].weight)
+        nn.init.constant_(self.classifier[-1].bias,-20.)
+
+    def forward(self,features):
+        single=features.ndim==2
+        if single:features=features[None]
+        encoded,_=self.encoder(features[...,:-1])
+        lengths=(features[...,-1]>0).sum(-1).clamp_min(1)
+        state=encoded[torch.arange(len(features),device=features.device),lengths-1]
+        result=self.classifier(state)
+        return result[0] if single else result
+
+
 class CompleteAnswerSpanPredictor(nn.Module):
     """Small shared request/start/endpoint heads; no observed-profile vocabulary."""
-    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False):
+    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False,typed_extent_eligibility=False,kind_threshold=.9,owner_context=False,general_context=False,general_endpoint=False,general_roles=False,general_name_plan=False):
         super().__init__()
         self.max_words=max_words
         self.feature_version=feature_version
         self.word_encoder=word_encoder
         self.kind_conditioned_endpoints=kind_conditioned_endpoints
+        self.typed_extent_eligibility=typed_extent_eligibility
+        self.kind_threshold=kind_threshold
+        self.owner_context=owner_context
+        self.general_context=general_context
+        self.general_roles=general_roles
+        self.general_name_plan=general_name_plan
         self.kind_labels=tuple(kind_labels or ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
         kinds=len(self.kind_labels)
         self.question_attention=nn.Linear(width,1,bias=False)
@@ -64,6 +90,28 @@ class CompleteAnswerSpanPredictor(nn.Module):
             # Neutral migration; reusable kind properties come from the shared
             # bank, not one learned row per observed answer or source profile.
             self.kind_extent_projection=nn.Parameter(torch.zeros(width,width))
+        if owner_context:
+            # Shared ordered encoder for requests and bounded causal source
+            # prefixes. Zero residual preserves all previous scoring at migration.
+            self.owner_encoder=nn.GRU(width,width,batch_first=True)
+            self.owner_projection=nn.Parameter(torch.zeros(width,width))
+        if general_context:
+            self.general_scope=OrderedQuestionScope(width)
+            self.general_encoder=nn.GRU(width,width,batch_first=True)
+            self.general_start_projection=nn.Parameter(torch.zeros(width,width))
+            self.general_end_projection=nn.Parameter(torch.zeros(width,width))
+            if general_endpoint:
+                self.general_endpoint=nn.Sequential(nn.Linear(7*width,64),nn.Tanh(),nn.Linear(64,1))
+                nn.init.zeros_(self.general_endpoint[-1].weight)
+                nn.init.zeros_(self.general_endpoint[-1].bias)
+            if general_name_plan:
+                self.general_name_scope=OrderedQuestionScope(width)
+                self.general_name_encoder=nn.GRU(width,width,batch_first=True)
+                self.general_name_attention=nn.Linear(width,1,bias=False)
+                nn.init.zeros_(self.general_name_attention.weight)
+                self.general_name_start=nn.Parameter(torch.zeros(width,width))
+                self.general_name_end=nn.Sequential(nn.Linear(3*width,64),nn.Tanh(),nn.Linear(64,1))
+                nn.init.zeros_(self.general_name_end[-1].weight);nn.init.zeros_(self.general_name_end[-1].bias)
 
     @staticmethod
     def payload(tokenizer,text):
@@ -115,6 +163,7 @@ class CompleteAnswerSpanPredictor(nn.Module):
         query=state.words.question()
         if not query:return None
         question=torch.stack([word(ids) for ids in query])
+        name_enabled=self.general_name_plan and bool(self.general_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99) and bool(self.general_name_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99)
         zero=vectors.new_zeros(d)
         def neighbor(i):return vectors[i] if 0<=i<len(groups) else zero
         def unit(pos):return tokenizer.construction_units[raw[pos]] if pos in raw else None
@@ -125,7 +174,44 @@ class CompleteAnswerSpanPredictor(nn.Module):
         def numeric_join(pos):
             left,marker,right=unit(pos-1),unit(pos),unit(pos+1)
             return bool(left is not None and right is not None and marker is not None and left.kind=='digit' and right.kind=='digit' and marker.render in {'.',',','-','/'})
+        owner_prefixes=[];owner_lengths=[];scope_start=0;scope_starts=[]
+        if self.owner_context or self.general_context:
+            for i,group in enumerate(groups):
+                if i:
+                    previous=groups[i-1];left=previous[-1][1];right=group[0][1]
+                    previous_text=tokenizer.decode([item[2] for item in previous],clean_text=False,collapse_structure=False)
+                    for pos in range(left+1,right):
+                        marker=unit(pos)
+                        if marker is None or marker.text in {'<EOL>','<EOI>','<LINE>'}:
+                            scope_start=i;break
+                        if marker.render in {'!','?',';'} or (marker.render=='.' and not numeric_join(pos) and not (len(previous_text)==1 and previous_text.isalpha())):
+                            scope_start=i;break
+                sequence=vectors[max(scope_start,i-32):i]
+                prefix=vectors.new_zeros(32,d);prefix[:len(sequence)]=sequence
+                owner_prefixes.append(prefix);owner_lengths.append(len(sequence))
+                scope_starts.append(scope_start)
+        case_chains=[]
+        if self.general_context and self.general_roles:
+            from signature_bank import BoundedIdentityReadout
+            chain_roles=BoundedIdentityReadout.source_start_chain_roles(state.words,tokenizer)
+            serials=[state.entries[group[0][0]][3] for group in groups]
+            marked=[]
+            for s,group in zip(serials,groups):
+                position=group[0][1]-1;case=False
+                while unit(position) is not None and unit(position).kind=='case':
+                    case=True;position-=1
+                marked.append(case or 'initial=True' in chain_roles.get(s,()))
+            def continues(i,j):
+                if not (marked[i] and marked[j]) or scope_starts[i]!=scope_starts[j]:return False
+                initial='initial=True' in chain_roles.get(serials[i],())
+                gap=[unit(p) for p in range(groups[i][-1][1]+1,groups[j][0][1])]
+                return bool(gap) and all(u is not None and (u.kind=='case' or u.text in {'<SPACE>','<TAB>'} or (initial and u.render=='.')) for u in gap)
+            case_chains=[(marked[i],i>0 and continues(i-1,i),i+1<len(groups) and continues(i,i+1)) for i in range(len(groups))]
+            def case_keys(i):
+                return ['case_marked='+str(case_chains[i][0]),'case_chain_left='+str(case_chains[i][1]),'case_chain_right='+str(case_chains[i][2])]
         start_features=[];starts=[];ends=[];end_features=[];tokens=[];surfaces=[]
+        general_endpoint_roles=[]
+        name_valid=[];name_properties=[];name_contexts=[];name_lengths=[]
         for i,group in enumerate(groups):
             first=group[0][1];leading=first
             while leading>0 and not boundary(unit(leading-1)):leading-=1
@@ -145,7 +231,7 @@ class CompleteAnswerSpanPredictor(nn.Module):
                     for finish in range(last+1,tail+1):
                         original=tokenizer.decode([raw[p] for p in range(begin,finish)],clean_text=False,collapse_structure=False).strip()
                         if not original:continue
-                        for case_mode,text in enumerate(dict.fromkeys((original,original[:1].upper()+original[1:].lower()))):
+                        for case_mode,text in enumerate(dict.fromkeys((original,original[:1].upper()+original[1:].lower(),original[:1].upper()+original[1:]))):
                             keys=['role=endpoint','words='+str(min(j-i+1,8)), 'case_policy='+str(case_mode),
                                   'prefix='+str(begin!=case_start),'tail_count='+str(finish-last-1)]
                             keys+=['trailing='+unit(p).text for p in range(last+1,finish)]
@@ -156,32 +242,163 @@ class CompleteAnswerSpanPredictor(nn.Module):
                                 keys+=['word_type='+category(groups[j]),'next_marker='+(following.text if following is not None else 'unobserved'),
                                        'numeric_continuation='+str(numeric_join(last+1))]
                             end_features.append(torch.cat([neighbor(i),neighbor(j),vectors[i:j+1].mean(0),neighbor(j+1),props(keys)]))
+                            if case_chains:
+                                general_endpoint_roles.append(props(keys+['start_'+key for key in case_keys(i)]+['end_'+key for key in case_keys(j)]))
+                            if name_enabled:
+                                initial='initial=True' in chain_roles.get(serials[j],())
+                                expected_finish=last+2 if initial and unit(last+1) is not None and unit(last+1).render=='.' else last+1
+                                name_valid.append(not case_chains[i][1] and not case_chains[j][2] and scope_starts[i]==scope_starts[j]
+                                                  and begin==case_start and finish==expected_finish
+                                                  and not (unit(last+1) is not None and unit(last+1).render==':')
+                                                  and not any(unit(p) is not None and unit(p).render==':' for p in range(first,last+1)))
+                                name_properties.append(props(keys+['answer_kind=PERSON']+['start_'+key for key in case_keys(i)]+['end_'+key for key in case_keys(j)]))
+                                scope_end=next((k for k in range(j+1,len(groups)) if scope_starts[k]!=scope_starts[j]),len(groups))
+                                before_words=vectors[max(scope_starts[i],i-8):i];after_words=vectors[j+1:min(scope_end,j+9)]
+                                marker=props(['role=person_value','name_words='+str(min(j-i+1,8)),
+                                              'before_words='+str(min(i-scope_starts[i],8)),
+                                              'after_words='+str(min(scope_end-j-1,8))]+case_keys(i))
+                                # Each hypothesis masks its entire proposed
+                                # value before scoring the surrounding relation.
+                                sequence=torch.cat((before_words,marker[None],after_words))
+                                window=vectors.new_zeros(17,d);window[:len(sequence)]=sequence
+                                name_contexts.append(window);name_lengths.append(len(sequence))
                             ends.append((i,j,begin,finish));tokens.append(payload(text));surfaces.append(text)
         if not ends:return None
         result=dict(question=question,start_features=torch.stack(start_features),end_features=torch.stack(end_features),
                     starts=starts,ends=ends,tokens=tokens,surfaces=surfaces)
+        if self.owner_context:
+            result['owner_prefixes']=torch.stack(owner_prefixes)
+            result['owner_lengths']=torch.tensor(owner_lengths,device=device,dtype=torch.long)
+        if self.general_context:
+            observed=[];lengths=[];marker=props(['role=source_occurrence'])
+            scope_ends=[len(groups)]*len(groups)
+            for i in range(len(groups)-2,-1,-1):
+                scope_ends[i]=i+1 if scope_starts[i+1]!=scope_starts[i] else scope_ends[i+1]
+            for i in range(len(groups)):
+                finish=scope_ends[i]
+                occurrence=props(['role=source_occurrence']+case_keys(i)) if case_chains else marker
+                sequence=torch.cat((vectors[max(scope_starts[i],i-16):i],occurrence[None],vectors[i:min(finish,i+17)]))
+                window=vectors.new_zeros(34,d);window[:len(sequence)]=sequence
+                observed.append(window);lengths.append(len(sequence))
+            result['general_contexts']=torch.stack(observed)
+            result['general_lengths']=torch.tensor(lengths,device=device,dtype=torch.long)
+            if case_chains:
+                result['general_case_chains']=case_chains
+                result['general_endpoint_roles']=torch.stack(general_endpoint_roles)
+            if name_enabled:
+                result['name_contexts']=torch.stack(name_contexts)
+                result['name_lengths']=torch.tensor(name_lengths,device=device,dtype=torch.long)
+                result['name_eligibility']=torch.tensor(name_valid,device=device,dtype=torch.bool)
+                result['name_properties']=torch.stack(name_properties)
         if self.kind_conditioned_endpoints:
             result['kind_features']=torch.stack([props(['role=requested_extent','answer_kind='+kind]) for kind in self.kind_labels])
+        if self.typed_extent_eligibility:
+            # Narrow structural contracts, not source identity or answer labels.
+            # YEAR denotes a four-digit calendar year in this schema. INTEGER_PART
+            # denotes one signed digit word, not its observed fractional suffix.
+            years=[];integers=[]
+            for text,(i,j,begin,finish) in zip(surfaces,ends):
+                years.append(text.isdecimal() and len(text)==4 and i==j)
+                first=groups[i][0][1];prefix=unit(first-1)
+                fragment=numeric_join(first-1)
+                signed=prefix is not None and prefix.render in {'+','-'} and not fragment
+                integers.append(text.lstrip('+-').isdecimal() and i==j and not fragment and (not signed or begin<first))
+            result['extent_eligibility']={
+                'YEAR':torch.tensor(years,device=device,dtype=torch.bool),
+                'INTEGER_PART':torch.tensor(integers,device=device,dtype=torch.bool)}
         return result
 
     def scores(self,packet):
         q=self.request_vector(packet['question'])
         kind=self.answer_kind(q)
+        general_probability=kind.new_zeros(())
+        general_active=False;general_query=general_states=None;name_active=False;name_probability=kind.new_zeros(())
+        if self.general_context:
+            general_probability=self.general_scope(self.task_features(packet['question'])).sigmoid().squeeze(-1)
+            general_active=bool(general_probability>=.99)
+            text_index=self.kind_labels.index('TEXT_SPAN')
+            old_kind=kind.clone();old_kind[text_index]=-torch.inf
+            if general_active:
+                kind=old_kind.log_softmax(-1)+(1.-general_probability).clamp_min(1e-8).log()
+                kind[text_index]=general_probability.clamp_min(1e-8).log()
+                if self.general_name_plan:
+                    name_probability=self.general_name_scope(self.task_features(packet['question'])).sigmoid().squeeze(-1)
+                    name_active=bool(name_probability>=.99)
+                    if name_active:
+                        person_index=self.kind_labels.index('PERSON')
+                        kind[person_index]=torch.logaddexp(kind[person_index],(general_probability*name_probability).clamp_min(1e-8).log())
+                        kind[text_index]=(general_probability*(1.-name_probability)).clamp_min(1e-8).log()
+                encoded,_=self.general_encoder(packet['general_contexts'])
+                rows=torch.arange(len(packet['general_lengths']),device=q.device)
+                general_states=encoded[rows,packet['general_lengths']-1]
+                _,request_state=self.general_encoder(packet['question'][-64:][None])
+                general_query=request_state[0,0]
+            else:kind=old_kind
         end_request=q
         if self.kind_conditioned_endpoints:
             extent=kind.softmax(-1)@packet['kind_features']
             end_request=q+F.linear(extent,self.kind_extent_projection)
+        owners=torch.tensor([e[0] for e in packet['ends']],device=q.device)
+        if general_active:
+            end_request=end_request[None]+F.linear(general_states[owners]*general_query,self.general_end_projection)
         def score(features,projection,head,request):
             x=torch.tanh(projection(features));request=request.expand_as(x)
             return head(torch.cat([request,x,request*x],-1)).squeeze(-1)
         start=score(packet['start_features'],self.start_projection,self.start_score,q)
+        if general_active:
+            start=start+(F.linear(general_states,self.general_start_projection)*general_query).sum(-1)/math.sqrt(q.numel())
         end=score(packet['end_features'],self.end_projection,self.end_score,end_request)
-        owners=torch.tensor([e[0] for e in packet['ends']],device=end.device)
+        if general_active and hasattr(self,'general_endpoint'):
+            source_features=packet['end_features']
+            if self.general_roles:
+                source_features=torch.cat((source_features[:,:4*q.numel()],packet['general_endpoint_roles']),-1)
+            endpoint_features=torch.cat((source_features,general_states[owners]*general_query,general_query.expand(len(owners),-1)),-1)
+            end=end+self.general_endpoint(endpoint_features).squeeze(-1)
+        if self.owner_context:
+            type_probs=kind.softmax(-1);type_index=int(type_probs.argmax())
+            # This adapter is fitted for numeric/date ownership. Person-name
+            # selection remains in its independently verified source channel.
+            if self.kind_labels[type_index] in {'YEAR','INTEGER_PART','NUMBER','AMOUNT','MEASUREMENT','DATE','QUALIFIED_COUNT'} and bool(type_probs[type_index]>=self.kind_threshold):
+                encoded,_=self.owner_encoder(packet['owner_prefixes'])
+                lengths=packet['owner_lengths'];rows=torch.arange(len(lengths),device=start.device)
+                context=encoded[rows,lengths.clamp_min(1)-1]*(lengths>0)[:,None]
+                _,request_state=self.owner_encoder(packet['question'][-64:][None])
+                owner_request=request_state[0,0]
+                start=start+(F.linear(context,self.owner_projection)*owner_request).sum(-1)/math.sqrt(q.numel())
+        extent_confidence=general_probability if general_active else kind.new_ones(())
+        eligible_starts=torch.ones_like(start,dtype=torch.bool)
+        if name_active:
+            encoded,_=self.general_name_encoder(packet['name_contexts']);rows=torch.arange(len(packet['name_lengths']),device=q.device)
+            contexts=encoded[rows,packet['name_lengths']-1]
+            query_states,_=self.general_name_encoder(packet['question'][None])
+            query_words=F.layer_norm(query_states[0]+packet['question'],(q.numel(),))
+            request=(query_words*self.general_name_attention(query_words).softmax(0)).sum(0)
+            span_relation=(F.linear(contexts,self.general_name_start)*request).sum(-1)/math.sqrt(q.numel())
+            properties=packet['name_properties'];requests=request.expand_as(properties)
+            end=span_relation+self.general_name_end(torch.cat((properties,requests,properties*requests),-1)).squeeze(-1)
+            valid=packet['name_eligibility'];eligible_starts=torch.tensor([bool(valid[owners==i].any()) for i in range(len(start))],device=q.device)
+            end=end.masked_fill(~valid,-torch.inf)
+            span_posterior=end.log_softmax(0) if bool(valid.any()) else torch.full_like(end,-torch.inf)
+            # Empty owner groups have no differentiable logsumexp: its all-inf
+            # backward would yield NaNs even when the row is later masked.
+            start=torch.stack([torch.logsumexp(span_posterior[owners==i],0) if bool(eligible_starts[i])
+                               else end.new_full((),-torch.inf) for i in range(len(start))])
+            start=start.masked_fill(~eligible_starts,-torch.inf);end=end.masked_fill(~valid,-torch.inf)
+            extent_confidence=general_probability*name_probability
+        elif self.typed_extent_eligibility:
+            probabilities=kind.softmax(-1);index=int(probabilities.argmax())
+            valid=packet['extent_eligibility'].get(self.kind_labels[index])
+            if valid is not None and bool(probabilities[index]>=self.kind_threshold):
+                extent_confidence=probabilities[index]
+                eligible_starts=torch.tensor([bool(valid[owners==i].any()) for i in range(len(start))],device=start.device)
+                start=start.masked_fill(~eligible_starts,-torch.inf)
+                end=end.masked_fill(~valid,-torch.inf)
         # Separate distributions make start and endpoint losses interpretable.
-        normalizer=torch.stack([torch.logsumexp(end[owners==i],0) for i in range(len(start))])
-        joint=start.log_softmax(0)[owners]+end-normalizer[owners]
+        normalizer=torch.stack([torch.logsumexp(end[owners==i],0) if bool(eligible_starts[i]) else end.new_zeros(()) for i in range(len(start))])
+        joint=start.log_softmax(0)[owners]+end-normalizer[owners] if bool(eligible_starts.any()) else torch.full_like(end,-torch.inf)
         applicability=self.task_router(self.task_features(packet['question'])).squeeze(-1) if hasattr(self,'task_router') else self.applicability(q).squeeze(-1)
-        return dict(start=start,end=end,joint=joint,owners=owners,kind=kind,applicability=applicability)
+        if general_active:applicability=torch.maximum(applicability,torch.logit(general_probability.clamp(1e-8,1.-1e-8)))
+        return dict(start=start,end=end,joint=joint,owners=owners,kind=kind,applicability=applicability,extent_confidence=extent_confidence,extent_supported=bool(eligible_starts.any()),source_owned_person=name_active)
 
     def request_vector(self,question):
         q=(question*self.question_attention(question).softmax(0)).sum(0)
@@ -203,7 +420,15 @@ class CompleteAnswerSpanPredictor(nn.Module):
         question=self.question_features(words,bank,lexical_embeddings,tokenizer)
         if question is None:return bank.embedding.weight.new_zeros(())
         logits=self.task_router(self.task_features(question)) if hasattr(self,'task_router') else self.applicability(self.request_vector(question))
-        return logits.sigmoid().squeeze(-1)
+        probability=logits.sigmoid().squeeze(-1)
+        if self.general_context:probability=torch.maximum(probability,self.general_scope(self.task_features(question)).sigmoid().squeeze(-1))
+        return probability
+
+    def general_task_probability(self,words,bank,lexical_embeddings,tokenizer=None):
+        if not self.general_context:return bank.embedding.weight.new_zeros(())
+        question=self.question_features(words,bank,lexical_embeddings,tokenizer)
+        if question is None:return bank.embedding.weight.new_zeros(())
+        return self.general_scope(self.task_features(question)).sigmoid().squeeze(-1)
 
     @staticmethod
     def task_features(question):
@@ -217,14 +442,16 @@ class CompleteAnswerSpanPredictor(nn.Module):
         packet=self.packet(state,tokenizer,bank,lexical_embeddings)
         if packet is None:return None
         scored=self.scores(packet);prob=scored['joint'].exp()
+        if not scored['extent_supported']:return None
         # Equivalent occurrences/surface variants support the same answer.
         totals={}
         for i,tokens in enumerate(packet['tokens']):totals[tokens]=totals.get(tokens,0.)+prob[i]
         tokens=max(totals,key=lambda key:float(totals[key]))
-        confidence=min(1.,max(0.,float(totals[tokens])*float(scored['applicability'].sigmoid())))
+        confidence=min(1.,max(0.,float(totals[tokens])*float(scored['applicability'].sigmoid())*float(scored['extent_confidence'])))
         if confidence<threshold:return None
         matching=[i for i,item in enumerate(packet['tokens']) if item==tokens]
         best=max(matching,key=lambda i:float(prob[i]));start,_,begin,endpoint=packet['ends'][best]
         kind_prob=scored['kind'].float().softmax(-1);kind_index=int(kind_prob.argmax())
         return AnswerSpanPlan(tokens,begin,endpoint,confidence,lexical_start=packet['starts'][start],
-                              answer_kind=self.kind_labels[kind_index],kind_confidence=float(kind_prob[kind_index]))
+                              answer_kind=self.kind_labels[kind_index],kind_confidence=float(kind_prob[kind_index]),
+                              source_owned_person=scored['source_owned_person'])

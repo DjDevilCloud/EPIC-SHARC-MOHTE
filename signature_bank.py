@@ -485,7 +485,7 @@ class BoundedIdentityReadout(nn.Module):
             self.register_buffer('surface_ids', torch.tensor(cfg.identity_readout_surface_ids, dtype=torch.long))
             if cfg.identity_readout_complete_answer_spans:
                 from source_answer_span import CompleteAnswerSpanPredictor
-                self.complete_answer_span=CompleteAnswerSpanPredictor(cfg.d_model,feature_version=cfg.identity_readout_answer_span_features,task_router=cfg.identity_readout_answer_span_task_router,word_encoder=cfg.identity_readout_answer_span_word_encoder,kind_labels=cfg.identity_readout_answer_span_kinds,kind_conditioned_endpoints=cfg.identity_readout_answer_span_kind_conditioned_endpoints)
+                self.complete_answer_span=CompleteAnswerSpanPredictor(cfg.d_model,feature_version=cfg.identity_readout_answer_span_features,task_router=cfg.identity_readout_answer_span_task_router,word_encoder=cfg.identity_readout_answer_span_word_encoder,kind_labels=cfg.identity_readout_answer_span_kinds,kind_conditioned_endpoints=cfg.identity_readout_answer_span_kind_conditioned_endpoints,typed_extent_eligibility=cfg.identity_readout_answer_span_typed_extent_eligibility,kind_threshold=cfg.identity_readout_native_span_confidence,owner_context=cfg.identity_readout_answer_span_owner_context,general_context=cfg.identity_readout_answer_span_general_context,general_endpoint=cfg.identity_readout_answer_span_general_endpoint,general_roles=cfg.identity_readout_answer_span_general_roles,general_name_plan=cfg.identity_readout_answer_span_general_name_plan)
             self.surface_projection = None
             if self.surface_ids.numel():
                 self.surface_projection = nn.Linear(2 * cfg.d_model, self.surface_ids.numel(), bias=False)
@@ -1146,6 +1146,9 @@ class BoundedIdentityReadout(nn.Module):
                         # confidence in a particular start/endpoint proposal.
                         task_applicable=binding_memory is not None and bool(
                             self.native_applicability(binding_memory[4]).sigmoid()>=self.binding_confidence)
+                        if self._binding_cfg.identity_readout_answer_span_general_context:
+                            task_applicable=task_applicable or bool(self.complete_answer_span.general_task_probability(
+                                state.words.question(),bank,lexical_embeddings,tokenizer)>=.99)
                         if self._binding_cfg.identity_readout_answer_span_task_router:
                             task_applicable=task_applicable and bool(self.complete_answer_span.task_probability(
                                 state.words.question(),bank,lexical_embeddings,tokenizer)>=self.binding_confidence)
@@ -1176,6 +1179,13 @@ class BoundedIdentityReadout(nn.Module):
         Equivalent complete occurrences may agree, while a shorter alias cannot
         override its confidently selected full occurrence.
         """
+        if (plan.answer_kind=='TEXT_SPAN' and plan.kind_confidence>=self._binding_cfg.identity_readout_native_span_confidence
+                and 0<=plan.lexical_start<len(state.entries)
+                and tokenizer.construction_units[state.entries[plan.lexical_start][0]].kind=='digit'):
+            # A generic numeric span may denote a full value or a requested
+            # subfield. An unrelated name/prefix-alias prior cannot verify its
+            # ownership; leave that decision with its learned span selector.
+            return True
         if plan.kind_confidence>=self._binding_cfg.identity_readout_native_span_confidence and plan.answer_kind in {
                 'AMOUNT','BILL_CODE','LEGAL_CODE','MEASUREMENT','QUALIFIED_COUNT'} and state.source_surface:
             surface=dict(state.source_surface)
@@ -1215,6 +1225,11 @@ class BoundedIdentityReadout(nn.Module):
                 marked='case_marked=True' in roles.get(last_serial,()) or initial
                 next_marked='case_marked=True' in roles.get(next_serial,()) or 'initial=True' in roles.get(next_serial,())
                 if last_serial!=next_serial and continuing and marked and next_marked:return False
+        if full_person and getattr(plan,'source_owned_person',False):
+            # This plan owns its complete source occurrence. The old selector's
+            # alias prior belongs to a different request route, while the
+            # physical full-name continuation check above still applies.
+            return True
         protected='initial=True' in roles.get(old_serial,()) or old_word in alias_words or (full_person and 'case_marked=True' in roles.get(old_serial,()))
         if not protected:return True
         if (float(confidence)>=self.binding_confidence or full_person) and old_serial!=new_serial:

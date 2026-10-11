@@ -140,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-answer-span-task-router", action="store_true")
         p.add_argument("--identity-readout-answer-span-word-encoder", choices=("unit_mean_v1","shared_word_v2"), default="shared_word_v2")
         p.add_argument("--identity-readout-answer-span-kind-conditioned-endpoints", action="store_true", help="Condition learned endpoints on predicted answer-kind properties from the shared bank")
+        p.add_argument("--identity-readout-answer-span-typed-extent-eligibility", action="store_true", help="Require confident YEAR/INTEGER_PART proposals to satisfy source-only structural contracts")
+        p.add_argument("--identity-readout-answer-span-owner-context", action="store_true", help="Attach bounded causal source-prefix context to numeric/date occurrence selection")
+        p.add_argument("--identity-readout-answer-span-general-context", action="store_true", help="Enable isolated observed-context routing for TEXT_SPAN requests")
+        p.add_argument("--identity-readout-answer-span-general-endpoint", action="store_true", help="Enable the isolated TEXT_SPAN endpoint scorer")
+        p.add_argument("--identity-readout-answer-span-general-roles", action="store_true", help="Compose observed case-chain start/end roles in general span features")
+        p.add_argument("--identity-readout-answer-span-general-name-plan", action="store_true", help="Predict complete person spans from surrounding relation context and source roles")
         p.add_argument("--identity-readout-source-boundary-adapter", action="store_true", help="Confident grammar proposals retain the validated source formatter on uncertainty")
         p.add_argument("--identity-readout-context-units", type=int, default=2)
         p.add_argument("--identity-readout-query-units", type=int, default=4)
@@ -783,6 +789,12 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         identity_readout_answer_span_task_router=getattr(args, "identity_readout_answer_span_task_router", False),
         identity_readout_answer_span_word_encoder=getattr(args, "identity_readout_answer_span_word_encoder", 'unit_mean_v1'),
         identity_readout_answer_span_kind_conditioned_endpoints=getattr(args, "identity_readout_answer_span_kind_conditioned_endpoints", False),
+        identity_readout_answer_span_typed_extent_eligibility=getattr(args, "identity_readout_answer_span_typed_extent_eligibility", False),
+        identity_readout_answer_span_owner_context=getattr(args, "identity_readout_answer_span_owner_context", False),
+        identity_readout_answer_span_general_context=getattr(args, "identity_readout_answer_span_general_context", False),
+        identity_readout_answer_span_general_endpoint=getattr(args, "identity_readout_answer_span_general_endpoint", False),
+        identity_readout_answer_span_general_roles=getattr(args, "identity_readout_answer_span_general_roles", False),
+        identity_readout_answer_span_general_name_plan=getattr(args, "identity_readout_answer_span_general_name_plan", False),
         identity_readout_source_boundary_adapter=getattr(args, "identity_readout_source_boundary_adapter", False),
         identity_readout_context_units=getattr(args, "identity_readout_context_units", 2),
         identity_readout_query_units=getattr(args, "identity_readout_query_units", 4),
