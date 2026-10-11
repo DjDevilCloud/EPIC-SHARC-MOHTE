@@ -540,3 +540,80 @@ sequences per seed. Broader QA scores 1/22 and 2/22; the database regression is
 recovered, but broader transfer remains a separate blocker to unrestricted scaling.
 See [the verified continuation repair](review_artifacts/REMAINING_ARCHITECTURE_REPAIR_20261010.md)
 and its executable retained-task gate for checkpoint provenance and final diagnostics.
+
+## Short grounded field transfer (2026-10-10)
+
+`--identity-readout-source-boundary-properties` enables a zero-initialized classifier
+and copy gate over shared-bank source word type, casing, root/within-word roles and
+separator progress. The accepted formatter remains underneath the adapter; uncertain
+or unsupported property proposals retain it. In particular, completed numeric words
+have distinct features from ordinary words, and observed source casing is available
+before the first generated lexical unit. The option requires categorical source
+boundaries and is disabled by default for checkpoint compatibility.
+
+The next curriculum uses seven native record templates plus one controlled calendar
+date, with 24 training records and 16 reserved value substitutions in three layouts.
+Both seeds pass 72/72 training and 48/48 value-transfer outputs. A separate harder
+stress set scores 18/24 and 24/24; seed 47 still selects/ends two longer person names
+incorrectly. Those stress failures and wider question grammar remain separate gates.
+The two previously useful broad-QA records are retention rehearsal, so their success
+is excluded from unfitted broad-QA claims. See
+[the short grounded field report](review_artifacts/SHORT_GROUNDED_FIELDS_TRANSFER_20261010.md)
+for exact checkpoints, prior-output replay and source/formatter freeze boundaries.
+
+## Complete person-name roles and alias confidence (2026-10-10)
+
+`--identity-readout-source-start-features context_roles_v5` composes observed
+initial/continuation roles and verified source-line prefix-alias relations in the
+previously unused third source-start slot. Exact word identities and separators
+verify the relation; the shared bank embeds reusable roles. Query entries cannot
+provide alias evidence. Ordinary candidates supply zero in this channel, preserving
+the accepted scoring path for unrelated numeric/text values. No parameters or
+whole-profile catalog rows are added. Earlier feature versions remain available.
+
+The person-name curriculum fits 16 records in three layouts, with coherent complete
+and split metadata. Both seeds pass 48/48 fitted outputs, 36/36 reserved development
+outputs, and 24/24 final fresh initial/no-initial confirmations. All earlier name
+and short-field stress cases pass as well. The earlier 18/24 name stress result
+describes the parent checkpoint; the new accepted checkpoint scores 24/24 in both.
+
+Retained-field confidence supervision keeps supported property decisions above the
+unchanged runtime threshold. A source-only margin against negative verified aliases
+then raises occurrence confidence at a previously failing separator from 72% to
+98.94%, and the space decision from 68% to 99.9985%. The property formatter stays
+frozen during that final source repair. Both seeds retain all 1,524 previous output
+sequences with identical IDs and pass streaming agreement. The 20 remaining unfitted
+broader-QA records still score 0/20. See
+[the complete person-name report](review_artifacts/PERSON_NAME_LENGTH_REPAIR_20261010.md)
+for accepted checkpoints, development/confirmation boundaries and the executable gate.
+
+## Complete answer-span proposals (2026-10-11)
+
+The opt-in complete-span path learns question-conditioned start/extent and carries
+source markers and verified progress through decoding. Task applicability is
+separate from selected-span confidence; old ownership and typed source-construct
+checks can decline an incompatible proposal. Original accepted checkpoints remain
+the default. No tokenizer change or repetition suppression is added.
+
+Ordered word composition is now shared with native retrieval via
+`compose_word_identity`; `shared_word_v2` preserves character order that the
+experimental unit mean lost. The matched question/extent control fits its training
+examples but does not improve held-out QA over the mean encoder; see
+[the ordered control](review_artifacts/ordered_span_control_20261011/REPORT.md).
+See [the complete-span report](review_artifacts/COMPLETE_ANSWER_SPAN_PLAN_20261010.md)
+for candidate comparisons, rejected changes, replay provenance and remaining QA limits.
+
+`identity_readout_answer_span_kind_conditioned_endpoints` is an additional opt-in
+repair. The predicted kind distribution composes reusable request/extent properties
+in the existing shared bank, then projects that mixture into the endpoint request.
+Endpoint loss can train the kind decision through this path; generation never
+receives a gold kind or endpoint. The new projection is zero-initialized for exact
+neutral migration, and existing checkpoint configurations default to the old path.
+
+Full-person proposals also decline disagreement with a confident capitalized source
+owner, or an endpoint inside an observed initial/capitalized name chain. The check
+uses source occurrences, case controls, and separators. It declines the proposal
+instead of selecting a replacement endpoint. Commas, sentence boundaries, and
+explicit narrower answer kinds stay distinct. Frozen-checkpoint replay restores
+the prior 9/9 and 3/3 failed name prompts without retraining; broader retained-task
+and fitted transfer checks are recorded in the kind/extent control artifacts.

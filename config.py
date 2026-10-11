@@ -57,6 +57,13 @@ class PrismalWaveConfig:
     identity_readout_source_start_features: str = 'word_neighbors_v1'
     identity_readout_word_path_readout: str = 'bias_v1'
     identity_readout_source_boundary_adapter: bool = False
+    identity_readout_source_boundary_properties: bool = False
+    identity_readout_complete_answer_spans: bool = False
+    identity_readout_answer_span_features: str = 'surface_v1'
+    identity_readout_answer_span_task_router: bool = False
+    identity_readout_answer_span_word_encoder: str = 'unit_mean_v1'
+    identity_readout_answer_span_kind_conditioned_endpoints: bool = False
+    identity_readout_answer_span_kinds: list[str] = field(default_factory=lambda: ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
     identity_readout_binding_confidence: float = 0.99
@@ -384,7 +391,7 @@ class PrismalWaveConfig:
             raise ValueError('Categorical source boundaries require categorical native spans')
         if self.identity_readout_source_ownership and (not self.identity_readout_native_word_paths or not self.identity_readout_exclude_query_candidates):
             raise ValueError('Source ownership requires native word paths and source/query partitioning')
-        if self.identity_readout_source_start_features not in {'word_neighbors_v1','span_roles_v2','context_roles_v3'}:
+        if self.identity_readout_source_start_features not in {'word_neighbors_v1','span_roles_v2','context_roles_v3','context_roles_v4','context_roles_v5'}:
             raise ValueError('Unknown source-start features')
         if self.identity_readout_word_path_readout not in {'bias_v1','posterior_v2'}:
             raise ValueError('Unknown word-path readout')
@@ -392,6 +399,20 @@ class PrismalWaveConfig:
             raise ValueError('Posterior word-path readout requires native word paths')
         if self.identity_readout_source_boundary_adapter and (not self.identity_readout_source_boundaries or self.identity_readout_source_boundary_readout!='categorical_v1'):
             raise ValueError('Source boundary adapter requires categorical source boundaries')
+        if self.identity_readout_source_boundary_properties and (not self.identity_readout_source_boundaries or self.identity_readout_source_boundary_readout!='categorical_v1'):
+            raise ValueError('Source boundary properties require categorical source boundaries')
+        if self.identity_readout_complete_answer_spans and not self.identity_readout_source_ownership:
+            raise ValueError('Complete answer spans require source ownership')
+        if self.identity_readout_answer_span_features not in {'surface_v1','surface_v2'}:
+            raise ValueError('Unknown complete answer-span features')
+        if self.identity_readout_answer_span_task_router and not self.identity_readout_complete_answer_spans:
+            raise ValueError('Answer-span task routing requires complete answer spans')
+        if self.identity_readout_answer_span_kind_conditioned_endpoints and not self.identity_readout_complete_answer_spans:
+            raise ValueError('Kind-conditioned endpoints require complete answer spans')
+        if self.identity_readout_answer_span_word_encoder not in {'unit_mean_v1','shared_word_v2'}:
+            raise ValueError('Unknown answer-span word encoder')
+        if not self.identity_readout_answer_span_kinds or len(set(self.identity_readout_answer_span_kinds))!=len(self.identity_readout_answer_span_kinds):
+            raise ValueError('Answer-span kinds must be nonempty and unique')
         if not .5 < self.identity_readout_native_span_confidence <= 1.:
             raise ValueError('Native span confidence must be above 0.5 and at most 1')
         if self.binding_adapter_training and self.identity_readout_binding == 'independent_v1':
