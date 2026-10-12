@@ -72,6 +72,9 @@ class PrismalWaveConfig:
     identity_readout_answer_span_general_query_attention: bool = False
     identity_readout_answer_span_general_relation_attention: bool = False
     identity_readout_answer_span_relation_eligibility: bool = False
+    identity_readout_answer_span_endpoint_properties: bool = False
+    identity_readout_answer_span_endpoint_task_router: bool = False
+    identity_readout_answer_span_causal_owners: bool = False
     identity_readout_answer_span_kinds: list[str] = field(default_factory=lambda: ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
@@ -426,6 +429,12 @@ class PrismalWaveConfig:
             raise ValueError('general name plans require general context and observed source roles')
         if self.identity_readout_answer_span_relation_eligibility and not self.identity_readout_answer_span_general_relation_attention:
             raise ValueError('Answer-span relation eligibility requires general relation attention')
+        if self.identity_readout_answer_span_endpoint_properties and not self.identity_readout_answer_span_general_context:
+            raise ValueError('Endpoint property scoring requires general span context')
+        if self.identity_readout_answer_span_endpoint_task_router and not self.identity_readout_answer_span_endpoint_properties:
+            raise ValueError('Endpoint task routing requires endpoint property scoring')
+        if self.identity_readout_answer_span_causal_owners and not self.identity_readout_answer_span_endpoint_task_router:
+            raise ValueError('Causal owner selection requires endpoint task routing')
         if self.identity_readout_answer_span_general_relation_attention and not self.identity_readout_answer_span_general_context:
             raise ValueError('Relation attention requires general span context')
         if self.identity_readout_answer_span_general_query_attention and not self.identity_readout_answer_span_general_context:

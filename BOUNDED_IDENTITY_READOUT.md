@@ -755,3 +755,65 @@ attention, and bypasses the name planner. The follow-on control labels both
 source amounts as eligible while supervising which owner is requested through
 the existing complete-span loss. It freezes the fitted relation attention and
 all prior parameters. No runtime numeric-only rule or gold answer mask is added.
+
+`identity_readout_answer_span_endpoint_properties` is a separate default-off
+option requiring general span context. A zero-initialized scorer combines the
+question request with the existing shared-bank endpoint properties: leading
+markers, trailing markers, word count, case policy and source boundary roles.
+It adds only an endpoint residual; source-start scoring and the independently
+verified name planner remain unchanged. The controlled fit freezes all existing
+parameters and supervises conditional endpoint probabilities on source-owned
+answer spans. Both amounts in each paired control supply marker/extent labels,
+without identifying the requested owner to the endpoint scorer. Evaluation
+labels never enter decoding. Results and saved candidates are kept separately
+under `review_artifacts/endpoint_properties_control_20261011`.
+
+`identity_readout_answer_span_endpoint_task_router` optionally gates that
+correction using a small classifier over the existing shared ordered request
+vector. It defaults off for compatibility, requires endpoint properties, and
+starts with the correction disabled until applicability is learned. The tested
+router is supervised for the controlled amount-request family; other native
+request families retain their prior endpoints. Its applicability threshold is
+0.99, separate from the unchanged 0.90 complete-answer confidence threshold.
+The property scorer and router add 7,362 parameters at width 32, without new
+signature/profile embedding rows. Routed candidates and acceptance limits are
+documented in `review_artifacts/endpoint_properties_routed_20261011/REPORT.md`.
+
+Source-cache coverage must include required owner/relation cues as well as
+answer payloads. The 32-block filler probes exceed the 1,024-unit cache and
+evict the first owner cue. A separate same-weights 2,048-unit comparison retains
+both cues; it is a coverage diagnostic, not a default memory-budget change or
+proof of bounded-context generalization. Longer inputs still require preserving
+causal owner information across eviction.
+
+### Causal owner-prefix experiment (2026-10-11)
+
+`identity_readout_answer_span_causal_owners` defaults to false and requires the
+endpoint request router. Each live source clause retains its first eight complete
+words, capped at 64 lexical units. These anchors are captured as input arrives,
+cloned with recurrent state, and removed once the entire clause leaves the source
+cache. Across live clauses their lexical-ID storage is bounded by the ordinary
+word-record budget plus 64 units: only the oldest live clause can have an evicted
+prefix. Oversized/truncated prefixes are marked unavailable. Candidate summaries
+include only anchor words that precede that occurrence, using the existing shared
+word composer and ordered encoder. Neither evaluation labels nor future source
+words enter the summary.
+
+Three small learned heads separate owning-relation matching, answer-start kind,
+and applicability of the retained prefix. Ownership scores have no candidate-value
+embedding or absolute-position input. Start-kind scores use the existing shared
+structural properties. The independently verified person planner bypasses this
+path. Other requests/layouts retain prior scoring unless the learned request,
+prefix-applicability and start-kind checks all exceed 0.99, with a separately
+calibrated owning-relation match above 0.99. Its confidence also scales the
+complete-answer confidence. On this verified route the existing structural
+endpoint scorer supplies the endpoint distribution directly; legacy lexical and
+position-dependent endpoint residuals cannot undermine its boundary confidence.
+The applicability head
+starts disabled; enabling the option alone preserves prior answer scores.
+
+The current prefix representation covers owners introduced near clause starts.
+It is not a general entity parser, arbitrary discourse memory, or proof of unseen
+relation grammar. Answer payloads themselves must still remain in the source
+cache. Controlled checkpoints and raw-generation results are kept under
+`review_artifacts/causal_owner_varied_20261011`; earlier defaults are unchanged.

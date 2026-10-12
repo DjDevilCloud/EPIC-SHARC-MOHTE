@@ -5,12 +5,150 @@ import tempfile
 from unittest.mock import patch
 import torch
 from tests import test_source_ownership as ownership
-from signature_bank import BoundedIdentityReadout,compose_word_identity
+from signature_bank import BoundedIdentityReadout,compose_word_identity,WordSpanState
 from source_answer_span import AnswerSpanPlan,CompleteAnswerSpanPredictor
 from train import save_checkpoint,load_bundle_from_checkpoint
 
 
 class CompleteAnswerSpanTests(unittest.TestCase):
+    def test_causal_anchor_survives_eviction_and_prunes_expired_clause(self):
+        from types import SimpleNamespace
+        lexical=SimpleNamespace(is_lexical=True)
+        st=WordSpanState(16,anchor_words=8)
+        for token in range(40):
+            st.observe(token,lexical);st.boundary()
+        self.assertEqual([w for _,w in st.anchors[0]],[(i,) for i in range(8)])
+        self.assertEqual(st.records[0][0],24)
+        cloned=st.clone();cloned.boundary(clause=True)
+        for token in range(40,60):
+            cloned.observe(token,lexical);cloned.boundary()
+        self.assertNotIn(0,cloned.anchors)
+        self.assertIn(0,st.anchors)
+        self.assertLessEqual(sum(len(w) for prefix in cloned.anchors.values() for _,w in prefix),cloned.capacity+64)
+
+    def test_causal_anchor_does_not_register_truncated_word(self):
+        from types import SimpleNamespace
+        st=WordSpanState(4,anchor_words=8)
+        for token in range(8):st.observe(token,SimpleNamespace(is_lexical=True))
+        st.boundary()
+        self.assertIn(0,st.anchor_truncated)
+        self.assertNotIn(0,st.anchors)
+
+    def test_production_causal_owner_survives_lexical_eviction(self):
+        t,m,_=self.fixture(general=True,endpoints=True,endpoint_router=True,causal=True)
+        head=m.bounded_identity_readout;module=head.complete_answer_span
+        text='Context:\nThe budget has notes '+('ordinary recorded detail '*30)+'with amount $75.\nQuestion:\nWhat is the budget?'
+        packets=[];states=[]
+        for capacity in (2048,128):
+            head.capacity=capacity
+            _,_,_,st=self.state(t,m,text);states.append(st)
+            packets.append(module.packet(st,t,m.shared_signature_bank,m.construction_embedding))
+        self.assertGreater(states[1].words.records[0][0],0)
+        indices=[p['ends'][p['surfaces'].index('$75')][0] for p in packets]
+        for key in ('causal_owner_contexts','causal_owner_properties'):
+            torch.testing.assert_close(packets[0][key][indices[0]],packets[1][key][indices[1]],atol=0,rtol=0)
+        self.assertTrue(bool(packets[1]['causal_owner_available'][indices[1]]))
+
+    def test_causal_owner_neutral_and_value_independent(self):
+        t,m,_=self.fixture(general=True,endpoints=True,endpoint_router=True,causal=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        with torch.no_grad():
+            module.general_scope.classifier[-1].bias.fill_(100.)
+            module.endpoint_scope[-1].bias.fill_(100.)
+        packets=[]
+        for value in ('75','123'):
+            _,_,_,state=self.state(t,m,f'Context:\nThe budget has notes ordinary detail with amount ${value}.\nQuestion:\nWhat is the budget?')
+            p=module.packet(state,t,m.shared_signature_bank,m.construction_embedding);packets.append(p)
+            baseline=module.scores(p)
+            with patch.object(module,'causal_owner_scores',return_value=dict(match=torch.zeros(len(p['starts'])),kind=torch.zeros(len(p['starts'])),scope=torch.full((len(p['starts']),),-100.))):
+                unchanged=module.scores(p)
+            for key in ('start','end','joint'):torch.testing.assert_close(baseline[key],unchanged[key],atol=0,rtol=0)
+            # First source word cannot see later source words.
+            self.assertFalse(bool(p['causal_owner_available'][0]))
+        for key in ('causal_owner_contexts','causal_owner_properties'):
+            a=packets[0]['ends'][packets[0]['surfaces'].index('$75')][0]
+            b=packets[1]['ends'][packets[1]['surfaces'].index('$123')][0]
+            torch.testing.assert_close(packets[0][key][a],packets[1][key][b],atol=0,rtol=0)
+        torch.testing.assert_close(packets[0]['start_features'][a,-m.cfg.d_model:],packets[1]['start_features'][b,-m.cfg.d_model:],atol=0,rtol=0)
+        with torch.no_grad():
+            for net in (module.causal_owner_match,module.causal_owner_kind,module.causal_owner_scope):net[-1].weight.fill_(.25)
+        request=module.general_request(packets[0]['question'])
+        scores=[module.causal_owner_scores(p,request) for p in packets]
+        for key in ('match','kind','scope'):torch.testing.assert_close(scores[0][key][a],scores[1][key][b],atol=0,rtol=0)
+
+    def test_confident_causal_owner_selects_supported_start_only(self):
+        t,m,_=self.fixture(general=True,endpoints=True,endpoint_router=True,causal=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        with torch.no_grad():
+            module.general_scope.classifier[-1].bias.fill_(100.)
+            module.endpoint_scope[-1].bias.fill_(100.)
+        _,_,_,state=self.state(t,m,'Context:\nThe budget has notes with amount $75. Other costs have amount $123.\nQuestion:\nWhat is the budget?')
+        p=module.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        a=p['ends'][p['surfaces'].index('$75')][0];b=p['ends'][p['surfaces'].index('$123')][0]
+        kind=torch.full((len(p['starts']),),-100.);kind[[a,b]]=100.
+        match=torch.zeros_like(kind);match[a]=10.
+        before=module.scores(p)
+        with patch.object(module,'causal_owner_scores',return_value=dict(match=match,kind=kind,scope=torch.full_like(kind,100.))):
+            after=module.scores(p)
+        with patch.object(module,'causal_owner_scores',return_value=dict(match=torch.full_like(kind,-100.),kind=kind,scope=torch.full_like(kind,100.))):
+            unsupported=module.scores(p)
+        torch.testing.assert_close(before['start'],unsupported['start'],atol=0,rtol=0)
+        # Kind confidence cannot borrow ownership confidence from another candidate.
+        biased=kind.clone();biased[b]=1000.;wrong=match.clone();wrong[b]=-10.
+        with patch.object(module,'causal_owner_scores',return_value=dict(match=wrong,kind=biased,scope=torch.full_like(kind,100.))):
+            declined=module.scores(p)
+        torch.testing.assert_close(before['start'],declined['start'],atol=0,rtol=0)
+        self.assertEqual(int(after['start'].argmax()),a)
+        self.assertEqual(int(torch.isfinite(after['start']).sum()),2)
+        torch.testing.assert_close(after['end'],module.endpoint_property_scores(p,module.general_request(p['question'])),atol=0,rtol=0)
+        self.assertFalse(torch.isnan(after['joint']).any())
+
+    def test_endpoint_request_router_preserves_other_tasks(self):
+        t,m,_=self.fixture(general=True,endpoints=True,endpoint_router=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        with torch.no_grad():
+            module.general_scope.classifier[-1].bias.fill_(100.)
+            module.endpoint_properties[-1].weight.fill_(.2)
+        _,_,_,state=self.state(t,m,'Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?')
+        packet=module.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        with patch.object(module.endpoint_properties,'forward',side_effect=AssertionError('unfitted router applied correction')):
+            baseline=module.scores(packet)
+        with torch.no_grad():module.endpoint_scope[-1].bias.fill_(100.)
+        updated=module.scores(packet)
+        torch.testing.assert_close(baseline['start'],updated['start'],atol=0,rtol=0)
+        self.assertFalse(torch.equal(baseline['end'],updated['end']))
+    def test_endpoint_properties_change_boundaries_without_changing_starts(self):
+        t,m,_=self.fixture(general=True,query_attention=True,endpoints=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        with torch.no_grad():module.general_scope.classifier[-1].bias.fill_(100.)
+        _,_,_,state=self.state(t,m,'Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?')
+        packet=module.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        before=module.scores(packet)
+        with torch.no_grad():module.endpoint_properties[-1].weight.fill_(.2)
+        after=module.scores(packet)
+        torch.testing.assert_close(before['start'],after['start'],atol=0,rtol=0)
+        self.assertFalse(torch.equal(before['end'],after['end']))
+        variants=[packet['surfaces'].index(x) for x in ('$75','75','$75.')]
+        properties=packet['general_endpoint_roles'][variants]
+        self.assertFalse(torch.equal(properties[0],properties[1]))
+        self.assertFalse(torch.equal(properties[0],properties[2]))
+        request=module.general_request(packet['question'])
+        (-module.endpoint_property_scores(packet,request)[variants[0]]).backward()
+        self.assertTrue(torch.isfinite(module.endpoint_properties[-1].weight.grad).all())
+        self.assertGreater(float(module.endpoint_properties[-1].weight.grad.abs().sum()),0.)
+
+    def test_endpoint_properties_bypass_verified_person_planner(self):
+        t,m,_=self.fixture(general=True,guide=True,endpoints=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        with torch.no_grad():
+            module.general_scope.classifier[-1].bias.fill_(100.)
+            module.general_name_scope.classifier[-1].bias.fill_(100.)
+        _,_,_,state=self.state(t,m,'Context:\nJ. Reed wrote Blue River.\nQuestion:\nWho wrote Blue River?')
+        packet=module.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        with patch.object(module.endpoint_properties,'forward',side_effect=AssertionError('name path called endpoint adapter')):
+            scored=module.scores(packet)
+        self.assertTrue(scored['source_owned_person'])
+
     def test_relation_context_neutral_migration_and_remote_gradients(self):
         torch.manual_seed(23)
         old=CompleteAnswerSpanPredictor(8,general_context=True)
@@ -40,7 +178,7 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         packet=old.packet(state,t,m.shared_signature_bank,m.construction_embedding)
         new=CompleteAnswerSpanPredictor(m.cfg.d_model,kind_labels=old.kind_labels,
             general_context=True,general_endpoint=True,general_roles=True,
-            general_query_attention=True,general_relation_attention=True,relation_eligibility=True)
+            general_query_attention=True,general_relation_attention=True,relation_eligibility=True,endpoint_properties=True)
         new.load_state_dict(old.state_dict(),strict=False)
         updated=new.packet(state,t,m.shared_signature_bank,m.construction_embedding)
         a,b=old.scores(packet),new.scores(updated)
@@ -63,7 +201,7 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(module.relation_scope.weight.grad).all())
         self.assertGreater(float(module.relation_scope.weight.grad.abs().sum()),0.)
 
-    def fixture(self,conditioned=False,typed=False,owner=False,general=False,guide=False,query_attention=False,relation_attention=False,eligibility=False):
+    def fixture(self,conditioned=False,typed=False,owner=False,general=False,guide=False,query_attention=False,relation_attention=False,eligibility=False,endpoints=False,endpoint_router=False,causal=False):
         f=ownership.SourceOwnershipTests();helper,t,m=f.fixture();f.enable(m,t)
         old=m.bounded_identity_readout
         old._binding_cfg=copy.copy(m.cfg)
@@ -78,6 +216,9 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         m.cfg.identity_readout_answer_span_general_query_attention=query_attention
         m.cfg.identity_readout_answer_span_general_relation_attention=relation_attention
         m.cfg.identity_readout_answer_span_relation_eligibility=eligibility
+        m.cfg.identity_readout_answer_span_endpoint_properties=endpoints
+        m.cfg.identity_readout_answer_span_endpoint_task_router=endpoint_router
+        m.cfg.identity_readout_answer_span_causal_owners=causal
         if general:m.cfg.identity_readout_answer_span_kinds=list(m.cfg.identity_readout_answer_span_kinds)+['TEXT_SPAN']
         head=BoundedIdentityReadout(m.cfg);head.load_state_dict(old.state_dict(),strict=False)
         m.bounded_identity_readout=head;m.prepare_capacity_for_tokenizer(t)
@@ -458,7 +599,7 @@ class CompleteAnswerSpanTests(unittest.TestCase):
             self.assertIsNone(module.propose(state,t,m.shared_signature_bank,m.construction_embedding))
 
     def test_active_plan_streams_reloads_and_task_rejection_is_neutral(self):
-        t,m,old=self.fixture(conditioned=True,typed=True,owner=True,general=True,guide=True,query_attention=True,relation_attention=True,eligibility=True);head=m.bounded_identity_readout;module=head.complete_answer_span
+        t,m,old=self.fixture(conditioned=True,typed=True,owner=True,general=True,guide=True,query_attention=True,relation_attention=True,eligibility=True,endpoints=True,endpoint_router=True,causal=True);head=m.bounded_identity_readout;module=head.complete_answer_span
         ids,features,baseline,state=self.state(t,m,'Context:\nThe budget is $75 million.\nQuestion:\nWhat is the budget?')
         module.ready.fill_(True)
         with torch.no_grad():
@@ -492,6 +633,9 @@ class CompleteAnswerSpanTests(unittest.TestCase):
             self.assertTrue(cfg.identity_readout_answer_span_general_query_attention)
             self.assertTrue(cfg.identity_readout_answer_span_general_relation_attention)
             self.assertTrue(cfg.identity_readout_answer_span_relation_eligibility)
+            self.assertTrue(cfg.identity_readout_answer_span_endpoint_properties)
+            self.assertTrue(cfg.identity_readout_answer_span_endpoint_task_router)
+            self.assertTrue(cfg.identity_readout_answer_span_causal_owners)
             self.assertTrue(bool(loaded.bounded_identity_readout.complete_answer_span.ready))
             for name,value in module.state_dict().items():torch.testing.assert_close(value,loaded.bounded_identity_readout.complete_answer_span.state_dict()[name],atol=0,rtol=0)
         # A rejected QA task cannot invoke even a very confident span predictor.

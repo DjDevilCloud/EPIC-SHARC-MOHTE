@@ -57,7 +57,7 @@ class OrderedQuestionScope(nn.Module):
 
 class CompleteAnswerSpanPredictor(nn.Module):
     """Small shared request/start/endpoint heads; no observed-profile vocabulary."""
-    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False,typed_extent_eligibility=False,kind_threshold=.9,owner_context=False,general_context=False,general_endpoint=False,general_roles=False,general_name_plan=False,general_query_attention=False,general_relation_attention=False,relation_eligibility=False):
+    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False,typed_extent_eligibility=False,kind_threshold=.9,owner_context=False,general_context=False,general_endpoint=False,general_roles=False,general_name_plan=False,general_query_attention=False,general_relation_attention=False,relation_eligibility=False,endpoint_properties=False,endpoint_task_router=False,causal_owners=False):
         super().__init__()
         self.max_words=max_words
         self.feature_version=feature_version
@@ -97,6 +97,21 @@ class CompleteAnswerSpanPredictor(nn.Module):
             self.owner_encoder=nn.GRU(width,width,batch_first=True)
             self.owner_projection=nn.Parameter(torch.zeros(width,width))
         if general_context:
+            if causal_owners:
+                self.causal_owner_match=nn.Sequential(nn.Linear(3*width,32),nn.Tanh(),nn.Linear(32,1))
+                self.causal_owner_kind=nn.Sequential(nn.Linear(3*width,32),nn.Tanh(),nn.Linear(32,1))
+                self.causal_owner_scope=nn.Sequential(nn.Linear(4*width,32),nn.Tanh(),nn.Linear(32,1))
+                for module in (self.causal_owner_match,self.causal_owner_kind,self.causal_owner_scope):
+                    nn.init.zeros_(module[-1].weight);nn.init.zeros_(module[-1].bias)
+                nn.init.constant_(self.causal_owner_scope[-1].bias,-8.)
+            if endpoint_properties:
+                self.endpoint_properties=nn.Sequential(nn.Linear(3*width,64),nn.Tanh(),nn.Linear(64,1))
+                nn.init.zeros_(self.endpoint_properties[-1].weight)
+                nn.init.zeros_(self.endpoint_properties[-1].bias)
+                if endpoint_task_router:
+                    self.endpoint_scope=nn.Sequential(nn.Linear(width,32),nn.Tanh(),nn.Linear(32,1))
+                    nn.init.zeros_(self.endpoint_scope[-1].weight)
+                    nn.init.constant_(self.endpoint_scope[-1].bias,-8.)
             self.general_scope=OrderedQuestionScope(width)
             self.general_encoder=nn.GRU(width,width,batch_first=True)
             if general_relation_attention:
@@ -180,6 +195,25 @@ class CompleteAnswerSpanPredictor(nn.Module):
             ids=torch.tensor(ids,device=device)
             return F.layer_norm((lexical_embeddings(ids)+bank.encode('token',ids)).mean(0)/math.sqrt(2.),(d,))
         vectors=torch.stack([word([item[2] for item in group]) for group in groups])
+        if hasattr(self,'causal_owner_match'):
+            clauses={serial:clause for serial,clause,_ in state.words.records}
+            summaries={};owner_contexts=[];owner_properties=[];owner_available=[]
+            for group in groups:
+                serial=state.entries[group[0][0]][3];clause=clauses[serial]
+                prefix=tuple((s,ids) for s,ids in state.words.anchors.get(clause,()) if s<serial)
+                key=(clause,len(prefix))
+                if key not in summaries:
+                    if prefix:
+                        values=torch.stack([word(ids) for _,ids in prefix])
+                        encoded,_=self.general_encoder(values[None])
+                        context=F.layer_norm(encoded[0]+values,(d,)).mean(0)
+                    else:context=vectors.new_zeros(d)
+                    available=bool(prefix) and clause not in state.words.anchor_truncated
+                    owner_props=props(['role=causal_owner','prefix_words='+str(len(prefix)),
+                                      'prefix_complete='+str(available)])
+                    summaries[key]=(context,owner_props,available)
+                context,owner_props,available=summaries[key]
+                owner_contexts.append(context);owner_properties.append(owner_props);owner_available.append(available)
         query=state.words.question()
         if not query:return None
         question=torch.stack([word(ids) for ids in query])
@@ -286,6 +320,10 @@ class CompleteAnswerSpanPredictor(nn.Module):
         if not ends:return None
         result=dict(question=question,start_features=torch.stack(start_features),end_features=torch.stack(end_features),
                     starts=starts,ends=ends,tokens=tokens,surfaces=surfaces)
+        if hasattr(self,'causal_owner_match'):
+            result['causal_owner_contexts']=torch.stack(owner_contexts)
+            result['causal_owner_properties']=torch.stack(owner_properties)
+            result['causal_owner_available']=torch.tensor(owner_available,device=device,dtype=torch.bool)
         if self.general_relation_attention:
             result['relation_source']=vectors
             result['relation_scopes']=torch.tensor(scope_starts,device=device)
@@ -380,6 +418,9 @@ class CompleteAnswerSpanPredictor(nn.Module):
                 source_features=torch.cat((source_features[:,:4*q.numel()],packet['general_endpoint_roles']),-1)
             endpoint_features=torch.cat((source_features,general_states[owners]*general_query,general_query.expand(len(owners),-1)),-1)
             end=end+self.general_endpoint(endpoint_features).squeeze(-1)
+        if general_active and not name_active and hasattr(self,'endpoint_properties'):
+            if not hasattr(self,'endpoint_scope') or bool(self.endpoint_scope(general_query).sigmoid().squeeze(-1)>=.99):
+                end=end+self.endpoint_property_scores(packet,general_query)
         if self.owner_context:
             type_probs=kind.softmax(-1);type_index=int(type_probs.argmax())
             # This adapter is fitted for numeric/date ownership. Person-name
@@ -391,8 +432,22 @@ class CompleteAnswerSpanPredictor(nn.Module):
                 _,request_state=self.owner_encoder(packet['question'][-64:][None])
                 owner_request=request_state[0,0]
                 start=start+(F.linear(context,self.owner_projection)*owner_request).sum(-1)/math.sqrt(q.numel())
+        causal_supported=None;causal_confidence=None
+        if general_active and not name_active and hasattr(self,'causal_owner_match') and bool(self.endpoint_scope(general_query).sigmoid().squeeze(-1)>=.99):
+            causal=self.causal_owner_scores(packet,general_query)
+            supported=packet['causal_owner_available']&(causal['scope'].sigmoid()>=.99)&(causal['kind'].sigmoid()>=.99)
+            if bool(supported.any()):
+                proposed_start=(causal['match']+causal['kind']).masked_fill(~supported,-torch.inf)
+                selected_confidence=causal['match'][proposed_start.argmax()].sigmoid()
+                if bool(selected_confidence>=.99):
+                    causal_confidence=selected_confidence
+                    start=proposed_start;causal_supported=supported
+                    # A verified structural plan must not inherit value/position
+                    # bias from legacy endpoint features after source eviction.
+                    end=self.endpoint_property_scores(packet,general_query)
         extent_confidence=general_probability if general_active else kind.new_ones(())
-        eligible_starts=torch.ones_like(start,dtype=torch.bool)
+        if causal_confidence is not None:extent_confidence=extent_confidence*causal_confidence
+        eligible_starts=torch.ones_like(start,dtype=torch.bool) if causal_supported is None else causal_supported
         if name_active:
             encoded,_=self.general_name_encoder(packet['name_contexts']);rows=torch.arange(len(packet['name_lengths']),device=q.device)
             contexts=encoded[rows,packet['name_lengths']-1]
@@ -425,6 +480,19 @@ class CompleteAnswerSpanPredictor(nn.Module):
         applicability=self.task_router(self.task_features(packet['question'])).squeeze(-1) if hasattr(self,'task_router') else self.applicability(q).squeeze(-1)
         if general_active:applicability=torch.maximum(applicability,torch.logit(general_probability.clamp(1e-8,1.-1e-8)))
         return dict(start=start,end=end,joint=joint,owners=owners,kind=kind,applicability=applicability,extent_confidence=extent_confidence,extent_supported=bool(eligible_starts.any()),source_owned_person=name_active)
+
+    def causal_owner_scores(self,packet,request):
+        context=packet['causal_owner_contexts'];query=request.expand_as(context)
+        relation=torch.cat((query,context,query*context),-1)
+        properties=packet['start_features'][:,-request.numel():]
+        return dict(match=self.causal_owner_match(relation).squeeze(-1),
+                    scope=self.causal_owner_scope(torch.cat((relation,packet['causal_owner_properties']),-1)).squeeze(-1),
+                    kind=self.causal_owner_kind(torch.cat((query,properties,query*properties),-1)).squeeze(-1))
+
+    def endpoint_property_scores(self,packet,request):
+        properties=packet.get('general_endpoint_roles',packet['end_features'][:,-request.numel():])
+        query=request.expand_as(properties)
+        return self.endpoint_properties(torch.cat((query,properties,query*properties),-1)).squeeze(-1)
 
     def relation_eligibility_scores(self,packet,request):
         width=request.numel();features=packet['start_features']
