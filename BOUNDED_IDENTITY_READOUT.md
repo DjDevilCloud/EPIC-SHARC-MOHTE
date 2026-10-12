@@ -699,3 +699,59 @@ can independently establish eligibility when the older genre classifier does
 not recognize a supported new request. Source-owned person plans retain physical
 continuation verification without being vetoed by another route's alias prior.
 No evaluation endpoints or name-specific embedding rows enter generation.
+
+
+### General question attention experiment (2026-10-11)
+
+`identity_readout_answer_span_general_query_attention` defaults to false and
+requires general span context. It attends over the shared ordered encoder's
+last 64 question-word states plus their direct compositional word vectors.
+It changes the general start/endpoint request representation; applicability and
+verified source copying retain their separate confidence gates. Existing
+checkpoints use the prior final-state request unchanged. This is an experimental
+learning option, not evidence of broad QA readiness or a generation speed gain.
+The fixed-checkpoint native span diagnostic and controlled name/grammar results
+are under `review_artifacts/baseline_completion_20261011`.
+
+A confident general TEXT_SPAN plan owns its source occurrence and endpoint;
+the older name/initial alias prior cannot veto that different answer task.
+Uncertain answer kinds retain their previous checks. PERSON plans continue
+to use physical full-name and appropriate legacy ownership verification.
+The frozen Sea-otters regression and the final controlled/native acceptance
+results are documented in `review_artifacts/baseline_completion_20261011/REPORT.md`.
+
+### Question-to-source relation experiment (2026-10-11)
+
+`identity_readout_answer_span_general_relation_attention` defaults to false and
+requires general span context. It attends to the entire bounded observed source
+using shared word vectors and the existing ordered encoder. Question-word
+anchors and learned directional distance buckets produce context for each
+candidate occurrence. Distances count source words; categorical occurrence IDs
+are not treated as linguistic features. No answer labels enter this path.
+
+The output projection starts at zero so enabling the option preserves existing
+scores until fitted. The independently gated name planner bypasses the residual.
+The experiment freezes existing parameters and fits only the relation modules,
+replaying native answers alongside counterfactual distant-owner controls.
+Attention storage grows quadratically with the bounded source word count;
+this is a selection experiment, without a generation-speed claim.
+
+The relation supervision control exposes attention weights for auxiliary
+training labels and adds question-conditioned same/different source-scope
+biases. Scopes come from observed sentence/line boundaries already used by
+the span packet; their numeric labels are used only for equality. Scope biases
+start at zero, preserving previous experimental scores on checkpoint migration.
+The control supervises each amount's owning source phrase, keeps endpoint
+confidence separate from start selection, and penalizes native replay residuals
+while freezing existing parameters. Cue labels are training annotations only.
+Candidates and raw-generation metrics are saved separately under
+`review_artifacts/relation_supervision_control_20261011`.
+
+`identity_readout_answer_span_relation_eligibility` is a separate default-off
+option requiring relation attention. A zero-initialized learned score combines
+the question request, candidate word and compositional start properties. It
+adds answer-kind compatibility to start scores, independently of owning-relation
+attention, and bypasses the name planner. The follow-on control labels both
+source amounts as eligible while supervising which owner is requested through
+the existing complete-span loss. It freezes the fitted relation attention and
+all prior parameters. No runtime numeric-only rule or gold answer mask is added.

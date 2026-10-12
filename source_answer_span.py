@@ -57,7 +57,7 @@ class OrderedQuestionScope(nn.Module):
 
 class CompleteAnswerSpanPredictor(nn.Module):
     """Small shared request/start/endpoint heads; no observed-profile vocabulary."""
-    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False,typed_extent_eligibility=False,kind_threshold=.9,owner_context=False,general_context=False,general_endpoint=False,general_roles=False,general_name_plan=False):
+    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False,typed_extent_eligibility=False,kind_threshold=.9,owner_context=False,general_context=False,general_endpoint=False,general_roles=False,general_name_plan=False,general_query_attention=False,general_relation_attention=False,relation_eligibility=False):
         super().__init__()
         self.max_words=max_words
         self.feature_version=feature_version
@@ -69,6 +69,7 @@ class CompleteAnswerSpanPredictor(nn.Module):
         self.general_context=general_context
         self.general_roles=general_roles
         self.general_name_plan=general_name_plan
+        self.general_relation_attention=general_relation_attention
         self.kind_labels=tuple(kind_labels or ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
         kinds=len(self.kind_labels)
         self.question_attention=nn.Linear(width,1,bias=False)
@@ -98,6 +99,25 @@ class CompleteAnswerSpanPredictor(nn.Module):
         if general_context:
             self.general_scope=OrderedQuestionScope(width)
             self.general_encoder=nn.GRU(width,width,batch_first=True)
+            if general_relation_attention:
+                self.relation_query=nn.Linear(width,width,bias=False)
+                self.relation_key=nn.Linear(width,width,bias=False)
+                nn.init.eye_(self.relation_query.weight);nn.init.eye_(self.relation_key.weight)
+                self.relation_word_attention=nn.Linear(width,1,bias=False)
+                nn.init.zeros_(self.relation_word_attention.weight)
+                self.relation_distance=nn.Linear(width,17)
+                nn.init.zeros_(self.relation_distance.weight);nn.init.zeros_(self.relation_distance.bias)
+                self.relation_scope=nn.Linear(width,2)
+                nn.init.zeros_(self.relation_scope.weight);nn.init.zeros_(self.relation_scope.bias)
+                self.relation_output=nn.Linear(width,width,bias=False)
+                nn.init.zeros_(self.relation_output.weight)
+                if relation_eligibility:
+                    self.relation_eligibility=nn.Sequential(nn.Linear(5*width,64),nn.Tanh(),nn.Linear(64,1))
+                    nn.init.zeros_(self.relation_eligibility[-1].weight)
+                    nn.init.zeros_(self.relation_eligibility[-1].bias)
+            if general_query_attention:
+                self.general_query_attention=nn.Linear(width,1,bias=False)
+                nn.init.zeros_(self.general_query_attention.weight)
             self.general_start_projection=nn.Parameter(torch.zeros(width,width))
             self.general_end_projection=nn.Parameter(torch.zeros(width,width))
             if general_endpoint:
@@ -266,6 +286,9 @@ class CompleteAnswerSpanPredictor(nn.Module):
         if not ends:return None
         result=dict(question=question,start_features=torch.stack(start_features),end_features=torch.stack(end_features),
                     starts=starts,ends=ends,tokens=tokens,surfaces=surfaces)
+        if self.general_relation_attention:
+            result['relation_source']=vectors
+            result['relation_scopes']=torch.tensor(scope_starts,device=device)
         if self.owner_context:
             result['owner_prefixes']=torch.stack(owner_prefixes)
             result['owner_lengths']=torch.tensor(owner_lengths,device=device,dtype=torch.long)
@@ -331,8 +354,9 @@ class CompleteAnswerSpanPredictor(nn.Module):
                 encoded,_=self.general_encoder(packet['general_contexts'])
                 rows=torch.arange(len(packet['general_lengths']),device=q.device)
                 general_states=encoded[rows,packet['general_lengths']-1]
-                _,request_state=self.general_encoder(packet['question'][-64:][None])
-                general_query=request_state[0,0]
+                general_query=self.general_request(packet['question'])
+                if self.general_relation_attention and not name_active:
+                    general_states=general_states+self.relation_context(packet,general_query)
             else:kind=old_kind
         end_request=q
         if self.kind_conditioned_endpoints:
@@ -347,6 +371,8 @@ class CompleteAnswerSpanPredictor(nn.Module):
         start=score(packet['start_features'],self.start_projection,self.start_score,q)
         if general_active:
             start=start+(F.linear(general_states,self.general_start_projection)*general_query).sum(-1)/math.sqrt(q.numel())
+            if hasattr(self,'relation_eligibility') and not name_active:
+                start=start+self.relation_eligibility_scores(packet,general_query)
         end=score(packet['end_features'],self.end_projection,self.end_score,end_request)
         if general_active and hasattr(self,'general_endpoint'):
             source_features=packet['end_features']
@@ -399,6 +425,49 @@ class CompleteAnswerSpanPredictor(nn.Module):
         applicability=self.task_router(self.task_features(packet['question'])).squeeze(-1) if hasattr(self,'task_router') else self.applicability(q).squeeze(-1)
         if general_active:applicability=torch.maximum(applicability,torch.logit(general_probability.clamp(1e-8,1.-1e-8)))
         return dict(start=start,end=end,joint=joint,owners=owners,kind=kind,applicability=applicability,extent_confidence=extent_confidence,extent_supported=bool(eligible_starts.any()),source_owned_person=name_active)
+
+    def relation_eligibility_scores(self,packet,request):
+        width=request.numel();features=packet['start_features']
+        word=features[:,2*width:3*width];properties=features[:,4*width:5*width]
+        query=request.expand_as(word)
+        return self.relation_eligibility(torch.cat((query,word,properties,query*word,query*properties),-1)).squeeze(-1)
+
+    def relation_weights(self,packet,request):
+        """Query anchors over the entire bounded observed source, per occurrence.
+
+        Relative offsets count actual source words; occurrence IDs are not
+        linguistic features. No output tokens or answer labels enter here.
+        """
+        source=packet['relation_source'];width=source.size(-1)
+        question=packet['question'][-64:]
+        query=F.normalize(self.relation_query(question),dim=-1)
+        keys=F.normalize(self.relation_key(source),dim=-1)
+        word_weights=self.relation_word_attention(question).squeeze(-1).log_softmax(0)
+        anchors=(4.*(keys@query.T)+word_weights[None]).logsumexp(-1)
+        positions=torch.arange(len(source),device=source.device)
+        offsets=positions[None,:]-positions[:,None]
+        buckets=offsets.abs().clamp_min(1).float().log2().floor().long().clamp_max(7)
+        roles=torch.where(offsets==0,0,torch.where(offsets<0,1+buckets,9+buckets))
+        logits=anchors[None]+self.relation_distance(request)[roles]
+        scopes=packet.get('relation_scopes')
+        if scopes is not None:
+            same_scope=(scopes[:,None]==scopes[None,:]).long()
+            logits=logits+self.relation_scope(request)[same_scope]
+        return logits.softmax(-1)
+
+    def relation_context(self,packet,request):
+        source=packet['relation_source'];width=source.size(-1)
+        states,_=self.general_encoder(source[None])
+        values=F.layer_norm(states[0]+source,(width,))
+        return self.relation_output(self.relation_weights(packet,request)@values)
+
+    def general_request(self,question):
+        """Ordered words retain direct lexical support when attention is enabled."""
+        question=question[-64:]
+        states,last=self.general_encoder(question[None])
+        if not hasattr(self,'general_query_attention'):return last[0,0]
+        words=F.layer_norm(states[0]+question,(question.size(-1),))
+        return (words*self.general_query_attention(words).softmax(0)).sum(0)
 
     def request_vector(self,question):
         q=(question*self.question_attention(question).softmax(0)).sum(0)

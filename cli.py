@@ -146,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-answer-span-general-endpoint", action="store_true", help="Enable the isolated TEXT_SPAN endpoint scorer")
         p.add_argument("--identity-readout-answer-span-general-roles", action="store_true", help="Compose observed case-chain start/end roles in general span features")
         p.add_argument("--identity-readout-answer-span-general-name-plan", action="store_true", help="Predict complete person spans from surrounding relation context and source roles")
+        p.add_argument("--identity-readout-answer-span-general-query-attention", action="store_true", help="Attend over ordered question words for general span selection")
+        p.add_argument("--identity-readout-answer-span-relation-eligibility", action="store_true", help="Learn question-conditioned source answer-kind eligibility")
+        p.add_argument("--identity-readout-answer-span-general-relation-attention", action="store_true", help="Align question anchors with bounded source occurrences using relative word positions")
         p.add_argument("--identity-readout-source-boundary-adapter", action="store_true", help="Confident grammar proposals retain the validated source formatter on uncertainty")
         p.add_argument("--identity-readout-context-units", type=int, default=2)
         p.add_argument("--identity-readout-query-units", type=int, default=4)
@@ -795,6 +798,9 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         identity_readout_answer_span_general_endpoint=getattr(args, "identity_readout_answer_span_general_endpoint", False),
         identity_readout_answer_span_general_roles=getattr(args, "identity_readout_answer_span_general_roles", False),
         identity_readout_answer_span_general_name_plan=getattr(args, "identity_readout_answer_span_general_name_plan", False),
+        identity_readout_answer_span_general_query_attention=getattr(args, "identity_readout_answer_span_general_query_attention", False),
+        identity_readout_answer_span_general_relation_attention=getattr(args, "identity_readout_answer_span_general_relation_attention", False),
+        identity_readout_answer_span_relation_eligibility=getattr(args, "identity_readout_answer_span_relation_eligibility", False),
         identity_readout_source_boundary_adapter=getattr(args, "identity_readout_source_boundary_adapter", False),
         identity_readout_context_units=getattr(args, "identity_readout_context_units", 2),
         identity_readout_query_units=getattr(args, "identity_readout_query_units", 4),

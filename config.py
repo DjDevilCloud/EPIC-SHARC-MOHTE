@@ -69,6 +69,9 @@ class PrismalWaveConfig:
     identity_readout_answer_span_general_endpoint: bool = False
     identity_readout_answer_span_general_roles: bool = False
     identity_readout_answer_span_general_name_plan: bool = False
+    identity_readout_answer_span_general_query_attention: bool = False
+    identity_readout_answer_span_general_relation_attention: bool = False
+    identity_readout_answer_span_relation_eligibility: bool = False
     identity_readout_answer_span_kinds: list[str] = field(default_factory=lambda: ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
@@ -421,6 +424,12 @@ class PrismalWaveConfig:
             raise ValueError('Answer-span owner context requires complete answer spans')
         if self.identity_readout_answer_span_general_name_plan and (not self.identity_readout_answer_span_general_roles or not self.identity_readout_answer_span_general_context or 'PERSON' not in self.identity_readout_answer_span_kinds):
             raise ValueError('general name plans require general context and observed source roles')
+        if self.identity_readout_answer_span_relation_eligibility and not self.identity_readout_answer_span_general_relation_attention:
+            raise ValueError('Answer-span relation eligibility requires general relation attention')
+        if self.identity_readout_answer_span_general_relation_attention and not self.identity_readout_answer_span_general_context:
+            raise ValueError('Relation attention requires general span context')
+        if self.identity_readout_answer_span_general_query_attention and not self.identity_readout_answer_span_general_context:
+            raise ValueError('General question attention requires general span context')
         if self.identity_readout_answer_span_general_roles and not self.identity_readout_answer_span_general_context:
             raise ValueError('general source roles require general source context')
         if self.identity_readout_answer_span_general_endpoint and not self.identity_readout_answer_span_general_context:

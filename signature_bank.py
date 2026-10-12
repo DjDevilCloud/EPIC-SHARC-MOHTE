@@ -485,7 +485,7 @@ class BoundedIdentityReadout(nn.Module):
             self.register_buffer('surface_ids', torch.tensor(cfg.identity_readout_surface_ids, dtype=torch.long))
             if cfg.identity_readout_complete_answer_spans:
                 from source_answer_span import CompleteAnswerSpanPredictor
-                self.complete_answer_span=CompleteAnswerSpanPredictor(cfg.d_model,feature_version=cfg.identity_readout_answer_span_features,task_router=cfg.identity_readout_answer_span_task_router,word_encoder=cfg.identity_readout_answer_span_word_encoder,kind_labels=cfg.identity_readout_answer_span_kinds,kind_conditioned_endpoints=cfg.identity_readout_answer_span_kind_conditioned_endpoints,typed_extent_eligibility=cfg.identity_readout_answer_span_typed_extent_eligibility,kind_threshold=cfg.identity_readout_native_span_confidence,owner_context=cfg.identity_readout_answer_span_owner_context,general_context=cfg.identity_readout_answer_span_general_context,general_endpoint=cfg.identity_readout_answer_span_general_endpoint,general_roles=cfg.identity_readout_answer_span_general_roles,general_name_plan=cfg.identity_readout_answer_span_general_name_plan)
+                self.complete_answer_span=CompleteAnswerSpanPredictor(cfg.d_model,feature_version=cfg.identity_readout_answer_span_features,task_router=cfg.identity_readout_answer_span_task_router,word_encoder=cfg.identity_readout_answer_span_word_encoder,kind_labels=cfg.identity_readout_answer_span_kinds,kind_conditioned_endpoints=cfg.identity_readout_answer_span_kind_conditioned_endpoints,typed_extent_eligibility=cfg.identity_readout_answer_span_typed_extent_eligibility,kind_threshold=cfg.identity_readout_native_span_confidence,owner_context=cfg.identity_readout_answer_span_owner_context,general_context=cfg.identity_readout_answer_span_general_context,general_endpoint=cfg.identity_readout_answer_span_general_endpoint,general_roles=cfg.identity_readout_answer_span_general_roles,general_name_plan=cfg.identity_readout_answer_span_general_name_plan,general_query_attention=cfg.identity_readout_answer_span_general_query_attention,general_relation_attention=cfg.identity_readout_answer_span_general_relation_attention,relation_eligibility=cfg.identity_readout_answer_span_relation_eligibility)
             self.surface_projection = None
             if self.surface_ids.numel():
                 self.surface_projection = nn.Linear(2 * cfg.d_model, self.surface_ids.numel(), bias=False)
@@ -1180,11 +1180,10 @@ class BoundedIdentityReadout(nn.Module):
         override its confidently selected full occurrence.
         """
         if (plan.answer_kind=='TEXT_SPAN' and plan.kind_confidence>=self._binding_cfg.identity_readout_native_span_confidence
-                and 0<=plan.lexical_start<len(state.entries)
-                and tokenizer.construction_units[state.entries[plan.lexical_start][0]].kind=='digit'):
-            # A generic numeric span may denote a full value or a requested
-            # subfield. An unrelated name/prefix-alias prior cannot verify its
-            # ownership; leave that decision with its learned span selector.
+                and 0<=plan.lexical_start<len(state.entries)):
+            # The complete general span already selects its source occurrence
+            # and extent. A name/initial alias prior is a different task's
+            # ownership signal; it cannot veto a confident text-span plan.
             return True
         if plan.kind_confidence>=self._binding_cfg.identity_readout_native_span_confidence and plan.answer_kind in {
                 'AMOUNT','BILL_CODE','LEGAL_CODE','MEASUREMENT','QUALIFIED_COUNT'} and state.source_surface:

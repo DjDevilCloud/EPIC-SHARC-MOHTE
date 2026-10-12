@@ -11,7 +11,59 @@ from train import save_checkpoint,load_bundle_from_checkpoint
 
 
 class CompleteAnswerSpanTests(unittest.TestCase):
-    def fixture(self,conditioned=False,typed=False,owner=False,general=False,guide=False):
+    def test_relation_context_neutral_migration_and_remote_gradients(self):
+        torch.manual_seed(23)
+        old=CompleteAnswerSpanPredictor(8,general_context=True)
+        new=CompleteAnswerSpanPredictor(8,general_context=True,general_relation_attention=True)
+        new.load_state_dict(old.state_dict(),strict=False)
+        source=torch.randn(96,8,requires_grad=True)
+        packet={'relation_source':source,'question':torch.randn(9,8)}
+        request=new.general_request(packet['question'])
+        torch.testing.assert_close(new.relation_context(packet,request),torch.zeros_like(source),atol=0,rtol=0)
+        with torch.no_grad():
+            new.relation_output.weight.copy_(torch.eye(8))
+            new.relation_distance.bias[1:9].fill_(2.)
+        original=new.relation_context(packet,request)
+        swapped=source.detach().clone();swapped[[2,50]]=swapped[[50,2]]
+        changed=new.relation_context(dict(packet,relation_source=swapped),request)
+        self.assertFalse(torch.equal(original[90],changed[90]))
+        original[90].square().sum().backward()
+        self.assertTrue(torch.isfinite(source.grad).all())
+        self.assertGreater(float(source.grad[2].abs().sum()),0.)
+        self.assertGreater(float(new.relation_query.weight.grad.abs().sum()),0.)
+
+    def test_relation_zero_residual_preserves_active_span_scores(self):
+        t,m,_=self.fixture(general=True,query_attention=True)
+        old=m.bounded_identity_readout.complete_answer_span
+        with torch.no_grad():old.general_scope.classifier[-1].bias.fill_(100.)
+        _,_,_,state=self.state(t,m,'Context:\nThe budget is $75 million.\nQuestion:\nWhat is the budget?')
+        packet=old.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        new=CompleteAnswerSpanPredictor(m.cfg.d_model,kind_labels=old.kind_labels,
+            general_context=True,general_endpoint=True,general_roles=True,
+            general_query_attention=True,general_relation_attention=True,relation_eligibility=True)
+        new.load_state_dict(old.state_dict(),strict=False)
+        updated=new.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        a,b=old.scores(packet),new.scores(updated)
+        for key in ('start','end','joint','kind'):
+            torch.testing.assert_close(a[key],b[key],atol=0,rtol=0)
+
+    def test_relation_scope_uses_boundary_membership_and_supports_supervision(self):
+        module=CompleteAnswerSpanPredictor(8,general_context=True,general_relation_attention=True)
+        packet={'relation_source':torch.zeros(8,8),'question':torch.randn(5,8),
+                'relation_scopes':torch.tensor([0,0,0,0,4,4,4,4])}
+        request=module.general_request(packet['question'])
+        with torch.no_grad():module.relation_scope.bias[1]=3.
+        weights=module.relation_weights(packet,request)
+        self.assertGreater(float(weights[2,:4].sum()),.95)
+        self.assertGreater(float(weights[6,4:].sum()),.95)
+        # Scope labels are categorical equality keys, never numeric distances.
+        renumbered=dict(packet,relation_scopes=torch.tensor([91,91,91,91,7,7,7,7]))
+        torch.testing.assert_close(weights,module.relation_weights(renumbered,request),atol=0,rtol=0)
+        (-weights[2,0].log()-weights[6,4].log()).backward()
+        self.assertTrue(torch.isfinite(module.relation_scope.weight.grad).all())
+        self.assertGreater(float(module.relation_scope.weight.grad.abs().sum()),0.)
+
+    def fixture(self,conditioned=False,typed=False,owner=False,general=False,guide=False,query_attention=False,relation_attention=False,eligibility=False):
         f=ownership.SourceOwnershipTests();helper,t,m=f.fixture();f.enable(m,t)
         old=m.bounded_identity_readout
         old._binding_cfg=copy.copy(m.cfg)
@@ -23,6 +75,9 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         m.cfg.identity_readout_answer_span_general_endpoint=general
         m.cfg.identity_readout_answer_span_general_roles=general
         m.cfg.identity_readout_answer_span_general_name_plan=guide
+        m.cfg.identity_readout_answer_span_general_query_attention=query_attention
+        m.cfg.identity_readout_answer_span_general_relation_attention=relation_attention
+        m.cfg.identity_readout_answer_span_relation_eligibility=eligibility
         if general:m.cfg.identity_readout_answer_span_kinds=list(m.cfg.identity_readout_answer_span_kinds)+['TEXT_SPAN']
         head=BoundedIdentityReadout(m.cfg);head.load_state_dict(old.state_dict(),strict=False)
         m.bounded_identity_readout=head;m.prepare_capacity_for_tokenizer(t)
@@ -35,6 +90,22 @@ class CompleteAnswerSpanTests(unittest.TestCase):
             logits,state=m.bounded_identity_readout(torch.zeros(1,ids.size(1),t.vocab_size),torch.zeros(1,ids.size(1),m.cfg.d_model),ids,features,t,m.shared_signature_bank,lexical_embeddings=m.construction_embedding)
         return ids,features,logits,state[0]
 
+    def test_general_request_legacy_contract_and_attention_gradients(self):
+        torch.manual_seed(19)
+        old=CompleteAnswerSpanPredictor(8,general_context=True)
+        new=CompleteAnswerSpanPredictor(8,general_context=True,general_query_attention=True)
+        new.load_state_dict(old.state_dict(),strict=False)
+        question=torch.randn(12,8,requires_grad=True)
+        _,last=old.general_encoder(question[None])
+        torch.testing.assert_close(old.general_request(question),last[0,0],atol=0,rtol=0)
+        states,_=new.general_encoder(question[None])
+        expected=torch.nn.functional.layer_norm(states[0]+question,(8,)).mean(0)
+        torch.testing.assert_close(new.general_request(question),expected)
+        new.general_request(question).square().sum().backward()
+        self.assertTrue(torch.isfinite(question.grad).all())
+        self.assertGreater(float(question.grad[0].abs().sum()),0.)
+        self.assertGreater(float(new.general_query_attention.weight.grad.abs().sum()),0.)
+
     def test_currency_prefix_and_complete_endpoints_reach_shared_features(self):
         t,m,_=self.fixture();packets=[];vectors=[]
         for prefix in ('','$'):
@@ -46,6 +117,22 @@ class CompleteAnswerSpanTests(unittest.TestCase):
             vectors.append(BoundedIdentityReadout.source_boundary_property_vector(m.shared_signature_bank,state,t,torch.device('cpu'),include_source_prefix=True))
             packets.append(packet)
         self.assertFalse(torch.equal(vectors[0],vectors[1]))
+
+    def test_generic_text_span_is_not_vetoed_by_unrelated_initial_owner(self):
+        t,m,_=self.fixture(general=True);head=m.bounded_identity_readout
+        head._binding_cfg.identity_readout_source_start_features='context_roles_v5'
+        _,_,_,state=self.state(t,m,'Context:\nR. Finch visited. Sea otters live nearby.\nQuestion:\nWhich animals live nearby?')
+        module=head.complete_answer_span;packet=module.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        index=packet['surfaces'].index('Sea otters');owner,_,begin,end=packet['ends'][index]
+        old_index=packet['surfaces'].index('R. Finch');old_owner=packet['ends'][old_index][0]
+        state.source_initial_prior=torch.zeros(len(state.entries));state.source_initial_prior[packet['starts'][old_owner]]=.999
+        plan=AnswerSpanPlan(packet['tokens'][index],begin,end,.999,lexical_start=packet['starts'][owner],answer_kind='TEXT_SPAN',kind_confidence=.999)
+        self.assertTrue(head.verify_answer_plan_start(state,plan,t))
+        # An uncertain kind retains the previous ownership safeguard.
+        plan.kind_confidence=.5
+        self.assertFalse(head.verify_answer_plan_start(state,plan,t))
+        plan.kind_confidence=.999;plan.answer_kind='PERSON'
+        self.assertFalse(head.verify_answer_plan_start(state,plan,t))
 
     def test_generic_numeric_span_is_not_vetoed_by_unrelated_name_prior(self):
         t,m,_=self.fixture();head=m.bounded_identity_readout;module=head.complete_answer_span
@@ -371,7 +458,7 @@ class CompleteAnswerSpanTests(unittest.TestCase):
             self.assertIsNone(module.propose(state,t,m.shared_signature_bank,m.construction_embedding))
 
     def test_active_plan_streams_reloads_and_task_rejection_is_neutral(self):
-        t,m,old=self.fixture(conditioned=True,typed=True,owner=True,general=True,guide=True);head=m.bounded_identity_readout;module=head.complete_answer_span
+        t,m,old=self.fixture(conditioned=True,typed=True,owner=True,general=True,guide=True,query_attention=True,relation_attention=True,eligibility=True);head=m.bounded_identity_readout;module=head.complete_answer_span
         ids,features,baseline,state=self.state(t,m,'Context:\nThe budget is $75 million.\nQuestion:\nWhat is the budget?')
         module.ready.fill_(True)
         with torch.no_grad():
@@ -402,6 +489,9 @@ class CompleteAnswerSpanTests(unittest.TestCase):
             self.assertTrue(cfg.identity_readout_answer_span_general_context)
             self.assertTrue(cfg.identity_readout_answer_span_general_roles)
             self.assertTrue(cfg.identity_readout_answer_span_general_name_plan)
+            self.assertTrue(cfg.identity_readout_answer_span_general_query_attention)
+            self.assertTrue(cfg.identity_readout_answer_span_general_relation_attention)
+            self.assertTrue(cfg.identity_readout_answer_span_relation_eligibility)
             self.assertTrue(bool(loaded.bounded_identity_readout.complete_answer_span.ready))
             for name,value in module.state_dict().items():torch.testing.assert_close(value,loaded.bounded_identity_readout.complete_answer_span.state_dict()[name],atol=0,rtol=0)
         # A rejected QA task cannot invoke even a very confident span predictor.
