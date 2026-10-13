@@ -3,6 +3,58 @@ import torch
 from unified_span_reader import UnifiedSpanReader,RelationalSpanReader,SemanticWordComposer,collate_reader_packets,answer_span_facts,ANSWER_ROLE_FACTS,ANSWER_EXTENT_FACTS
 
 class UnifiedReaderTests(unittest.TestCase):
+    def test_condition_alignment_neutral_migration_and_scope_exclusion(self):
+        from unified_span_reader import FactoredMatching
+        torch.manual_seed(55);factor=FactoredMatching(16,structural_owner=True)
+        p=self.packet(8,2);p['exact'].zero_();p['exact'][0,0]=1.;p['exact'][2,1]=1.;p['exact'][6,1]=1.
+        p.update(scope_start=torch.tensor([0]*4+[4]*4),scope_end=torch.tensor([4]*4+[8]*4),query_properties=torch.rand(2,8))
+        batch=collate_reader_packets([p]);source=torch.randn(1,8,16);query=torch.randn(1,2,16);request=torch.randn(1,16);args=(source,query,source,query,request,batch)
+        before=factor(*args);factor.enable_condition_alignment();after=factor(*args)
+        for key in before:torch.testing.assert_close(before[key],after[key],rtol=0,atol=0)
+        with torch.no_grad():factor.condition_alignment.gain.fill_(1.)
+        scored=factor(*args);owners=batch['owners'][0];ends=batch['finishes'][0]
+        good=((owners==1)&(ends==1)).nonzero()[0,0];wrong=((owners==5)&(ends==5)).nonzero()[0,0];answer_match=((owners==0)&(ends==0)).nonzero()[0,0]
+        self.assertGreater(float(scored['condition_match_logits'][0,good]),float(scored['condition_match_logits'][0,wrong]))
+        self.assertEqual(float(scored['condition_match_logits'][0,answer_match]),float(scored['condition_match_logits'][0,wrong]))
+        batch['exact'][0,5,0]=1.;changed=factor(*args)
+        torch.testing.assert_close(scored['condition_match_logits'][0,wrong],changed['condition_match_logits'][0,wrong],rtol=0,atol=0)
+        (-scored['condition_match_logits'][0,good]).backward();self.assertGreater(float(factor.condition_alignment.selector[-1].weight.grad.abs().sum()),0.)
+
+    def test_lexical_cue_projection_is_neutral_and_shared(self):
+        from unified_span_reader import create_unified_reader
+        torch.manual_seed(52);reader=create_unified_reader(8,'relation_decisions_v10')
+        p=self.packet(5,3);p.update(scope_start=torch.zeros(5,dtype=torch.long),scope_end=torch.full((5,),5),query_properties=torch.rand(3,8),answer_facts=torch.rand(len(p['owners']),29))
+        p['source_components']=[torch.tensor([[i+1,i+2]]) for i in range(5)]
+        p['question_components']=[torch.tensor([[i+1,i+2]]) for i in range(3)]
+        batch=collate_reader_packets([p]);before=reader(batch);factor=reader.factored_matching
+        factor.enable_lexical_cues();factor.enable_lexical_cues()
+        self.assertEqual(factor.lexical_cue_projection.weight.numel(),reader.hidden**2)
+        after=reader(batch)
+        for key in before:torch.testing.assert_close(before[key],after[key],rtol=0,atol=0)
+        values=torch.randn(1,3,reader.hidden);owner=torch.ones(1,3)
+        with torch.no_grad():factor.lexical_cue_projection.weight.copy_(torch.eye(reader.hidden)*.25)
+        torch.testing.assert_close(factor.relation_inputs(values,owner),values*.25,rtol=0,atol=0)
+        torch.testing.assert_close(factor.relation_inputs(values,owner*0),values,rtol=0,atol=0)
+
+    def test_owned_relation_cues_learn_without_changing_owner_match_or_reading_value(self):
+        from unified_span_reader import FactoredMatching
+        torch.manual_seed(53);factor=FactoredMatching(16);factor.enable_lexical_cues();factor.requires_grad_(False);factor.lexical_cue_projection.requires_grad_(True)
+        with torch.no_grad():factor.owner_tagger[-1].weight.zero_();factor.owner_tagger[-1].bias.fill_(100.)
+        p=self.packet(7,3);p.update(scope_start=torch.zeros(7,dtype=torch.long),scope_end=torch.full((7,),7));batch=collate_reader_packets([p])
+        source=torch.randn(1,7,16);query=torch.randn(1,3,16);states=torch.randn_like(source);qstates=torch.randn_like(query);request=torch.randn(1,16)
+        a=factor(source,query,states,qstates,request,batch);other=query.clone();other[:,1]+=3.
+        b=factor(source,other,states,qstates,request,batch)
+        torch.testing.assert_close(a['relation_request'],b['relation_request'],rtol=0,atol=0)
+        a['relation_request'].square().sum().backward()
+        self.assertGreater(float(factor.lexical_cue_projection.weight.grad.abs().sum()),0.)
+        with torch.no_grad():factor.lexical_cue_projection.weight.copy_(torch.eye(16)*.25)
+        a=factor(source,query,states,qstates,request,batch);b=factor(source,other,states,qstates,request,batch)
+        self.assertGreater(float((a['relation_request']-b['relation_request']).abs().max()),1e-4)
+        torch.testing.assert_close(a['owner_match_logits'],b['owner_match_logits'],rtol=0,atol=0)
+        changed=source.clone();changed[:,2:4]+=100.;c=factor(changed,query,states,qstates,request,batch)
+        target=((batch['owners'][0]==2)&(batch['finishes'][0]==3)).nonzero()[0,0]
+        torch.testing.assert_close(a['factored_relation_logits'][0,target],c['factored_relation_logits'][0,target],rtol=0,atol=0)
+
     def test_relation_decision_migration_preserves_scores_and_enables_heads(self):
         from unified_span_reader import create_unified_reader
         torch.manual_seed(41);old=create_unified_reader(8,'structural_owner_v9');new=create_unified_reader(8,'relation_decisions_v10')

@@ -77,6 +77,8 @@ class PrismalWaveConfig:
     identity_readout_answer_span_causal_owners: bool = False
     identity_readout_unified_span_reader: bool = False
     identity_readout_unified_reader_version: str = 'aligned_v1'
+    identity_readout_relation_lexical_cues: bool = False
+    identity_readout_condition_alignment: bool = False
     grounded_qa_span_loss_weight: float = 0.0
     grounded_qa_full_context: bool = False
     identity_readout_answer_span_kinds: list[str] = field(default_factory=lambda: ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
@@ -443,6 +445,10 @@ class PrismalWaveConfig:
             raise ValueError('Grounded QA span supervision requires the unified reader and full QA contexts')
         if self.identity_readout_unified_reader_version not in {'aligned_v1','masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
             raise ValueError('Unknown unified span reader version')
+        if self.identity_readout_relation_lexical_cues and (not self.identity_readout_unified_span_reader or self.identity_readout_unified_reader_version not in {'factored_matching_v8','structural_owner_v9','relation_decisions_v10'}):
+            raise ValueError('Relation lexical cues require a factored unified span reader')
+        if self.identity_readout_condition_alignment and (not self.identity_readout_unified_span_reader or self.identity_readout_unified_reader_version not in {'structural_owner_v9','relation_decisions_v10'}):
+            raise ValueError('Condition alignment requires a structural-owner unified reader')
         if self.identity_readout_unified_span_reader and (not self.identity_readout_answer_span_general_context or self.identity_readout_answer_span_word_encoder != 'shared_word_v2'):
             raise ValueError('Unified span reader requires general span context and shared word composition')
         if self.identity_readout_answer_span_causal_owners and not self.identity_readout_answer_span_endpoint_task_router:

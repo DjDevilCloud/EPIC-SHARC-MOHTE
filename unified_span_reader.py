@@ -275,6 +275,24 @@ class RelationalSpanReader(nn.Module):
         return result
 
 
+class ConditionAlignment(nn.Module):
+    """Learn which query constraints require support outside a source answer."""
+    def __init__(self,hidden):
+        super().__init__()
+        self.selector=nn.Sequential(nn.Linear(hidden+8,hidden//2),nn.Tanh(),nn.Linear(hidden//2,1))
+        nn.init.zeros_(self.selector[-1].weight);nn.init.zeros_(self.selector[-1].bias)
+        self.gain=nn.Parameter(torch.zeros(()))
+
+    def forward(self,query,properties,mask,support):
+        logits=self.selector(torch.cat((query,properties),-1)).squeeze(-1)
+        weights=logits.sigmoid()*mask
+        agreement=(support*weights[:,None]).sum(-1)/weights.sum(-1).clamp_min(1e-6)[:,None]
+        confidence=weights.max(-1).values[:,None]
+        match=agreement*confidence
+        return dict(condition_query_logits=logits,condition_match_logits=match,
+                    condition_offset=10.*self.gain.tanh().clamp_min(0.)*match)
+
+
 class FactoredMatching(nn.Module):
     """Learn query owner tags separately from owner-masked relation matching.
 
@@ -289,15 +307,36 @@ class FactoredMatching(nn.Module):
         self.applicability=nn.Sequential(nn.Linear(2*hidden,hidden//2),nn.Tanh(),nn.Linear(hidden//2,1))
         self.owner_gain=nn.Parameter(torch.zeros(()));self.relation_gain=nn.Parameter(torch.zeros(()))
 
+    def enable_lexical_cues(self):
+        """Restore suppressed lexical evidence through one shared projection.
+
+        Zero initialization preserves legacy outputs exactly. The projection
+        is shared across source and question, without occurrence/profile rows.
+        """
+        if not hasattr(self,'lexical_cue_projection'):
+            reference=self.relation_encoder.weight_ih_l0
+            self.lexical_cue_projection=nn.Linear(self.hidden,self.hidden,bias=False,device=reference.device,dtype=reference.dtype)
+            nn.init.zeros_(self.lexical_cue_projection.weight)
+
+    def relation_inputs(self,values,owner):
+        masked=values*(1-owner[:,:,None])
+        if not hasattr(self,'lexical_cue_projection'):return masked
+        return masked+self.lexical_cue_projection(values*owner[:,:,None])
+
+    def enable_condition_alignment(self):
+        if not hasattr(self,'condition_alignment'):
+            reference=self.relation_encoder.weight_ih_l0
+            self.condition_alignment=ConditionAlignment(self.hidden).to(device=reference.device,dtype=reference.dtype)
+
     def forward(self,source_input,question_input,source_states,question_states,request,batch):
         mask=batch['question_mask'];owner_logits=self.owner_tagger(batch['query_properties'] if self.structural_owner else question_states).squeeze(-1)
         owner=owner_logits.sigmoid()*mask
         source_owner=(batch['exact']@owner[:,:,None]).squeeze(-1).clamp(0,1)
-        q=UnifiedSpanReader._encode(self.relation_encoder,question_input*(1-owner[:,:,None]),mask)
+        q=UnifiedSpanReader._encode(self.relation_encoder,self.relation_inputs(question_input,owner),mask)
         pool=self.relation_pool(q).squeeze(-1).masked_fill(~mask,-torch.inf).softmax(-1)
         relation=(q*pool[:,:,None]).sum(1)
         rows=batch['segment_rows'][:,None];positions=batch['segment_positions'];segment_mask=batch['segment_mask']
-        values=source_input*(1-source_owner[:,:,None])
+        values=self.relation_inputs(source_input,source_owner)
         encoded=UnifiedSpanReader._encode(self.relation_encoder,values[rows,positions],segment_mask)
         addresses=(rows*values.size(1)+positions)[segment_mask]
         states=torch.zeros_like(values).flatten(0,1).index_copy(0,addresses,encoded[segment_mask]).reshape_as(values)
@@ -318,8 +357,13 @@ class FactoredMatching(nn.Module):
         if hasattr(self,'relation_applicability'):
             applicable=applicable+self.relation_applicability(torch.cat((relation,source_mean),-1)).squeeze(-1)
         offset=applicable.sigmoid()[:,None]*(self.owner_gain.tanh()*10.*owner_logits_match+self.relation_gain.tanh()*10.*relation_logits)
-        return dict(matching_offset=offset,query_owner_logits=owner_logits,owner_match_logits=owner_logits_match,relation_request=relation,source_summary=source_mean,
+        result=dict(matching_offset=offset,query_owner_logits=owner_logits,owner_match_logits=owner_logits_match,relation_request=relation,source_summary=source_mean,
                     factored_relation_logits=relation_logits,factored_applicability_logits=applicable)
+        if hasattr(self,'condition_alignment'):
+            conditions=self.condition_alignment(q,batch['query_properties'],mask,covered)
+            result.update(conditions)
+            result['matching_offset']=offset+applicable.sigmoid()[:,None]*conditions['condition_offset']
+        return result
 
 
 class SemanticWordComposer(nn.Module):

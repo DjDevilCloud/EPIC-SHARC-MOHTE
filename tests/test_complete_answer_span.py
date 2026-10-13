@@ -12,6 +12,21 @@ from train import save_checkpoint,load_bundle_from_checkpoint
 
 
 class CompleteAnswerSpanTests(unittest.TestCase):
+    def test_lexical_cue_configuration_checkpoint_roundtrip(self):
+        t,m,module=self.requested_role_fixture('relation_decisions_v10')
+        m.cfg.identity_readout_relation_lexical_cues=True
+        m.cfg.identity_readout_condition_alignment=True
+        module.unified_reader.factored_matching.enable_lexical_cues()
+        module.unified_reader.factored_matching.enable_condition_alignment()
+        with torch.no_grad():module.unified_reader.factored_matching.lexical_cue_projection.weight.normal_(0.,.05)
+        with tempfile.TemporaryDirectory() as directory:
+            save_checkpoint(m,directory,tokenizer=t)
+            loaded,_,cfg=load_bundle_from_checkpoint(Path(directory)/'model.pt',device='cpu',load_training_state=False)
+            self.assertTrue(cfg.identity_readout_relation_lexical_cues)
+            self.assertTrue(cfg.identity_readout_condition_alignment)
+            torch.testing.assert_close(module.unified_reader.factored_matching.lexical_cue_projection.weight,loaded.bounded_identity_readout.complete_answer_span.unified_reader.factored_matching.lexical_cue_projection.weight,rtol=0,atol=0)
+            for key,value in module.unified_reader.factored_matching.condition_alignment.state_dict().items():torch.testing.assert_close(value,loaded.bounded_identity_readout.complete_answer_span.unified_reader.factored_matching.condition_alignment.state_dict()[key],rtol=0,atol=0)
+
     def test_failed_name_router_allows_only_confident_digit_request(self):
         from unified_span_reader import ANSWER_ROLE_FACTS
         t,m,module=self.requested_role_fixture('relation_decisions_v10')

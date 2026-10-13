@@ -502,6 +502,10 @@ class BoundedIdentityReadout(nn.Module):
             if cfg.identity_readout_complete_answer_spans:
                 from source_answer_span import CompleteAnswerSpanPredictor
                 self.complete_answer_span=CompleteAnswerSpanPredictor(cfg.d_model,feature_version=cfg.identity_readout_answer_span_features,task_router=cfg.identity_readout_answer_span_task_router,word_encoder=cfg.identity_readout_answer_span_word_encoder,kind_labels=cfg.identity_readout_answer_span_kinds,kind_conditioned_endpoints=cfg.identity_readout_answer_span_kind_conditioned_endpoints,typed_extent_eligibility=cfg.identity_readout_answer_span_typed_extent_eligibility,kind_threshold=cfg.identity_readout_native_span_confidence,owner_context=cfg.identity_readout_answer_span_owner_context,general_context=cfg.identity_readout_answer_span_general_context,general_endpoint=cfg.identity_readout_answer_span_general_endpoint,general_roles=cfg.identity_readout_answer_span_general_roles,general_name_plan=cfg.identity_readout_answer_span_general_name_plan,general_query_attention=cfg.identity_readout_answer_span_general_query_attention,general_relation_attention=cfg.identity_readout_answer_span_general_relation_attention,relation_eligibility=cfg.identity_readout_answer_span_relation_eligibility,endpoint_properties=cfg.identity_readout_answer_span_endpoint_properties,endpoint_task_router=cfg.identity_readout_answer_span_endpoint_task_router,causal_owners=cfg.identity_readout_answer_span_causal_owners,unified_reader=cfg.identity_readout_unified_span_reader,unified_reader_version=cfg.identity_readout_unified_reader_version)
+                if cfg.identity_readout_relation_lexical_cues:
+                    self.complete_answer_span.unified_reader.factored_matching.enable_lexical_cues()
+                if cfg.identity_readout_condition_alignment:
+                    self.complete_answer_span.unified_reader.factored_matching.enable_condition_alignment()
             self.surface_projection = None
             if self.surface_ids.numel():
                 self.surface_projection = nn.Linear(2 * cfg.d_model, self.surface_ids.numel(), bias=False)
