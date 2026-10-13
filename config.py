@@ -441,7 +441,7 @@ class PrismalWaveConfig:
             raise ValueError('Grounded QA span loss weight must be nonnegative')
         if self.grounded_qa_span_loss_weight and (not self.identity_readout_unified_span_reader or not self.grounded_qa_full_context):
             raise ValueError('Grounded QA span supervision requires the unified reader and full QA contexts')
-        if self.identity_readout_unified_reader_version not in {'aligned_v1','masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+        if self.identity_readout_unified_reader_version not in {'aligned_v1','masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
             raise ValueError('Unknown unified span reader version')
         if self.identity_readout_unified_span_reader and (not self.identity_readout_answer_span_general_context or self.identity_readout_answer_span_word_encoder != 'shared_word_v2'):
             raise ValueError('Unified span reader requires general span context and shared word composition')

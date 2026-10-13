@@ -12,6 +12,24 @@ from train import save_checkpoint,load_bundle_from_checkpoint
 
 
 class CompleteAnswerSpanTests(unittest.TestCase):
+    def test_failed_name_router_allows_only_confident_digit_request(self):
+        from unified_span_reader import ANSWER_ROLE_FACTS
+        t,m,module=self.requested_role_fixture('relation_decisions_v10')
+        module.ready.fill_(True);module.general_name_plan=True
+        module.general_name_scope=torch.nn.Linear(m.cfg.d_model,1)
+        roles=[0.]*len(ANSWER_ROLE_FACTS);roles[ANSWER_ROLE_FACTS.index('digits')]=.999
+        proposed=AnswerSpanPlan(tuple(t.encode('December 2021.',add_special_tokens=False)),0,2,.999,requested_properties=tuple(roles))
+        with patch.object(module,'unified_task_applicable',return_value=True),patch.object(module,'question_features',return_value=torch.zeros(1,m.cfg.d_model)),patch.object(module,'task_features',return_value=torch.zeros(1,m.cfg.d_model)),patch.object(module.general_scope,'forward',return_value=torch.tensor([20.])),patch.object(module.general_name_scope,'forward',return_value=torch.tensor([20.])),patch.object(module,'packet',return_value={}),patch.object(module,'scores',return_value={}),patch.object(module,'plan_from_scores',return_value=None),patch.object(module,'unified_proposal',return_value=proposed):
+            from types import SimpleNamespace
+            state=SimpleNamespace(words=SimpleNamespace(question=lambda:()))
+            args=(state,t,m.shared_signature_bank,m.construction_embedding)
+            self.assertIs(module.propose(*args),proposed)
+            proposed.confidence=.98;self.assertIsNone(module.propose(*args))
+            proposed.confidence=.999;proposed.requested_properties=tuple([0.]*len(roles));self.assertIsNone(module.propose(*args))
+            proposed.requested_properties=tuple(roles);proposed.tokens=tuple(t.encode('John Reed',add_special_tokens=False));self.assertIsNone(module.propose(*args))
+            protected_plan=AnswerSpanPlan((),0,1,.999)
+            with patch.object(module,'plan_from_scores',return_value=protected_plan):self.assertIs(module.propose(*args),protected_plan)
+
     def requested_role_fixture(self,version='requested_roles_v6'):
         t,m,_=self.fixture(general=True)
         m.cfg.identity_readout_unified_span_reader=True
@@ -34,7 +52,7 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         self.assertEqual(float(actual['reader_answer_facts'][actual['surfaces'].index('John Reed'),bit]),0.)
 
     def test_normal_compute_loss_supervises_requested_properties(self):
-        for version in ('requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'):
+        for version in ('requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'):
             with self.subTest(version=version):self.check_normal_requested_properties(version)
 
     def check_normal_requested_properties(self,version):

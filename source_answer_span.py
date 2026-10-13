@@ -383,12 +383,12 @@ class CompleteAnswerSpanPredictor(nn.Module):
             for i in range(len(groups)-2,-1,-1):scope_ends[i]=i+1 if scope_starts[i+1]!=scope_starts[i] else scope_ends[i+1]
             result['reader_scope_end']=torch.tensor(scope_ends,device=device)
             result['question_word_ids']=[tuple(ids) for ids in query]
-            if hasattr(self,'unified_reader') and self.unified_reader.version=='structural_owner_v9':
+            if hasattr(self,'unified_reader') and self.unified_reader.version in {'structural_owner_v9','relation_decisions_v10'}:
                 from unified_span_reader import query_word_properties
                 query_records=[(serial,ids) for serial,_,ids in state.words.records if serial>question_label]
                 last_positions={entry[3]:position for entry,position in zip(state.entries,state.source_positions)}
                 result['reader_query_properties']=query_word_properties(query_records,raw,last_positions,tokenizer).to(device)
-            if hasattr(self,'unified_reader') and self.unified_reader.version in {'requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+            if hasattr(self,'unified_reader') and self.unified_reader.version in {'requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
                 from unified_span_reader import answer_span_facts
                 facts=[];word_text={};fact_cache={}
                 for text,(i,j,begin,finish) in zip(surfaces,ends):
@@ -651,7 +651,7 @@ class CompleteAnswerSpanPredictor(nn.Module):
             answer=tokenizer.decode(row[output_begin+1:output_end],clean_text=False,collapse_structure=False).strip()
             features=reader_packet_from_span(p,self.unified_reader.version)
             gold=torch.tensor([text==answer for text in p['surfaces']],device=bank.embedding.weight.device)
-            if self.unified_reader.version in {'scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+            if self.unified_reader.version in {'scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
                 gold=gold&(features['scope_start'][features['owners']]==features['scope_start'][features['finishes']])
             if not bool(gold.any()):uncovered+=1;continue
             features['gold']=gold
@@ -745,7 +745,19 @@ class CompleteAnswerSpanPredictor(nn.Module):
         if packet is None:packet=self.packet(state,tokenizer,bank,lexical_embeddings)
         if packet is None:return None
         if scored is None:scored=self.scores(packet)
-        return self.plan_from_scores(packet,scored,threshold)
+        plan=self.plan_from_scores(packet,scored,threshold)
+        if plan is None and self.unified_task_applicable(state,tokenizer) and protected:
+            # A name-routing false positive must not veto a verified numeric
+            # request when the protected planner cannot supply any span.
+            proposed=self.unified_proposal(state,tokenizer,bank,lexical_embeddings,threshold)
+            if proposed is not None and proposed.confidence>=.99:
+                from unified_span_reader import ANSWER_ROLE_FACTS
+                digit_index=ANSWER_ROLE_FACTS.index('digits')
+                if (len(proposed.requested_properties)>digit_index
+                        and proposed.requested_properties[digit_index]>=.99
+                        and any(c.isdecimal() for c in tokenizer.decode(proposed.tokens))):
+                    return proposed
+        return plan
 
     def plan_from_scores(self,packet,scored,threshold=.9):
         prob=scored['joint'].exp()

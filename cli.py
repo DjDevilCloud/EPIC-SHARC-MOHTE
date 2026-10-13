@@ -147,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-answer-span-general-roles", action="store_true", help="Compose observed case-chain start/end roles in general span features")
         p.add_argument("--identity-readout-answer-span-general-name-plan", action="store_true", help="Predict complete person spans from surrounding relation context and source roles")
         p.add_argument("--identity-readout-answer-span-general-query-attention", action="store_true", help="Attend over ordered question words for general span selection")
-        p.add_argument("--identity-readout-unified-reader-version", choices=("aligned_v1", "masked_relations_v2", "scoped_relations_v3", "semantic_scoped_v4", "semantic_context_v5", "requested_roles_v6", "nonlinear_roles_v7", "factored_matching_v8", "structural_owner_v9"), default="aligned_v1")
+        p.add_argument("--identity-readout-unified-reader-version", choices=("aligned_v1", "masked_relations_v2", "scoped_relations_v3", "semantic_scoped_v4", "semantic_context_v5", "requested_roles_v6", "nonlinear_roles_v7", "factored_matching_v8", "structural_owner_v9", "relation_decisions_v10"), default="aligned_v1")
         p.add_argument("--grounded-qa-full-context", action="store_true", help="Keep complete Context/Question/Answer records; QA length may exceed seq-len")
         p.add_argument("--grounded-qa-span-loss-weight", type=float, default=None, help="Differentiable source-span objective (defaults to 1 for unified reader training)")
         p.add_argument("--identity-readout-unified-span-reader", action="store_true", help="Use one shared question/source encoder for complete grounded spans")

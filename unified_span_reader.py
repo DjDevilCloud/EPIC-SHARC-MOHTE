@@ -157,12 +157,12 @@ def reader_packet_from_span(packet,version='aligned_v1'):
     exact=torch.tensor([[a==b for b in query_keys] for a in source_keys],device=packet['source_words'].device,dtype=torch.float32)
     d=packet['source_words'].size(-1)
     result=dict(source=packet['source_words'],question=packet['question'],properties=packet['start_features'][:,-d:],
-                anchors=packet.get('causal_owner_contexts',torch.zeros_like(packet['source_words']))*(packet.get('causal_owner_evicted',torch.zeros(len(source_keys),device=exact.device,dtype=torch.bool))[:,None] if version in {'masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'} else 1.),
+                anchors=packet.get('causal_owner_contexts',torch.zeros_like(packet['source_words']))*(packet.get('causal_owner_evicted',torch.zeros(len(source_keys),device=exact.device,dtype=torch.bool))[:,None] if version in {'masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'} else 1.),
                 owners=torch.tensor([e[0] for e in packet['ends']],device=exact.device),
                 finishes=torch.tensor([e[1] for e in packet['ends']],device=exact.device),
                 end_properties=packet['reader_endpoint_properties'],exact=exact,scope_start=packet['reader_scope_start'],scope_end=packet['reader_scope_end'])
-    if version in {'requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:result['answer_facts']=packet['reader_answer_facts']
-    if version=='structural_owner_v9':result['query_properties']=packet['reader_query_properties']
+    if version in {'requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:result['answer_facts']=packet['reader_answer_facts']
+    if version in {'structural_owner_v9','relation_decisions_v10'}:result['query_properties']=packet['reader_query_properties']
     return result
 
 
@@ -234,18 +234,23 @@ class RelationalSpanReader(nn.Module):
         count=(finishes-owners+1).clamp(1,16)
         req=request[:,None].expand_as(context)
         features=torch.cat((context,req,context*req,memory,props,batch['end_properties'],self.length(count),coverage),-1)
+        factors=self.factored_matching(source_input,question_input,s,q,request,batch) if hasattr(self,'factored_matching') else None
         role_logits=role_compatibility=None
         if hasattr(self,'requested_roles'):
             role_logits=self.requested_roles(request)
             if hasattr(self,'requested_roles_nonlinear'):
                 role_logits=role_logits+self.requested_roles_nonlinear(request)
+            if hasattr(self,'relation_properties'):
+                relation_logits=self.relation_properties(factors['relation_request'])
+                mix=factors['factored_applicability_logits'].sigmoid()[:,None]*self.relation_properties_gain.tanh().clamp_min(0.)
+                role_logits=role_logits*(1-mix)+relation_logits*mix
+                factors['relation_requested_role_logits']=relation_logits
             facts=batch['answer_facts'];logits=role_logits[:,None].expand_as(facts)
             compatibility=-F.binary_cross_entropy_with_logits(logits,facts,reduction='none')
             split=len(ANSWER_ROLE_FACTS)
             role_compatibility=compatibility.sum(-1)
         valid=batch['candidate_mask']
         if self.scoped:valid=valid&(batch['scope_start'].gather(1,owners)==batch['scope_start'].gather(1,finishes))
-        factors=self.factored_matching(source_input,question_input,s,q,request,batch) if hasattr(self,'factored_matching') else None
         result=self.score_candidates(features,owners,valid,source.size(1),role_compatibility,
                                      factors['matching_offset'] if factors is not None else None)
         if factors is not None:result.update(factors)
@@ -310,8 +315,10 @@ class FactoredMatching(nn.Module):
         owner_logits_match=coverage.clamp_min(.001).log()*owner.max(-1).values[:,None]
         source_mean=(source_states*batch['source_mask'][:,:,None]).sum(1)/batch['source_mask'].sum(1)[:,None]
         applicable=self.applicability(torch.cat((request,source_mean),-1)).squeeze(-1)
+        if hasattr(self,'relation_applicability'):
+            applicable=applicable+self.relation_applicability(torch.cat((relation,source_mean),-1)).squeeze(-1)
         offset=applicable.sigmoid()[:,None]*(self.owner_gain.tanh()*10.*owner_logits_match+self.relation_gain.tanh()*10.*relation_logits)
-        return dict(matching_offset=offset,query_owner_logits=owner_logits,owner_match_logits=owner_logits_match,
+        return dict(matching_offset=offset,query_owner_logits=owner_logits,owner_match_logits=owner_logits_match,relation_request=relation,source_summary=source_mean,
                     factored_relation_logits=relation_logits,factored_applicability_logits=applicable)
 
 
@@ -338,22 +345,28 @@ def semantic_components(word_ids,tokenizer,capacity=512):
 
 def create_unified_reader(width,version='aligned_v1'):
     if version=='aligned_v1':reader=UnifiedSpanReader(width)
-    elif version in {'masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+    elif version in {'masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
         reader=RelationalSpanReader(width);reader.scoped=version!='masked_relations_v2'
-        if version in {'semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+        if version in {'semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
             reader.semantic_words=SemanticWordComposer(width)
             reader.semantic_gain=nn.Parameter(torch.zeros(()))
-        if version in {'semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:reader.document_context_gain=nn.Parameter(torch.zeros(()))
-        if version in {'requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+        if version in {'semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:reader.document_context_gain=nn.Parameter(torch.zeros(()))
+        if version in {'requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
             reader.requested_roles=nn.Linear(reader.hidden,len(ANSWER_ROLE_FACTS)+len(ANSWER_EXTENT_FACTS))
             nn.init.zeros_(reader.requested_roles.weight);nn.init.zeros_(reader.requested_roles.bias)
             reader.requested_roles_gain=nn.Parameter(torch.zeros(()))
-            if version in {'nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+            if version in {'nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
                 reader.requested_roles_nonlinear=nn.Sequential(nn.Linear(reader.hidden,reader.hidden),nn.Tanh(),nn.Linear(reader.hidden,len(ANSWER_ROLE_FACTS)+len(ANSWER_EXTENT_FACTS)))
                 # Preserve the learned linear head exactly at checkpoint migration.
                 nn.init.zeros_(reader.requested_roles_nonlinear[-1].weight)
                 nn.init.zeros_(reader.requested_roles_nonlinear[-1].bias)
-        if version in {'factored_matching_v8','structural_owner_v9'}:reader.factored_matching=FactoredMatching(reader.hidden,version=='structural_owner_v9')
+        if version in {'factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:reader.factored_matching=FactoredMatching(reader.hidden,version in {'structural_owner_v9','relation_decisions_v10'})
+        if version=='relation_decisions_v10':
+            reader.factored_matching.relation_applicability=nn.Sequential(nn.Linear(2*reader.hidden,reader.hidden//2),nn.Tanh(),nn.Linear(reader.hidden//2,1))
+            reader.relation_properties=nn.Sequential(nn.Linear(reader.hidden,reader.hidden),nn.Tanh(),nn.Linear(reader.hidden,len(ANSWER_ROLE_FACTS)+len(ANSWER_EXTENT_FACTS)))
+            reader.relation_properties_gain=nn.Parameter(torch.zeros(()))
+            for head in (reader.factored_matching.relation_applicability,reader.relation_properties):
+                nn.init.zeros_(head[-1].weight);nn.init.zeros_(head[-1].bias)
     else:raise ValueError('Unknown unified span reader version: '+version)
     reader.version=version
     return reader

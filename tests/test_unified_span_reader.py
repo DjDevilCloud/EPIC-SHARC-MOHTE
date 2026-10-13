@@ -3,6 +3,23 @@ import torch
 from unified_span_reader import UnifiedSpanReader,RelationalSpanReader,SemanticWordComposer,collate_reader_packets,answer_span_facts,ANSWER_ROLE_FACTS,ANSWER_EXTENT_FACTS
 
 class UnifiedReaderTests(unittest.TestCase):
+    def test_relation_decision_migration_preserves_scores_and_enables_heads(self):
+        from unified_span_reader import create_unified_reader
+        torch.manual_seed(41);old=create_unified_reader(8,'structural_owner_v9');new=create_unified_reader(8,'relation_decisions_v10')
+        missing=new.load_state_dict(old.state_dict(),strict=False)
+        self.assertFalse(missing.unexpected_keys)
+        self.assertTrue(all(k.startswith(('relation_properties','factored_matching.relation_applicability')) for k in missing.missing_keys))
+        p=self.packet(5,3);p.update(scope_start=torch.zeros(5,dtype=torch.long),scope_end=torch.full((5,),5),query_properties=torch.rand(3,8),answer_facts=torch.rand(len(p['owners']),29))
+        # Shared semantic units remain real ordered inputs, independent of labels.
+        p['source_components']=[torch.tensor([[i+1,i+2]]) for i in range(5)]
+        p['question_components']=[torch.tensor([[i+1,i+2]]) for i in range(3)]
+        batch=collate_reader_packets([p]);a,b=old(batch),new(batch)
+        for key in a:torch.testing.assert_close(a[key],b[key],rtol=0,atol=0)
+        auxiliary=b['relation_requested_role_logits'].sum()+b['factored_applicability_logits'].sum()
+        auxiliary.backward()
+        self.assertGreater(float(new.relation_properties[-1].weight.grad.abs().sum()),0.)
+        self.assertGreater(float(new.factored_matching.relation_applicability[-1].weight.grad.abs().sum()),0.)
+
     def test_query_properties_preserve_case_for_fragmented_unseen_words(self):
         from data import PrismalTokenizer
         from signature_bank import WordSpanState
