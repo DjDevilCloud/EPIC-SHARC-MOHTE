@@ -75,6 +75,10 @@ class PrismalWaveConfig:
     identity_readout_answer_span_endpoint_properties: bool = False
     identity_readout_answer_span_endpoint_task_router: bool = False
     identity_readout_answer_span_causal_owners: bool = False
+    identity_readout_unified_span_reader: bool = False
+    identity_readout_unified_reader_version: str = 'aligned_v1'
+    grounded_qa_span_loss_weight: float = 0.0
+    grounded_qa_full_context: bool = False
     identity_readout_answer_span_kinds: list[str] = field(default_factory=lambda: ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
@@ -433,6 +437,14 @@ class PrismalWaveConfig:
             raise ValueError('Endpoint property scoring requires general span context')
         if self.identity_readout_answer_span_endpoint_task_router and not self.identity_readout_answer_span_endpoint_properties:
             raise ValueError('Endpoint task routing requires endpoint property scoring')
+        if not 0<=self.grounded_qa_span_loss_weight<float('inf'):
+            raise ValueError('Grounded QA span loss weight must be nonnegative')
+        if self.grounded_qa_span_loss_weight and (not self.identity_readout_unified_span_reader or not self.grounded_qa_full_context):
+            raise ValueError('Grounded QA span supervision requires the unified reader and full QA contexts')
+        if self.identity_readout_unified_reader_version not in {'aligned_v1','masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+            raise ValueError('Unknown unified span reader version')
+        if self.identity_readout_unified_span_reader and (not self.identity_readout_answer_span_general_context or self.identity_readout_answer_span_word_encoder != 'shared_word_v2'):
+            raise ValueError('Unified span reader requires general span context and shared word composition')
         if self.identity_readout_answer_span_causal_owners and not self.identity_readout_answer_span_endpoint_task_router:
             raise ValueError('Causal owner selection requires endpoint task routing')
         if self.identity_readout_answer_span_general_relation_attention and not self.identity_readout_answer_span_general_context:

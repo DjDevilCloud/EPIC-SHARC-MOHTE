@@ -2,6 +2,7 @@
 import copy
 import unittest
 import tempfile
+from pathlib import Path
 from unittest.mock import patch
 import torch
 from tests import test_source_ownership as ownership
@@ -11,6 +12,109 @@ from train import save_checkpoint,load_bundle_from_checkpoint
 
 
 class CompleteAnswerSpanTests(unittest.TestCase):
+    def requested_role_fixture(self,version='requested_roles_v6'):
+        t,m,_=self.fixture(general=True)
+        m.cfg.identity_readout_unified_span_reader=True
+        m.cfg.identity_readout_unified_reader_version=version
+        m.cfg.identity_readout_answer_span_word_encoder='shared_word_v2'
+        head=BoundedIdentityReadout(m.cfg);head.load_state_dict(m.bounded_identity_readout.state_dict(),strict=False)
+        m.bounded_identity_readout=head
+        return t,m,head.complete_answer_span
+
+    def test_requested_role_metadata_preserves_source_case_continuation(self):
+        from unified_span_reader import ANSWER_ROLE_FACTS,ANSWER_EXTENT_FACTS
+        t,m,module=self.requested_role_fixture()
+        text='Context:\nJohn Reed wrote Blue River.\nQuestion:\nWho wrote Blue River?'
+        ids,_,_,state=self.state(t,m,text)
+        actual=module.packet(state,t,m.shared_signature_bank,m.construction_embedding,compact=True)
+        rebuilt=module.packet(m.bounded_identity_readout.input_state_from_tokens(ids[0].tolist(),t),t,m.shared_signature_bank,m.construction_embedding,compact=True)
+        torch.testing.assert_close(actual['reader_answer_facts'],rebuilt['reader_answer_facts'],rtol=0,atol=0)
+        bit=len(ANSWER_ROLE_FACTS)+ANSWER_EXTENT_FACTS.index('capital_continuation')
+        self.assertEqual(float(actual['reader_answer_facts'][actual['surfaces'].index('John'),bit]),1.)
+        self.assertEqual(float(actual['reader_answer_facts'][actual['surfaces'].index('John Reed'),bit]),0.)
+
+    def test_normal_compute_loss_supervises_requested_properties(self):
+        for version in ('requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'):
+            with self.subTest(version=version):self.check_normal_requested_properties(version)
+
+    def check_normal_requested_properties(self,version):
+        from data import _build_window_samples_from_text
+        from model import PrismalWaveOutput
+        t,m,module=self.requested_role_fixture(version);m.cfg.grounded_qa_span_loss_weight=1.;m.cfg.grounded_qa_full_context=True
+        m.eval();m.requires_grad_(False);reader=module.unified_reader;reader.requires_grad_(True)
+        sample=_build_window_samples_from_text(t,'<BOI>Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?<EOI><BOO>$75<EOO>',seq_len=16,preserve_grounded_qa_context=True,hierarchy_vector_dtype='float32')[0]
+        ids=sample.input_ids[None]
+        output=PrismalWaveOutput(logits=torch.zeros(1,ids.size(1),t.vocab_size),input_signature=torch.zeros(1,m.cfg.d_model),output_signature=torch.zeros(1,m.cfg.d_model),path_logits=None,route_stats={})
+        with patch.object(m,'forward',return_value=output):loss,result=m.compute_loss(ids,sample.labels[None],loss_mask=sample.loss_mask[None],collect_telemetry=False)
+        stats=result.route_stats
+        for key in ('grounded_qa_requested_role_loss','grounded_qa_requested_extent_loss'):self.assertGreater(float(stats[key]),0.)
+        torch.testing.assert_close(stats['grounded_qa_span_loss'],stats['grounded_qa_start_loss']+stats['grounded_qa_endpoint_loss'])
+        loss.backward();self.assertGreater(float(reader.requested_roles.weight.grad.abs().sum()),0.)
+        if hasattr(reader,'requested_roles_nonlinear'):self.assertGreater(float(reader.requested_roles_nonlinear[-1].weight.grad.abs().sum()),0.)
+        if hasattr(reader,'factored_matching'):
+            self.assertGreater(float(reader.factored_matching.owner_gain.grad.abs()+reader.factored_matching.relation_gain.grad.abs()),0.)
+        self.assertFalse(bool(reader.ready))
+        with tempfile.TemporaryDirectory() as directory:
+            save_checkpoint(m,directory,tokenizer=t)
+            loaded,_,cfg=load_bundle_from_checkpoint(Path(directory)/'model.pt',device='cpu',load_training_state=False)
+            self.assertEqual(cfg.identity_readout_unified_reader_version,version)
+            for key,value in reader.state_dict().items():torch.testing.assert_close(value,loaded.bounded_identity_readout.complete_answer_span.unified_reader.state_dict()[key],rtol=0,atol=0)
+
+    def test_span_plan_carries_predicted_request_properties(self):
+        t,m,module=self.requested_role_fixture()
+        _,_,_,state=self.state(t,m,'Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?')
+        packet=module.packet(state,t,m.shared_signature_bank,m.construction_embedding,compact=True)
+        joint=torch.full((1,len(packet['surfaces'])),-100.)
+        joint[0,packet['surfaces'].index('$75')]=0.
+        logits=torch.linspace(-2.,2.,29)[None]
+        with patch.object(module.unified_reader,'forward',return_value=dict(joint=joint,requested_role_logits=logits)):
+            plan=module.unified_proposal(state,t,m.shared_signature_bank,m.construction_embedding,.9)
+        self.assertEqual(plan.tokens,module.payload(t,'$75'))
+        torch.testing.assert_close(torch.tensor(plan.requested_properties),logits[0].sigmoid(),rtol=0,atol=0)
+
+    def test_unified_reader_cannot_override_verified_causal_occurrence(self):
+        t,m,_=self.fixture(general=True,endpoints=True,endpoint_router=True,causal=True,unified=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        with torch.no_grad():
+            module.ready.fill_(True);module.unified_reader.ready.fill_(True)
+            module.general_scope.classifier[-1].bias.fill_(100.)
+            module.endpoint_scope[-1].bias.fill_(100.)
+        _,_,_,state=self.state(t,m,'Context:\nThe budget has notes with amount $75. Other costs have amount $123.\nQuestion:\nWhat is the budget?')
+        packet=module.packet(state,t,m.shared_signature_bank,m.construction_embedding)
+        target=packet['surfaces'].index('$75');owner=packet['ends'][target][0]
+        match=torch.zeros(len(packet['starts']));match[owner]=10.
+        kind=torch.full_like(match,-100.);kind[owner]=100.
+        endpoint=torch.zeros(len(packet['ends']));endpoint[target]=100.
+        wrong=AnswerSpanPlan(module.payload(t,'$123'),0,1,.999,answer_kind='TEXT_SPAN',kind_confidence=1.)
+        causal=dict(match=match,kind=kind,scope=torch.full_like(match,100.))
+        with patch.object(module,'causal_owner_scores',return_value=causal),patch.object(module,'endpoint_property_scores',return_value=endpoint),patch.object(module,'unified_proposal',side_effect=AssertionError('generic reader overrode verified owner')):
+            plan=module.propose(state,t,m.shared_signature_bank,m.construction_embedding)
+            self.assertEqual(plan.tokens,module.payload(t,'$75'))
+        # An uncalibrated owner route must leave generic native QA available.
+        causal['scope']=torch.full_like(match,-100.)
+        with patch.object(module,'causal_owner_scores',return_value=causal),patch.object(module,'unified_proposal',return_value=wrong):
+            self.assertIs(module.propose(state,t,m.shared_signature_bank,m.construction_embedding),wrong)
+        # Owner confidence alone cannot protect an uncertain endpoint.
+        causal['scope']=torch.full_like(match,100.)
+        with patch.object(module,'causal_owner_scores',return_value=causal),patch.object(module,'endpoint_property_scores',return_value=torch.zeros_like(endpoint)),patch.object(module,'unified_proposal',return_value=wrong):
+            self.assertIs(module.propose(state,t,m.shared_signature_bank,m.construction_embedding),wrong)
+
+    def test_document_context_reader_checkpoint_roundtrip(self):
+        t,m,_=self.fixture(general=True)
+        m.cfg.identity_readout_unified_span_reader=True
+        m.cfg.identity_readout_unified_reader_version='semantic_context_v5'
+        m.cfg.identity_readout_answer_span_word_encoder='shared_word_v2'
+        head=BoundedIdentityReadout(m.cfg);head.load_state_dict(m.bounded_identity_readout.state_dict(),strict=False)
+        m.bounded_identity_readout=head;reader=head.complete_answer_span.unified_reader
+        with torch.no_grad():reader.document_context_gain.fill_(.25);reader.ready.fill_(True)
+        from train import save_checkpoint,load_bundle_from_checkpoint
+        with tempfile.TemporaryDirectory() as directory:
+            save_checkpoint(m,directory,tokenizer=t)
+            loaded,_,cfg=load_bundle_from_checkpoint(Path(directory)/'model.pt',device='cpu',load_training_state=False)
+            self.assertEqual(cfg.identity_readout_unified_reader_version,'semantic_context_v5')
+            for name,value in reader.state_dict().items():
+                torch.testing.assert_close(value,loaded.bounded_identity_readout.complete_answer_span.unified_reader.state_dict()[name],rtol=0,atol=0)
+
     def test_causal_anchor_survives_eviction_and_prunes_expired_clause(self):
         from types import SimpleNamespace
         lexical=SimpleNamespace(is_lexical=True)
@@ -102,6 +206,82 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         self.assertEqual(int(torch.isfinite(after['start']).sum()),2)
         torch.testing.assert_close(after['end'],module.endpoint_property_scores(p,module.general_request(p['question'])),atol=0,rtol=0)
         self.assertFalse(torch.isnan(after['joint']).any())
+
+    def test_compact_reader_uses_explicit_full_question_and_removes_labels(self):
+        t,m,_=self.fixture(general=True,endpoints=True,endpoint_router=True,causal=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        packets=[]
+        for label in ('Context:\n','CONTEXT:\t'):
+            text=label+'The budget is $75.\nQuestion: Consider the budget. What is the amount?'
+            _,_,_,state=self.state(t,m,text)
+            p=module.packet(state,t,m.shared_signature_bank,m.construction_embedding,compact=True)
+            source=[t.decode(list(ids),clean_text=False,collapse_structure=False).casefold() for ids in p['source_word_ids']]
+            query=[t.decode(list(ids),clean_text=False,collapse_structure=False).casefold() for ids in p['question_word_ids']]
+            self.assertNotIn('context',source);self.assertNotIn('question',source)
+            self.assertNotIn('consider',source);self.assertEqual(query[0],'consider')
+            self.assertNotIn('general_contexts',p)
+            packets.append(p)
+        torch.testing.assert_close(packets[0]['source_words'],packets[1]['source_words'],atol=0,rtol=0)
+        torch.testing.assert_close(packets[0]['question'],packets[1]['question'],atol=0,rtol=0)
+
+    def test_unified_schema_route_bypasses_question_family_rejection(self):
+        t,m,_=self.fixture(general=True,unified=True)
+        head=m.bounded_identity_readout;module=head.complete_answer_span
+        ids,features,baseline,st=self.state(t,m,'Context:\nThe budget is $75.\nQuestion:\nWhich amount is the budget?')
+        p=module.packet(st,t,m.shared_signature_bank,m.construction_embedding,compact=True)
+        winner=p['surfaces'].index('$75');joint=torch.full((1,len(p['ends'])),-torch.inf);joint[0,winner]=0.
+        module.ready.fill_(True);module.unified_reader.ready.fill_(True)
+        with torch.no_grad():
+            head.native_applicability.classifier[-1].bias.fill_(-100.)
+            module.general_scope.classifier[-1].bias.fill_(-100.)
+        with torch.no_grad(),patch.object(module.unified_reader,'forward',return_value={'joint':joint}):
+            _,states=head(torch.zeros_like(baseline),torch.zeros(1,ids.size(1),m.cfg.d_model),ids,features,t,m.shared_signature_bank,lexical_embeddings=m.construction_embedding)
+        self.assertEqual(states[0].answer_plan.tokens,module.payload(t,'$75'))
+        self.assertTrue(module.unified_task_applicable(st,t))
+        _,_,_,ordinary=self.state(t,m,'Which amount is the budget?')
+        self.assertFalse(module.unified_task_applicable(ordinary,t))
+        with tempfile.TemporaryDirectory() as directory:
+            path=save_checkpoint(m,directory,tokenizer=t);loaded,_,cfg=load_bundle_from_checkpoint(path,device='cpu',load_training_state=False)
+            self.assertTrue(cfg.identity_readout_unified_span_reader)
+            self.assertTrue(bool(loaded.bounded_identity_readout.complete_answer_span.unified_reader.ready))
+            for name,value in module.unified_reader.state_dict().items():torch.testing.assert_close(value,loaded.bounded_identity_readout.complete_answer_span.unified_reader.state_dict()[name],atol=0,rtol=0)
+
+    def test_compact_spans_tokenize_only_selected_answer(self):
+        t,m,_=self.fixture(general=True,unified=True)
+        module=m.bounded_identity_readout.complete_answer_span
+        _,_,_,st=self.state(t,m,'Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?')
+        with patch.object(module,'payload',side_effect=AssertionError('candidate re-tokenized')):
+            p=module.packet(st,t,m.shared_signature_bank,m.construction_embedding,compact=True)
+        self.assertIn('$75',p['surfaces']);self.assertNotIn('tokens',p)
+
+    def test_normal_compute_loss_backpropagates_explicit_span_supervision(self):
+        from data import _build_window_samples_from_text
+        from model import PrismalWaveOutput
+        t,m,_=self.fixture(general=True,unified=True)
+        m.cfg.grounded_qa_span_loss_weight=1.;m.cfg.grounded_qa_full_context=True
+        m.eval();m.requires_grad_(False);reader=m.bounded_identity_readout.complete_answer_span.unified_reader;reader.requires_grad_(True)
+        text='<BOI>Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?<EOI><BOO>$75<EOO>'
+        sample=_build_window_samples_from_text(t,text,seq_len=16,preserve_grounded_qa_context=True,hierarchy_vector_dtype='float32')[0]
+        ids=sample.input_ids[None];labels=sample.labels[None]
+        output=PrismalWaveOutput(logits=torch.zeros(1,ids.size(1),t.vocab_size),input_signature=torch.zeros(1,m.cfg.d_model),output_signature=torch.zeros(1,m.cfg.d_model),path_logits=None,route_stats={})
+        with patch.object(m,'forward',return_value=output):loss,result=m.compute_loss(ids,labels,loss_mask=sample.loss_mask[None],collect_telemetry=False)
+        self.assertEqual(int(result.route_stats['grounded_qa_records']),1)
+        self.assertEqual(int(result.route_stats['grounded_qa_uncovered']),0)
+        self.assertFalse(bool(reader.ready))
+        loss.backward()
+        self.assertGreater(float(reader.query.weight.grad.abs().sum()),0.)
+        self.assertGreater(float(reader.end[-1].weight.grad.abs().sum()),0.)
+
+    def test_training_source_metadata_matches_production_prefix(self):
+        t,m,_=self.fixture(general=True,unified=True)
+        ids,_,_,state=self.state(t,m,'Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?')
+        head=m.bounded_identity_readout;module=head.complete_answer_span
+        actual=module.packet(state,t,m.shared_signature_bank,m.construction_embedding,compact=True)
+        built=head.input_state_from_tokens(ids[0].tolist(),t)
+        expected=module.packet(built,t,m.shared_signature_bank,m.construction_embedding,compact=True)
+        for key,value in actual.items():
+            if torch.is_tensor(value):torch.testing.assert_close(value,expected[key],atol=0,rtol=0)
+            else:self.assertEqual(value,expected[key],key)
 
     def test_endpoint_request_router_preserves_other_tasks(self):
         t,m,_=self.fixture(general=True,endpoints=True,endpoint_router=True)
@@ -201,7 +381,7 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(module.relation_scope.weight.grad).all())
         self.assertGreater(float(module.relation_scope.weight.grad.abs().sum()),0.)
 
-    def fixture(self,conditioned=False,typed=False,owner=False,general=False,guide=False,query_attention=False,relation_attention=False,eligibility=False,endpoints=False,endpoint_router=False,causal=False):
+    def fixture(self,conditioned=False,typed=False,owner=False,general=False,guide=False,query_attention=False,relation_attention=False,eligibility=False,endpoints=False,endpoint_router=False,causal=False,unified=False):
         f=ownership.SourceOwnershipTests();helper,t,m=f.fixture();f.enable(m,t)
         old=m.bounded_identity_readout
         old._binding_cfg=copy.copy(m.cfg)
@@ -219,6 +399,8 @@ class CompleteAnswerSpanTests(unittest.TestCase):
         m.cfg.identity_readout_answer_span_endpoint_properties=endpoints
         m.cfg.identity_readout_answer_span_endpoint_task_router=endpoint_router
         m.cfg.identity_readout_answer_span_causal_owners=causal
+        m.cfg.identity_readout_unified_span_reader=unified
+        if unified:m.cfg.identity_readout_answer_span_word_encoder='shared_word_v2'
         if general:m.cfg.identity_readout_answer_span_kinds=list(m.cfg.identity_readout_answer_span_kinds)+['TEXT_SPAN']
         head=BoundedIdentityReadout(m.cfg);head.load_state_dict(old.state_dict(),strict=False)
         m.bounded_identity_readout=head;m.prepare_capacity_for_tokenizer(t)

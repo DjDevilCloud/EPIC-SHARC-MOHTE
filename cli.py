@@ -147,6 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--identity-readout-answer-span-general-roles", action="store_true", help="Compose observed case-chain start/end roles in general span features")
         p.add_argument("--identity-readout-answer-span-general-name-plan", action="store_true", help="Predict complete person spans from surrounding relation context and source roles")
         p.add_argument("--identity-readout-answer-span-general-query-attention", action="store_true", help="Attend over ordered question words for general span selection")
+        p.add_argument("--identity-readout-unified-reader-version", choices=("aligned_v1", "masked_relations_v2", "scoped_relations_v3", "semantic_scoped_v4", "semantic_context_v5", "requested_roles_v6", "nonlinear_roles_v7", "factored_matching_v8", "structural_owner_v9"), default="aligned_v1")
+        p.add_argument("--grounded-qa-full-context", action="store_true", help="Keep complete Context/Question/Answer records; QA length may exceed seq-len")
+        p.add_argument("--grounded-qa-span-loss-weight", type=float, default=None, help="Differentiable source-span objective (defaults to 1 for unified reader training)")
+        p.add_argument("--identity-readout-unified-span-reader", action="store_true", help="Use one shared question/source encoder for complete grounded spans")
         p.add_argument("--identity-readout-answer-span-causal-owners", action="store_true", help="Retain bounded causal owner prefixes and separate relation selection from value identity")
         p.add_argument("--identity-readout-answer-span-endpoint-task-router", action="store_true", help="Gate endpoint property corrections by learned request applicability")
         p.add_argument("--identity-readout-answer-span-endpoint-properties", action="store_true", help="Learn source-owned endpoint marker and extent compatibility")
@@ -807,6 +811,10 @@ def _build_config(args: argparse.Namespace, tokenizer: ByteTokenizer | None = No
         identity_readout_answer_span_endpoint_properties=getattr(args, "identity_readout_answer_span_endpoint_properties", False),
         identity_readout_answer_span_endpoint_task_router=getattr(args, "identity_readout_answer_span_endpoint_task_router", False),
         identity_readout_answer_span_causal_owners=getattr(args, "identity_readout_answer_span_causal_owners", False),
+        identity_readout_unified_span_reader=getattr(args, "identity_readout_unified_span_reader", False),
+        identity_readout_unified_reader_version=getattr(args, "identity_readout_unified_reader_version", "aligned_v1"),
+        grounded_qa_span_loss_weight=(getattr(args,'grounded_qa_span_loss_weight',None) if getattr(args,'grounded_qa_span_loss_weight',None) is not None else (1. if getattr(args,'identity_readout_unified_span_reader',False) else 0.)),
+        grounded_qa_full_context=getattr(args,'grounded_qa_full_context',False) or getattr(args,'identity_readout_unified_span_reader',False),
         identity_readout_source_boundary_adapter=getattr(args, "identity_readout_source_boundary_adapter", False),
         identity_readout_context_units=getattr(args, "identity_readout_context_units", 2),
         identity_readout_query_units=getattr(args, "identity_readout_query_units", 4),
@@ -1520,6 +1528,7 @@ def main(argv: List[str] | None = None) -> int:
             val_fraction=args.val_fraction,
             seed=args.seed,
             streaming=getattr(args, "dataset_streaming", True),
+            preserve_grounded_qa_context=getattr(runtime_cfg,"grounded_qa_full_context",False),
             hierarchy_vector_dtype=getattr(runtime_cfg, "hierarchy_vector_dtype", "float8_e4m3fn"),
         )
         metrics = train_model(

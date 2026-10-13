@@ -11270,6 +11270,17 @@ class PrismalWaveModel(nn.Module):
         )
         output.route_stats["token_superposition_bag_size"] = torch.tensor(float(superposition_bag_size), device=output.logits.device)
         output.route_stats["token_superposition_bag_count"] = torch.tensor(float(output.logits.size(1)), device=output.logits.device)
+        qa_weight=float(getattr(self.cfg,'grounded_qa_span_loss_weight',0.))
+        if qa_weight:
+            if self._prismal_tokenizer is None or self.bounded_identity_readout is None:
+                raise ValueError('Grounded QA supervision requires the configured tokenizer and identity reader.')
+            qa_loss,qa_stats=self.bounded_identity_readout.complete_answer_span.supervised_qa_loss(
+                input_ids,self._prismal_tokenizer,self.shared_signature_bank,self.construction_embedding,
+                self.bounded_identity_readout.input_state_from_tokens)
+            output.aux_loss=output.aux_loss+qa_weight*qa_loss
+            output.route_stats.update(qa_stats)
+            output.route_stats['aux_grounded_qa_span_term']=qa_weight*qa_loss.detach()
+            if 'aux_loss_total' in output.route_stats:output.route_stats['aux_loss_total']=output.aux_loss.detach()
         loss = ce + output.aux_loss
         output.ce_loss = ce.detach()
         # Registry birth/activity statistics are training observations, not a

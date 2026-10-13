@@ -234,7 +234,7 @@ class StructurePreservingReadoutTests(BoundedIdentityReadoutTests):
         mixed=head.mix_probabilities(logits,copy,torch.tensor(12.)).softmax(-1)
         torch.testing.assert_close(mixed[~head.lexical_mask],base[~head.lexical_mask],rtol=1e-5,atol=1e-7)
         torch.testing.assert_close(mixed[head.lexical_mask].sum(),base[head.lexical_mask].sum(),rtol=1e-5,atol=1e-7)
-        self.assertAlmostEqual(float(mixed.sum()),1.,places=6)
+        torch.testing.assert_close(mixed.sum(),mixed.new_tensor(1.),atol=1e-6,rtol=0.)
         cap=t.special_tokens['<CAP>']
         (-mixed[cap].log()).backward()
         self.assertGreater(float(logits.grad.abs().sum()),0.)

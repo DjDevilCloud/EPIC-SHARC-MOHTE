@@ -817,3 +817,105 @@ It is not a general entity parser, arbitrary discourse memory, or proof of unsee
 relation grammar. Answer payloads themselves must still remain in the source
 cache. Controlled checkpoints and raw-generation results are kept under
 `review_artifacts/causal_owner_varied_20261011`; earlier defaults are unchanged.
+
+
+### Grounded-QA training contract and unified-reader experiments (2026-10-12)
+
+The corrected DiverseQA adapter splits all trailing QA pairs against their source
+document. Full-context grounded training is opt-in through
+`grounded_qa_full_context`; Context/Question records remain atomic and can exceed
+`seq_len`. Sibling questions share a document-level split. Existing truncated
+pretokenized caches are rejected in this mode. Generic document continuation
+keeps its existing window policy.
+
+`identity_readout_unified_span_reader` defaults off. Its versioned experimental
+paths share source/question word representations and complete-span scoring,
+without a learned question-family applicability whitelist. Compact candidates
+retain source surfaces and markers and tokenize only the selected answer. The
+separately verified name planner remains during migration. The semantic variant
+adds one 512-slot component bank and an ordered unit encoder, not one row per
+observed word/profile. All new candidates currently fail broader acceptance.
+
+`grounded_qa_span_loss_weight` defaults to zero in serialized configurations.
+A positive value requires the unified reader and full-context QA. The ordinary
+`compute_loss` now backpropagates an explicit span objective independently of
+inference readiness, exposing start/endpoint losses and frame/coverage counts.
+Token CE alone cannot train a discrete proposal's selection/confidence graph.
+CLI creation of a new unified reader selects full-context QA and weight 1 unless
+an explicit loss weight is supplied. This does not itself establish QA readiness.
+
+An audit of 79 native records found 63 empty source caches at the old 512-token
+window policy; full-context mode repairs all 79 frames. Local CPU packet/scorer
+cost is approximately halved with the compact shared path. Broader question
+semantics remain unresolved; retained checkpoints and rejection details are in
+`review_artifacts/unified_reader_reset_20261011/REPORT.md`.
+
+The subsequent normal-trainer acceptance run is recorded in
+`review_artifacts/normal_qa_acceptance_20261012/REPORT.md`. Both seeds use the
+accepted backbone with only the new shared reader trainable. All 87 full-context
+QA targets are covered and all observed training frames are complete. This
+adapter trial remains underfit after 200 updates: final fresh extractive raw QA
+is 0/16 in both seeds. The experimental candidates are rejected; the accepted
+checkpoints remain the reference. Training-path correctness does not establish
+question/relation learning or broader QA readiness.
+
+The follow-up 1,600-update study and matched controls are documented in
+`review_artifacts/normal_qa_learning_20261012/REPORT.md`. The optional
+`semantic_context_v5` reader adds one zero-initialized scalar for an ordered
+document-context pass through the existing shared GRU. Its before-start and
+after-end states exclude candidate values while retaining surrounding clauses
+and table rows. This removes 17 indistinguishable candidate pairs in five native
+records per seed, without adding profile rows. It does not improve raw new QA
+over equal-budget controls at this stage (4/24 and 3/24).
+
+Generic-reader confidence cannot override a complete, calibrated causal-owner
+plan. Precedence requires the retained task, owner, kind and endpoint checks;
+uncertain legacy plans still permit generic proposals. This restores ownership
+6/72 to 72/72 and eviction 12/24 to 24/24 using identical weights. Both seeds
+retain all 399 reference checks after the repair. Reliable new native-answer
+learning remains incomplete, and the experimental reader is not promoted.
+
+The requested-role/extent study is documented in
+`review_artifacts/normal_qa_learning_20261012/REQUESTED_ROLE_AND_EXTENT_REPORT.md`.
+Opt-in `requested_roles_v6` adds explicit reusable property supervision and a
+zero-gated compatibility term, with predicted properties carried in the answer
+plan. Source case controls are preserved when computing continuation facts.
+Both seeds retain 399/399 checks, but raw new training answers reach only 8/24,
+identical to the matched controls. The role head mostly learns common answer
+properties. Frozen diagnostic fitting shows a nonlinear decoder can recover
+substantially more role information than the current linear decoder; this is
+training-only evidence, not broad QA readiness. The candidates remain rejected.
+
+The nonlinear decoder and frozen-head warm-up comparison is recorded in
+`review_artifacts/normal_qa_learning_20261012/NONLINEAR_ROLE_REPORT.md`.
+Opt-in `nonlinear_roles_v7` adds a zero-output residual tanh decoder to the
+existing question-property head. Matched normal fits reach 16/24 new raw answers
+in both versions and both seeds. Dedicated cached-head fitting, with encoder
+state frozen and exact logit parity verified, reaches 21/24 in both nonlinear
+seeds versus 18/24 and 19/24 for linear controls. All numeric training targets
+are recognized after warm-up; raw improvements come from higher confidence on
+correct source proposals. Source selection and low-confidence fallback remain
+incomplete, broader QA is untested, and candidates are not promoted.
+
+The source-selection and confidence repair is documented in
+`review_artifacts/normal_qa_learning_20261012/SOURCE_SELECTION_AND_CONFIDENCE_REPAIR.md`.
+An education maximum-percentage label incorrectly chose the highest absolute
+count; the controlled manifest now uses the source-supported percentage winner.
+The existing source/endpoint scorer and mixing gain are fitted against the warmed
+property predictions, using the same full-span objective with frozen feature
+producers. `score_candidates` shares the ordinary scoring path and has exact
+score/gradient parity coverage. Difficult-example replay and replay of original
+QA-tail input forms address residual underfitting and a retained-input regression.
+The tokenizer, 0.9 inference threshold, legacy routers and shared banks are
+retained. Final scoped acceptance is in
+`joint_span_recalibration_retained/CONTROLLED_ACCEPTANCE.json`; broader transfer
+is still unestablished.
+
+The native variation study in
+`review_artifacts/native_variation_transfer_20261012/REPORT.md` retains 87/87
+training answers and 399/399 old checks in both seeds. Deliberate answer-form and
+question variation raises raw partial-transfer results from 14/53 to 43/53 and
+24/53 to 44/53. Reordered-source results improve from 1/24 to 16/24 and 3/24 to
+19/24. Real-document held-out QA remains 0/16 in both candidates. The frozen
+request representation still entangles entity identity, relation and physical
+answer properties; candidates remain experimental and scaling is unestablished.

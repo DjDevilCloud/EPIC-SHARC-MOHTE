@@ -924,15 +924,43 @@ def _iter_jsonl_texts(path: Path) -> Iterator[str]:
                 yield _normalize_role_marked_text(payload.strip())
 
 
+def parse_diverse_qa_record(text: str) -> tuple[str, list[tuple[str, str]]] | None:
+    """Split a DiverseQA document and all trailing QA pairs without label leakage.
+
+    Every block must be complete. Ambiguous/incomplete rows retain their original
+    text rather than silently dropping a question or treating it as an answer.
+    """
+    headers = list(re.finditer(r"(?:^|\n)[ \t]*Question:[ \t]*", text))
+    if not headers:
+        return None
+    pairs = []
+    for index, header in enumerate(headers):
+        stop = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        block = text[header.end():stop]
+        answer_marker = re.search(r"(?:^|\n)[ \t]*Answer:[ \t]*", block)
+        if answer_marker is None:
+            return None
+        question = block[:answer_marker.start()].strip()
+        answer = block[answer_marker.end():].strip()
+        if not question or not answer:
+            return None
+        pairs.append((question, answer))
+    return text[:headers[0].start()].strip(), pairs
+
+
+def _normalize_diverse_qa_records(text: str) -> list[str]:
+    parsed = parse_diverse_qa_record(text)
+    if parsed is None:
+        return [_normalize_role_marked_text(text)]
+    context, pairs = parsed
+    prefix = f"Context:\n{context}\n" if context else ""
+    return [f"<BOI>{prefix}Question:\n{question}<EOI><BOO>{answer}<EOO>"
+            for question, answer in pairs]
+
+
 def _normalize_diverse_qa_record(text: str) -> str:
-    """Adapt the known DiverseQA document + trailing Question/Answer format."""
-    match = re.search(r"(?:^|\n)Question:\s*(.*?)\nAnswer:\s*(.*)\Z", text, re.DOTALL)
-    if match is None or not match.group(1).strip() or not match.group(2).strip():
-        return _normalize_role_marked_text(text)
-    context = text[:match.start()].strip()
-    question, answer = (value.strip() for value in match.groups())
-    prompt = (f"Context:\n{context}\n" if context else "") + f"Question:\n{question}"
-    return f"<BOI>{prompt}<EOI><BOO>{answer}<EOO>"
+    """Compatibility string wrapper; corpus iteration emits separate QA records."""
+    return "\n".join(_normalize_diverse_qa_records(text))
 
 
 def _iter_parquet_texts(path: Path) -> Iterator[str]:
@@ -972,7 +1000,10 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
                     for value in batch.column(0).to_pylist():
                         merged = _clean_record_value(value)
                         if merged:
-                            yield _normalize_diverse_qa_record(merged) if diverse_qa else _normalize_role_marked_text(merged)
+                            if diverse_qa:
+                                yield from _normalize_diverse_qa_records(merged)
+                            else:
+                                yield _normalize_role_marked_text(merged)
                 return
 
             for batch in parquet_file.iter_batches(columns=available_columns):
@@ -1006,7 +1037,10 @@ def _iter_parquet_texts(path: Path) -> Iterator[str]:
         for value in df[available_columns[0]].tolist():
             merged = _clean_record_value(value)
             if merged:
-                yield _normalize_diverse_qa_record(merged) if diverse_qa else _normalize_role_marked_text(merged)
+                if diverse_qa:
+                    yield from _normalize_diverse_qa_records(merged)
+                else:
+                    yield _normalize_role_marked_text(merged)
         return
 
     # `itertuples()` keeps the scan much lighter while preserving the same payload shape.
@@ -3521,6 +3555,7 @@ class WindowSample:
     signature_family_ids: torch.Tensor
     hierarchy_vectors: torch.Tensor
     loss_mask: torch.Tensor
+    source_group: str | None = None
 
     def __post_init__(self) -> None:
         seq_lengths = {
@@ -3723,6 +3758,16 @@ def _structure_boundary_starts(encoded: Sequence[int], tokenizer: PrismalTokeniz
     return starts
 
 
+def _grounded_qa_source_group(text: str) -> str | None:
+    """Group sibling questions by the observed document, never by their answers."""
+    if not text.startswith('<BOI>') or '<EOI>' not in text:return None
+    prefix=text[:text.index('<EOI>')]
+    match=re.match(r"<BOI>\s*Context:\s*(.*)\nQuestion:\s*.+\Z",prefix,re.DOTALL|re.IGNORECASE)
+    if match is None:return None
+    canonical=' '.join(match.group(1).split()).casefold()
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
 def _build_window_samples_from_text(
     tokenizer: PrismalTokenizer,
     merged: str,
@@ -3731,6 +3776,7 @@ def _build_window_samples_from_text(
     max_samples: int = 0,
     window_stride: int = 0,
     include_structure_starts: bool = True,
+    preserve_grounded_qa_context: bool = False,
     hierarchy_vector_dtype: object = "float8_e4m3fn",
     low_rank_enabled: Optional[bool] = None,
     low_rank_dim: Optional[int] = None,
@@ -3739,6 +3785,7 @@ def _build_window_samples_from_text(
     low_rank_enabled = bool(getattr(tokenizer, "hierarchy_vector_low_rank_enabled", True)) if low_rank_enabled is None else bool(low_rank_enabled)
     low_rank_dim = int(getattr(tokenizer, "hierarchy_vector_low_rank_dim", DEFAULT_HIERARCHY_VECTOR_LOW_RANK_DIM)) if low_rank_dim is None else int(low_rank_dim)
     samples: List[WindowSample] = []
+    source_group=_grounded_qa_source_group(merged)
     seq_len = max(0, int(seq_len))
     encoded, encoded_signatures, encoded_levels, encoded_relations, encoded_parents, encoded_families = tokenizer.encode_hierarchy(
         merged,
@@ -3868,9 +3915,16 @@ def _build_window_samples_from_text(
                 signature_family_ids=torch.tensor(family_ids[:-1], dtype=torch.long),
                 hierarchy_vectors=window_hierarchy[:-1],
                 loss_mask=torch.tensor(loss_mask[1:], dtype=torch.float32),
+                source_group=source_group,
             )
         )
         return True
+
+    if preserve_grounded_qa_context and source_group is not None:
+        # Grounded QA is atomic: discarding the input frame disables the source
+        # cache, and clipping its answer changes the supervised task.
+        append_window(0,len(encoded))
+        return samples
 
     boundary_starts = _structure_boundary_starts(encoded, tokenizer)
     if seq_len <= 0:
@@ -3938,7 +3992,9 @@ class TextWindowDataset(Dataset):
         max_samples: int = 0,
         sample_seed: int | None = None,
         hierarchy_vector_dtype: object = "float8_e4m3fn",
+        preserve_grounded_qa_context: bool = False,
     ) -> None:
+        self.preserve_grounded_qa_context=bool(preserve_grounded_qa_context)
         self.tokenizer = tokenizer
         self.seq_len = max(0, int(seq_len))
         self.hierarchy_vector_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
@@ -3965,6 +4021,7 @@ class TextWindowDataset(Dataset):
                 seq_len=self.seq_len,
                 max_samples=max(0, int(max_samples) - len(self.samples)) if max_samples else 0,
                 hierarchy_vector_dtype=self.hierarchy_vector_dtype,
+                preserve_grounded_qa_context=self.preserve_grounded_qa_context,
             )
             self.samples.extend(windows)
             if max_samples and len(self.samples) >= max_samples:
@@ -4004,8 +4061,10 @@ class StreamingTextCorpusDataset(IterableDataset):
         window_stride: int = 0,
         include_structure_starts: bool = True,
         hierarchy_vector_dtype: object = "float8_e4m3fn",
+        preserve_grounded_qa_context: bool = False,
     ) -> None:
         self.source = Path(source)
+        self.preserve_grounded_qa_context=bool(preserve_grounded_qa_context)
         self.tokenizer = tokenizer
         self.seq_len = max(0, int(seq_len))
         self.window_stride = max(0, int(window_stride))
@@ -4025,7 +4084,7 @@ class StreamingTextCorpusDataset(IterableDataset):
             int(shuffle_buffer_size) if shuffle_buffer_size is not None else min(max(self.max_samples, 1), 64) if self.max_samples else 1024,
         )
 
-    def _include_record(self, record_index: int) -> bool:
+    def _include_record(self, record_index: int, text: str | None = None) -> bool:
         if self.split == "all":
             return True
         if self.split not in {"train", "val"}:
@@ -4035,7 +4094,8 @@ class StreamingTextCorpusDataset(IterableDataset):
             return self.split != "val"
         if fraction >= 1.0:
             return self.split == "val"
-        key = f"{self.seed}:{record_index}".encode("utf-8")
+        group=_grounded_qa_source_group(text) if text is not None else None
+        key = f"{self.seed}:{group if group is not None else record_index}".encode("utf-8")
         digest = hashlib.blake2b(key, digest_size=8).digest()
         bucket = int.from_bytes(digest, "big") / float(1 << 64)
         if self.split == "val":
@@ -4054,9 +4114,11 @@ class StreamingTextCorpusDataset(IterableDataset):
             window_stride=self.window_stride,
             include_structure_starts=self.include_structure_starts,
             hierarchy_vector_dtype=self.hierarchy_vector_dtype,
+            preserve_grounded_qa_context=self.preserve_grounded_qa_context,
         )
 
     def __iter__(self) -> Iterator[WindowSample]:
+        saw_grounded=False
         if self.max_samples > 0:
             rng = random.Random(self.sample_seed)
             buffer: List[WindowSample] = []
@@ -4068,9 +4130,10 @@ class StreamingTextCorpusDataset(IterableDataset):
                     yield buffer.pop(index)
 
             def _ingest_records(include_filter: bool) -> None:
-                nonlocal yielded
+                nonlocal yielded,saw_grounded
                 for record_index, text in enumerate(iter_text_corpus(self.source)):
-                    if include_filter and not self._include_record(record_index):
+                    saw_grounded=saw_grounded or _grounded_qa_source_group(text) is not None
+                    if include_filter and not self._include_record(record_index,text):
                         continue
                     for sample in self._windows_for_line(text):
                         buffer.append(sample)
@@ -4085,7 +4148,7 @@ class StreamingTextCorpusDataset(IterableDataset):
 
             for sample in _ingest_records(include_filter=True):
                 yield sample
-            if yielded == 0 and self.split == "train":
+            if yielded == 0 and not buffer and self.split == "train" and not self.preserve_grounded_qa_context and not saw_grounded:
                 buffer.clear()
                 yielded = 0
                 for sample in _ingest_records(include_filter=False):
@@ -4100,13 +4163,14 @@ class StreamingTextCorpusDataset(IterableDataset):
 
         yielded = 0
         for record_index, text in enumerate(iter_text_corpus(self.source)):
-            if not self._include_record(record_index):
+            saw_grounded=saw_grounded or _grounded_qa_source_group(text) is not None
+            if not self._include_record(record_index,text):
                 continue
             windows = self._windows_for_line(text)
             for sample in windows:
                 yield sample
                 yielded += 1
-        if yielded == 0 and self.split == "train":
+        if yielded == 0 and self.split == "train" and not self.preserve_grounded_qa_context and not saw_grounded:
             for text in iter_text_corpus(self.source):
                 windows = self._windows_for_line(text)
                 for sample in windows:
@@ -4438,6 +4502,14 @@ def split_text_window_dataset(
     total = len(dataset)
     if total < 2:
         raise ValueError("Dataset must contain at least 2 samples for a validation split.")
+    if any(sample.source_group is not None for sample in dataset.samples):
+        groups={}
+        for index,sample in enumerate(dataset.samples):groups.setdefault(sample.source_group or ('sample:'+str(index)),[]).append(index)
+        if len(groups)<2:raise ValueError('Grounded QA validation requires at least two distinct source documents.')
+        keys=sorted(groups);random.Random(seed).shuffle(keys)
+        count=max(1,min(len(keys)-1,int(round(len(keys)*val_fraction))))
+        held=set(keys[:count]);train=[i for k,v in groups.items() if k not in held for i in v];val=[i for k,v in groups.items() if k in held for i in v]
+        return torch.utils.data.Subset(dataset,train),torch.utils.data.Subset(dataset,val)
     val_size = max(1, int(round(total * val_fraction)))
     train_size = max(1, total - val_size)
     if train_size + val_size > total:

@@ -964,6 +964,7 @@ def build_train_val_dataloaders(
     streaming: bool = True,
     window_stride: int = 0,
     include_structure_starts: bool = True,
+    preserve_grounded_qa_context: bool = False,
     hierarchy_vector_dtype: object = "float8_e4m3fn",
 ) -> tuple[DataLoader, DataLoader]:
     hierarchy_dtype = hierarchy_vector_torch_dtype(hierarchy_vector_dtype)
@@ -972,6 +973,7 @@ def build_train_val_dataloaders(
         source = Path(texts_or_source)
         pretokenized_root = _find_pretokenized_root(source)
         if pretokenized_root is not None:
+            if preserve_grounded_qa_context:raise ValueError('Full-context grounded QA requires raw source documents; existing window caches do not retain document split metadata.')
             train_dataset = MemmapTokenDataset(
                 pretokenized_root,
                 split="train",
@@ -1011,6 +1013,7 @@ def build_train_val_dataloaders(
                 seq_len=seq_len,
                 max_samples=max_samples,
                 hierarchy_vector_dtype=hierarchy_dtype,
+                preserve_grounded_qa_context=preserve_grounded_qa_context,
             )
             train_dataset, val_dataset = split_text_window_dataset(dataset, val_fraction=val_fraction, seed=seed)
             train_loader = DataLoader(
@@ -1039,6 +1042,7 @@ def build_train_val_dataloaders(
             window_stride=window_stride,
             include_structure_starts=include_structure_starts,
             hierarchy_vector_dtype=hierarchy_dtype,
+            preserve_grounded_qa_context=preserve_grounded_qa_context,
         )
         val_dataset = StreamingTextCorpusDataset(
             source,
@@ -1051,6 +1055,7 @@ def build_train_val_dataloaders(
             window_stride=window_stride,
             include_structure_starts=include_structure_starts,
             hierarchy_vector_dtype=hierarchy_dtype,
+            preserve_grounded_qa_context=preserve_grounded_qa_context,
         )
         train_loader = DataLoader(
             train_dataset,
@@ -1075,6 +1080,7 @@ def build_train_val_dataloaders(
         seq_len=seq_len,
         max_samples=max_samples,
         hierarchy_vector_dtype=hierarchy_dtype,
+        preserve_grounded_qa_context=preserve_grounded_qa_context,
     )
     train_dataset, val_dataset = split_text_window_dataset(dataset, val_fraction=val_fraction, seed=seed)
     train_loader = DataLoader(
@@ -1519,6 +1525,7 @@ AUX_BREAKDOWN_KEYS: tuple[str, ...] = (
     "aux_recursive_term",
     "aux_diversity_term",
     "aux_learned_residency_term",
+    "aux_grounded_qa_span_term",
     "aux_loss_total",
 )
 
@@ -1547,7 +1554,7 @@ def _train_step_host_metrics(
 ) -> Dict[str, float]:
     """Read the scalar values needed by the Python trainer with one CUDA sync."""
     keys = ("loss", "ce_loss", "aux_loss", "signature_agreement", "avg_entropy",
-            "stability_nonfinite_repair_count", *AUX_BREAKDOWN_KEYS)
+            "stability_nonfinite_repair_count", "grounded_qa_records", "grounded_qa_uncovered", "grounded_qa_missing_frames", *AUX_BREAKDOWN_KEYS)
     device = loss.device
     values = [loss.detach().float().mean(), ce_loss.detach().float().mean(), aux_loss.detach().float().mean()]
     for key in keys[3:-len(AUX_BREAKDOWN_KEYS)]:
@@ -2269,7 +2276,7 @@ def train_model(
                 f"and current optimizer={optimizer_name_norm}",
                 flush=True,
             )
-    if isinstance(resume_state, dict) and scaler_enabled:
+    if isinstance(resume_state, dict) and _current_scaler_enabled():
         resume_scaler_state = resume_state.get("scaler_state")
         if isinstance(resume_scaler_state, dict):
             try:
@@ -2419,9 +2426,10 @@ def train_model(
     optimizer.zero_grad(set_to_none=True)
     accumulation_step = 0
     optimizer_step = 0
+    pending_qa_supervision=False
 
     def _finish_optimizer_step() -> tuple[bool, int]:
-        nonlocal accumulation_step, optimizer_step
+        nonlocal accumulation_step, optimizer_step, pending_qa_supervision
         nonlocal stability_skipped_optimizer_steps, stability_nonfinite_grad_batches
         nonlocal stability_clipped_groups, stability_clipped_steps
         nonlocal last_stability_text
@@ -2459,6 +2467,12 @@ def train_model(
             scheduler.step()
         if should_step_scheduler:
             optimizer_step += 1
+            if pending_qa_supervision:
+                head=getattr(runtime_model,'bounded_identity_readout',None)
+                if head is not None and hasattr(head.complete_answer_span,'unified_reader'):
+                    head.complete_answer_span.ready.fill_(True)
+                    head.complete_answer_span.unified_reader.ready.fill_(True)
+        pending_qa_supervision=False
         optimizer.zero_grad(set_to_none=True)
         accumulation_step = 0
         return should_step_scheduler, clipped_groups
@@ -2539,7 +2553,7 @@ def train_model(
     ) -> None:
         nonlocal step
         nonlocal accumulation_step
-        nonlocal optimizer_step
+        nonlocal optimizer_step, pending_qa_supervision
         nonlocal last_stability_text
         nonlocal stability_nonfinite_loss_batches, stability_nonfinite_grad_batches
         nonlocal stability_skipped_optimizer_steps, stability_repaired_tensors
@@ -2705,6 +2719,7 @@ def train_model(
                 }
             )
             torch.cuda.reset_peak_memory_stats(device)
+        pending_qa_supervision=pending_qa_supervision or host_metrics['grounded_qa_records']>host_metrics['grounded_qa_uncovered']
         accumulation_step += 1
         should_step_scheduler = False
         clipped_groups = 0

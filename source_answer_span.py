@@ -2,7 +2,7 @@
 """Input-only, compositional complete answer spans with learned start/extent.
 
 Occurrence addresses are request-local indexes, never embedding features. Gold
-answers are used by the external trainer to label candidates, not by propose().
+answers label candidates in the training loss, never in propose().
 """
 from dataclasses import dataclass
 import hashlib
@@ -24,6 +24,7 @@ class AnswerSpanPlan:
     answer_kind: str = ''
     kind_confidence: float = 0.
     source_owned_person: bool = False
+    requested_properties: tuple = ()
 
     @property
     def next_token(self):
@@ -57,8 +58,11 @@ class OrderedQuestionScope(nn.Module):
 
 class CompleteAnswerSpanPredictor(nn.Module):
     """Small shared request/start/endpoint heads; no observed-profile vocabulary."""
-    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False,typed_extent_eligibility=False,kind_threshold=.9,owner_context=False,general_context=False,general_endpoint=False,general_roles=False,general_name_plan=False,general_query_attention=False,general_relation_attention=False,relation_eligibility=False,endpoint_properties=False,endpoint_task_router=False,causal_owners=False):
+    def __init__(self, width, kinds=9, max_words=16,feature_version='surface_v1',task_router=False,word_encoder='unit_mean_v1',kind_labels=None,kind_conditioned_endpoints=False,typed_extent_eligibility=False,kind_threshold=.9,owner_context=False,general_context=False,general_endpoint=False,general_roles=False,general_name_plan=False,general_query_attention=False,general_relation_attention=False,relation_eligibility=False,endpoint_properties=False,endpoint_task_router=False,causal_owners=False,unified_reader=False,unified_reader_version='aligned_v1'):
         super().__init__()
+        if unified_reader:
+            from unified_span_reader import create_unified_reader
+            self.unified_reader=create_unified_reader(width,unified_reader_version)
         self.max_words=max_words
         self.feature_version=feature_version
         self.word_encoder=word_encoder
@@ -162,7 +166,7 @@ class CompleteAnswerSpanPredictor(nn.Module):
         ids=torch.tensor([[address(salt+'answer_span:'+key) for salt in ('a:','b:')] for key in keys],device=bank.embedding.weight.device)
         return bank.embedding(ids).mean((0,1))
 
-    def packet(self,state,tokenizer,bank,lexical_embeddings):
+    def packet(self,state,tokenizer,bank,lexical_embeddings,compact=False):
         """Bounded candidates from input surface only, including unseen words."""
         if not state.source_surface or not state.source_positions or state.words is None:return None
         device=bank.embedding.weight.device;d=bank.embedding.embedding_dim
@@ -180,6 +184,13 @@ class CompleteAnswerSpanPredictor(nn.Module):
                 self._payload_cache[text]=self.payload(tokenizer,text)
             return self._payload_cache[text]
         raw=dict(state.source_surface);eligible=state.words.source_candidate_mask(state.entries)
+        compact_query=None
+        if compact:
+            fields=self.grounded_fields(state,tokenizer)
+            if fields is None:return None
+            question_label,labels=fields
+            compact_query=[ids for serial,_,ids in state.words.records if serial>question_label]
+            eligible=[entry[3]<question_label and labels.get(entry[3])!='context' for entry in state.entries]
         groups={}
         for i,(entry,position,allowed) in enumerate(zip(state.entries,state.source_positions,eligible)):
             if allowed and position in raw:groups.setdefault(entry[3],[]).append((i,position,entry[0]))
@@ -188,16 +199,23 @@ class CompleteAnswerSpanPredictor(nn.Module):
         groups=[group for serial,group in groups.items()
                 if tuple(item[2] for item in group)==complete_words.get(serial)]
         if not groups:return None
+        word_cache={}
         def word(ids):
+            key=tuple(ids)
+            if key in word_cache:return word_cache[key]
             if self.word_encoder=='shared_word_v2':
                 from signature_bank import compose_word_identity
-                return compose_word_identity(ids,tokenizer,bank,lexical_embeddings)
-            ids=torch.tensor(ids,device=device)
-            return F.layer_norm((lexical_embeddings(ids)+bank.encode('token',ids)).mean(0)/math.sqrt(2.),(d,))
+                value=compose_word_identity(ids,tokenizer,bank,lexical_embeddings)
+            else:
+                indices=torch.tensor(ids,device=device)
+                value=F.layer_norm((lexical_embeddings(indices)+bank.encode('token',indices)).mean(0)/math.sqrt(2.),(d,))
+            word_cache[key]=value
+            return value
         vectors=torch.stack([word([item[2] for item in group]) for group in groups])
-        if hasattr(self,'causal_owner_match'):
+        if hasattr(self,'causal_owner_match') or hasattr(self,'unified_reader'):
             clauses={serial:clause for serial,clause,_ in state.words.records}
-            summaries={};owner_contexts=[];owner_properties=[];owner_available=[]
+            summaries={};owner_contexts=[];owner_properties=[];owner_available=[];owner_evicted=[]
+            earliest=state.words.records[0][0]
             for group in groups:
                 serial=state.entries[group[0][0]][3];clause=clauses[serial]
                 prefix=tuple((s,ids) for s,ids in state.words.anchors.get(clause,()) if s<serial)
@@ -214,10 +232,11 @@ class CompleteAnswerSpanPredictor(nn.Module):
                     summaries[key]=(context,owner_props,available)
                 context,owner_props,available=summaries[key]
                 owner_contexts.append(context);owner_properties.append(owner_props);owner_available.append(available)
-        query=state.words.question()
+                owner_evicted.append(bool(prefix) and prefix[-1][0]<earliest and available)
+        query=compact_query if compact else state.words.question()
         if not query:return None
         question=torch.stack([word(ids) for ids in query])
-        name_enabled=self.general_name_plan and bool(self.general_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99) and bool(self.general_name_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99)
+        name_enabled=not compact and self.general_name_plan and bool(self.general_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99) and bool(self.general_name_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99)
         zero=vectors.new_zeros(d)
         def neighbor(i):return vectors[i] if 0<=i<len(groups) else zero
         def unit(pos):return tokenizer.construction_units[raw[pos]] if pos in raw else None
@@ -295,7 +314,7 @@ class CompleteAnswerSpanPredictor(nn.Module):
                                 following=unit(last+1)
                                 keys+=['word_type='+category(groups[j]),'next_marker='+(following.text if following is not None else 'unobserved'),
                                        'numeric_continuation='+str(numeric_join(last+1))]
-                            end_features.append(torch.cat([neighbor(i),neighbor(j),vectors[i:j+1].mean(0),neighbor(j+1),props(keys)]))
+                            end_features.append(props(keys) if compact else torch.cat([neighbor(i),neighbor(j),vectors[i:j+1].mean(0),neighbor(j+1),props(keys)]))
                             if case_chains:
                                 general_endpoint_roles.append(props(keys+['start_'+key for key in case_keys(i)]+['end_'+key for key in case_keys(j)]))
                             if name_enabled:
@@ -316,21 +335,24 @@ class CompleteAnswerSpanPredictor(nn.Module):
                                 sequence=torch.cat((before_words,marker[None],after_words))
                                 window=vectors.new_zeros(17,d);window[:len(sequence)]=sequence
                                 name_contexts.append(window);name_lengths.append(len(sequence))
-                            ends.append((i,j,begin,finish));tokens.append(payload(text));surfaces.append(text)
+                            ends.append((i,j,begin,finish));
+                            if not compact:tokens.append(payload(text))
+                            surfaces.append(text)
         if not ends:return None
         result=dict(question=question,start_features=torch.stack(start_features),end_features=torch.stack(end_features),
                     starts=starts,ends=ends,tokens=tokens,surfaces=surfaces)
-        if hasattr(self,'causal_owner_match'):
+        if hasattr(self,'causal_owner_match') or hasattr(self,'unified_reader'):
             result['causal_owner_contexts']=torch.stack(owner_contexts)
             result['causal_owner_properties']=torch.stack(owner_properties)
             result['causal_owner_available']=torch.tensor(owner_available,device=device,dtype=torch.bool)
+            result['causal_owner_evicted']=torch.tensor(owner_evicted,device=device,dtype=torch.bool)
         if self.general_relation_attention:
             result['relation_source']=vectors
             result['relation_scopes']=torch.tensor(scope_starts,device=device)
-        if self.owner_context:
+        if self.owner_context and not compact:
             result['owner_prefixes']=torch.stack(owner_prefixes)
             result['owner_lengths']=torch.tensor(owner_lengths,device=device,dtype=torch.long)
-        if self.general_context:
+        if self.general_context and not compact:
             observed=[];lengths=[];marker=props(['role=source_occurrence'])
             scope_ends=[len(groups)]*len(groups)
             for i in range(len(groups)-2,-1,-1):
@@ -351,6 +373,38 @@ class CompleteAnswerSpanPredictor(nn.Module):
                 result['name_lengths']=torch.tensor(name_lengths,device=device,dtype=torch.long)
                 result['name_eligibility']=torch.tensor(name_valid,device=device,dtype=torch.bool)
                 result['name_properties']=torch.stack(name_properties)
+        if compact:
+            result.pop('tokens')
+            result['source_words']=vectors
+            result['reader_endpoint_properties']=torch.stack(general_endpoint_roles) if case_chains else result['end_features'][:,-d:]
+            result['source_word_ids']=[tuple(item[2] for item in group) for group in groups]
+            result['reader_scope_start']=torch.tensor(scope_starts,device=device)
+            scope_ends=[len(groups)]*len(groups)
+            for i in range(len(groups)-2,-1,-1):scope_ends[i]=i+1 if scope_starts[i+1]!=scope_starts[i] else scope_ends[i+1]
+            result['reader_scope_end']=torch.tensor(scope_ends,device=device)
+            result['question_word_ids']=[tuple(ids) for ids in query]
+            if hasattr(self,'unified_reader') and self.unified_reader.version=='structural_owner_v9':
+                from unified_span_reader import query_word_properties
+                query_records=[(serial,ids) for serial,_,ids in state.words.records if serial>question_label]
+                last_positions={entry[3]:position for entry,position in zip(state.entries,state.source_positions)}
+                result['reader_query_properties']=query_word_properties(query_records,raw,last_positions,tokenizer).to(device)
+            if hasattr(self,'unified_reader') and self.unified_reader.version in {'requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+                from unified_span_reader import answer_span_facts
+                facts=[];word_text={};fact_cache={}
+                for text,(i,j,begin,finish) in zip(surfaces,ends):
+                    closed=j+1==len(groups) or scope_starts[j+1]!=scope_starts[j]
+                    if not closed and j+1 not in word_text:
+                        first_next=groups[j+1][0][1];begin_next=first_next
+                        while begin_next>0 and unit(begin_next-1) is not None and unit(begin_next-1).kind=='case':begin_next-=1
+                        word_text[j+1]=tokenizer.decode([raw[pos] for pos in range(begin_next,groups[j+1][-1][1]+1)],clean_text=False,collapse_structure=False)
+                    next_word=word_text.get(j+1,'') if not closed else ''
+                    capital=bool(next_word) and next_word[0].isupper()
+                    continuation=numeric_join(finish)
+                    key=(text,j-i+1,closed,capital,continuation)
+                    if key not in fact_cache:fact_cache[key]=answer_span_facts(text,j-i+1,scope_closed=closed,capital_continuation=capital,numeric_continuation=continuation)
+                    facts.append(fact_cache[key])
+                result['reader_answer_facts']=torch.tensor(facts,device=device,dtype=torch.float32)
+            return result
         if self.kind_conditioned_endpoints:
             result['kind_features']=torch.stack([props(['role=requested_extent','answer_kind='+kind]) for kind in self.kind_labels])
         if self.typed_extent_eligibility:
@@ -479,7 +533,7 @@ class CompleteAnswerSpanPredictor(nn.Module):
         joint=start.log_softmax(0)[owners]+end-normalizer[owners] if bool(eligible_starts.any()) else torch.full_like(end,-torch.inf)
         applicability=self.task_router(self.task_features(packet['question'])).squeeze(-1) if hasattr(self,'task_router') else self.applicability(q).squeeze(-1)
         if general_active:applicability=torch.maximum(applicability,torch.logit(general_probability.clamp(1e-8,1.-1e-8)))
-        return dict(start=start,end=end,joint=joint,owners=owners,kind=kind,applicability=applicability,extent_confidence=extent_confidence,extent_supported=bool(eligible_starts.any()),source_owned_person=name_active)
+        return dict(start=start,end=end,joint=joint,owners=owners,kind=kind,applicability=applicability,extent_confidence=extent_confidence,extent_supported=bool(eligible_starts.any()),source_owned_person=name_active,causal_owner_verified=causal_confidence is not None)
 
     def causal_owner_scores(self,packet,request):
         context=packet['causal_owner_contexts'];query=request.expand_as(context)
@@ -574,11 +628,127 @@ class CompleteAnswerSpanPredictor(nn.Module):
         features[:len(question),:-1]=question;features[:len(question),-1]=1.
         return features
 
+    def supervised_qa_loss(self,input_ids,tokenizer,bank,lexical_embeddings,state_factory):
+        """Differentiate source selection/extent using full training-only answers.
+
+        Live proposals never use these targets. Incomplete QA frames are counted
+        so clipped windows cannot masquerade as valid grounded training.
+        """
+        from unified_span_reader import collate_reader_packets,reader_packet_from_span,semantic_components
+        zero=bank.embedding.weight.new_zeros(());items=[];records=missing=uncovered=0
+        boi=tokenizer.special_tokens['<BOI>'];eoi=tokenizer.special_tokens['<EOI>'];boo=tokenizer.special_tokens['<BOO>'];eoo=tokenizer.special_tokens['<EOO>']
+        for row in input_ids.detach().cpu().tolist():
+            if boo not in row:continue
+            output_begin=row.index(boo)
+            if boi not in row[:output_begin] or eoi not in row[:output_begin]:missing+=1;continue
+            if eoo not in row[output_begin+1:]:missing+=1;continue
+            output_end=row.index(eoo,output_begin+1)
+            state=state_factory(row[:output_begin],tokenizer)
+            if self.grounded_fields(state,tokenizer) is None:continue
+            records+=1
+            p=self.packet(state,tokenizer,bank,lexical_embeddings,compact=True)
+            if p is None:uncovered+=1;continue
+            answer=tokenizer.decode(row[output_begin+1:output_end],clean_text=False,collapse_structure=False).strip()
+            features=reader_packet_from_span(p,self.unified_reader.version)
+            gold=torch.tensor([text==answer for text in p['surfaces']],device=bank.embedding.weight.device)
+            if self.unified_reader.version in {'scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9'}:
+                gold=gold&(features['scope_start'][features['owners']]==features['scope_start'][features['finishes']])
+            if not bool(gold.any()):uncovered+=1;continue
+            features['gold']=gold
+            starts=torch.zeros(len(features['source']),device=gold.device,dtype=torch.bool);starts[features['owners'][gold]]=True;features['gold_start']=starts
+            if hasattr(self.unified_reader,'semantic_words'):
+                features['source_components']=[semantic_components(ids,tokenizer) for ids in p['source_word_ids']]
+                features['question_components']=[semantic_components(ids,tokenizer) for ids in p['question_word_ids']]
+            items.append(features)
+        stats={key:zero.new_tensor(value) for key,value in (('grounded_qa_records',records),('grounded_qa_missing_frames',missing),('grounded_qa_uncovered',uncovered))}
+        if not items:
+            stats.update(grounded_qa_start_loss=zero,grounded_qa_endpoint_loss=zero,grounded_qa_span_loss=zero)
+            return zero,stats
+        batch=collate_reader_packets(items,bank.embedding.weight.device);scored=self.unified_reader(batch)
+        joint=scored['joint'].masked_fill(~batch['gold'],-torch.inf).logsumexp(-1)
+        start=scored['start'].log_softmax(-1).masked_fill(~batch['gold_start'],-torch.inf).logsumexp(-1)
+        start_loss=-start.mean();end_loss=(start-joint).mean();loss=start_loss+end_loss
+        if 'requested_role_logits' in scored:
+            from unified_span_reader import ANSWER_ROLE_FACTS
+            weights=batch['gold'].float();target=(batch['answer_facts']*weights[:,:,None]).sum(1)/weights.sum(1)[:,None]
+            split=len(ANSWER_ROLE_FACTS)
+            role_loss=F.binary_cross_entropy_with_logits(scored['requested_role_logits'][:,:split],target[:,:split])
+            extent_loss=F.binary_cross_entropy_with_logits(scored['requested_role_logits'][:,split:],target[:,split:])
+            loss=loss+role_loss+extent_loss
+            stats.update(grounded_qa_requested_role_loss=role_loss.detach(),grounded_qa_requested_extent_loss=extent_loss.detach())
+        stats.update(grounded_qa_start_loss=start_loss.detach(),grounded_qa_endpoint_loss=end_loss.detach(),grounded_qa_span_loss=(start_loss+end_loss).detach(),grounded_qa_objective_loss=loss.detach())
+        return loss,stats
+
+    @staticmethod
+    def grounded_fields(state,tokenizer):
+        if state.words is None or not state.source_surface:return None
+        raw=dict(state.source_surface)
+        last_positions={entry[3]:position for entry,position in zip(state.entries,state.source_positions)}
+        labels={}
+        for serial,_,ids in state.words.records:
+            after=raw.get(last_positions.get(serial,-2)+1)
+            if after is not None and tokenizer.construction_units[after].render==':':
+                text=tokenizer.decode(list(ids),clean_text=False,collapse_structure=False).casefold()
+                if text in {'question','context'}:labels[serial]=text
+        questions=[serial for serial,text in labels.items() if text=='question']
+        if not questions:return None
+        label=max(questions)
+        if any(text=='context' and serial>label for serial,text in labels.items()):return None
+        if not any(serial<label and labels.get(serial)!='context' for serial,_,_ in state.words.records):return None
+        return label,labels
+
+    def unified_task_applicable(self,state,tokenizer):
+        return hasattr(self,'unified_reader') and bool(self.unified_reader.ready) and self.grounded_fields(state,tokenizer) is not None
+
+    def unified_proposal(self,state,tokenizer,bank,lexical_embeddings,threshold):
+        from unified_span_reader import collate_reader_packets,reader_packet_from_span
+        p=self.packet(state,tokenizer,bank,lexical_embeddings,compact=True)
+        if p is None:return None
+        features=reader_packet_from_span(p,self.unified_reader.version)
+        if hasattr(self.unified_reader,'semantic_words'):
+            from unified_span_reader import semantic_components
+            features['source_components']=[semantic_components(ids,tokenizer) for ids in p['source_word_ids']]
+            features['question_components']=[semantic_components(ids,tokenizer) for ids in p['question_word_ids']]
+        scored=self.unified_reader(collate_reader_packets([features],bank.embedding.weight.device))
+        probabilities=scored['joint'][0].exp();totals={}
+        for i,text in enumerate(p['surfaces']):totals[text]=totals.get(text,0.)+probabilities[i]
+        text=max(totals,key=lambda key:float(totals[key]));confidence=float(totals[text])
+        if confidence<threshold:return None
+        matches=[i for i,key in enumerate(p['surfaces']) if key==text];best=max(matches,key=lambda i:float(probabilities[i]))
+        owner,_,begin,endpoint=p['ends'][best]
+        requested=tuple(scored['requested_role_logits'][0].sigmoid().detach().cpu().tolist()) if 'requested_role_logits' in scored else ()
+        return AnswerSpanPlan(self.payload(tokenizer,text),begin,endpoint,confidence,lexical_start=p['starts'][owner],answer_kind='TEXT_SPAN',kind_confidence=1.,requested_properties=requested)
+
     def propose(self,state,tokenizer,bank,lexical_embeddings,threshold=.9):
         if not bool(self.ready):return None
-        packet=self.packet(state,tokenizer,bank,lexical_embeddings)
+        packet=scored=None
+        if self.unified_task_applicable(state,tokenizer):
+            # Preserve the separately verified complete-person planner during
+            # migration; the generic reader has no per-question-family router.
+            question=self.question_features(state.words.question(),bank,lexical_embeddings,tokenizer)
+            protected=self.general_name_plan and question is not None and bool(self.general_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99) and bool(self.general_name_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99)
+            if not protected and hasattr(self,'causal_owner_match') and question is not None:
+                # Learned task, owner, kind and endpoint checks jointly protect
+                # an already verified occurrence from generic-reader interference.
+                if bool(self.general_scope(self.task_features(question)).sigmoid().squeeze(-1)>=.99):
+                    request=self.general_request(question)
+                    if bool(self.endpoint_scope(request).sigmoid().squeeze(-1)>=.99):
+                        packet=self.packet(state,tokenizer,bank,lexical_embeddings)
+                        if packet is not None:
+                            scored=self.scores(packet)
+                            if scored['causal_owner_verified']:
+                                plan=self.plan_from_scores(packet,scored,threshold)
+                                if plan is not None:return plan
+            if not protected:
+                proposed=self.unified_proposal(state,tokenizer,bank,lexical_embeddings,threshold)
+                if proposed is not None:return proposed
+        if packet is None:packet=self.packet(state,tokenizer,bank,lexical_embeddings)
         if packet is None:return None
-        scored=self.scores(packet);prob=scored['joint'].exp()
+        if scored is None:scored=self.scores(packet)
+        return self.plan_from_scores(packet,scored,threshold)
+
+    def plan_from_scores(self,packet,scored,threshold=.9):
+        prob=scored['joint'].exp()
         if not scored['extent_supported']:return None
         # Equivalent occurrences/surface variants support the same answer.
         totals={}

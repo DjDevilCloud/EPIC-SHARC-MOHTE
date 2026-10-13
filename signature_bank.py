@@ -501,7 +501,7 @@ class BoundedIdentityReadout(nn.Module):
             self.register_buffer('surface_ids', torch.tensor(cfg.identity_readout_surface_ids, dtype=torch.long))
             if cfg.identity_readout_complete_answer_spans:
                 from source_answer_span import CompleteAnswerSpanPredictor
-                self.complete_answer_span=CompleteAnswerSpanPredictor(cfg.d_model,feature_version=cfg.identity_readout_answer_span_features,task_router=cfg.identity_readout_answer_span_task_router,word_encoder=cfg.identity_readout_answer_span_word_encoder,kind_labels=cfg.identity_readout_answer_span_kinds,kind_conditioned_endpoints=cfg.identity_readout_answer_span_kind_conditioned_endpoints,typed_extent_eligibility=cfg.identity_readout_answer_span_typed_extent_eligibility,kind_threshold=cfg.identity_readout_native_span_confidence,owner_context=cfg.identity_readout_answer_span_owner_context,general_context=cfg.identity_readout_answer_span_general_context,general_endpoint=cfg.identity_readout_answer_span_general_endpoint,general_roles=cfg.identity_readout_answer_span_general_roles,general_name_plan=cfg.identity_readout_answer_span_general_name_plan,general_query_attention=cfg.identity_readout_answer_span_general_query_attention,general_relation_attention=cfg.identity_readout_answer_span_general_relation_attention,relation_eligibility=cfg.identity_readout_answer_span_relation_eligibility,endpoint_properties=cfg.identity_readout_answer_span_endpoint_properties,endpoint_task_router=cfg.identity_readout_answer_span_endpoint_task_router,causal_owners=cfg.identity_readout_answer_span_causal_owners)
+                self.complete_answer_span=CompleteAnswerSpanPredictor(cfg.d_model,feature_version=cfg.identity_readout_answer_span_features,task_router=cfg.identity_readout_answer_span_task_router,word_encoder=cfg.identity_readout_answer_span_word_encoder,kind_labels=cfg.identity_readout_answer_span_kinds,kind_conditioned_endpoints=cfg.identity_readout_answer_span_kind_conditioned_endpoints,typed_extent_eligibility=cfg.identity_readout_answer_span_typed_extent_eligibility,kind_threshold=cfg.identity_readout_native_span_confidence,owner_context=cfg.identity_readout_answer_span_owner_context,general_context=cfg.identity_readout_answer_span_general_context,general_endpoint=cfg.identity_readout_answer_span_general_endpoint,general_roles=cfg.identity_readout_answer_span_general_roles,general_name_plan=cfg.identity_readout_answer_span_general_name_plan,general_query_attention=cfg.identity_readout_answer_span_general_query_attention,general_relation_attention=cfg.identity_readout_answer_span_general_relation_attention,relation_eligibility=cfg.identity_readout_answer_span_relation_eligibility,endpoint_properties=cfg.identity_readout_answer_span_endpoint_properties,endpoint_task_router=cfg.identity_readout_answer_span_endpoint_task_router,causal_owners=cfg.identity_readout_answer_span_causal_owners,unified_reader=cfg.identity_readout_unified_span_reader,unified_reader_version=cfg.identity_readout_unified_reader_version)
             self.surface_projection = None
             if self.surface_ids.numel():
                 self.surface_projection = nn.Linear(2 * cfg.d_model, self.surface_ids.numel(), bias=False)
@@ -929,7 +929,7 @@ class BoundedIdentityReadout(nn.Module):
                 unit=tokenizer.construction_units[token]
                 if token==tokenizer.bos_id or unit.text=='<BOI>':
                     state.entries=[]
-                    if self.word_binding:state.words=WordSpanState(self.capacity,anchor_words=8 if self._binding_cfg.identity_readout_answer_span_causal_owners else 0)
+                    if self.word_binding:state.words=WordSpanState(self.capacity,anchor_words=8 if (self._binding_cfg.identity_readout_answer_span_causal_owners or self._binding_cfg.identity_readout_unified_span_reader) else 0)
                     if self.observed_span_binding:state.output_units=[]
                     binding_memory = None
                     state.binding_cache=None
@@ -1155,7 +1155,7 @@ class BoundedIdentityReadout(nn.Module):
                             if bool(strength>0):
                                 canonical=self.span_categorical_probabilities(span_base,copy,span_gate,macro)
                                 current=((1.-strength)*current.float().exp()+strength*canonical).clamp_min(1e-30).log().to(current.dtype)
-                if self._binding_cfg.identity_readout_complete_answer_spans and bool(self.complete_answer_span.ready):
+                if self._binding_cfg.identity_readout_complete_answer_spans and bool(self.complete_answer_span.ready) and not (self.training and self._binding_cfg.grounded_qa_span_loss_weight>0):
                     if state.role=='output' and unit.text=='<LINE>' and not state.answer_plan_attempted:
                         state.answer_plan_attempted=True
                         # Task eligibility is the retained genre classifier, not
@@ -1168,6 +1168,7 @@ class BoundedIdentityReadout(nn.Module):
                         if self._binding_cfg.identity_readout_answer_span_task_router:
                             task_applicable=task_applicable and bool(self.complete_answer_span.task_probability(
                                 state.words.question(),bank,lexical_embeddings,tokenizer)>=self.binding_confidence)
+                        task_applicable=task_applicable or self.complete_answer_span.unified_task_applicable(state,tokenizer)
                         if task_applicable:
                             state.answer_plan=self.complete_answer_span.propose(state,tokenizer,bank,lexical_embeddings)
                             if state.answer_plan is not None and not self.verify_answer_plan_start(state,state.answer_plan,tokenizer):
@@ -1186,6 +1187,26 @@ class BoundedIdentityReadout(nn.Module):
                 steps.append(current)
             rows.append(torch.stack(steps))
         return torch.stack(rows),states
+
+    def input_state_from_tokens(self,tokens,tokenizer):
+        """Input-only metadata for explicit QA supervision; no future output state."""
+        state=IdentityReadoutState(entries=[])
+        anchors=8 if (self._binding_cfg.identity_readout_answer_span_causal_owners or self._binding_cfg.identity_readout_unified_span_reader) else 0
+        state.words=WordSpanState(self.capacity,anchors);state.source_surface=[];state.source_positions=[]
+        for token in tokens:
+            token=int(token);unit=tokenizer.construction_units[token]
+            if token==tokenizer.bos_id or unit.text=='<BOI>':
+                state=IdentityReadoutState(entries=[]);state.words=WordSpanState(self.capacity,anchors)
+                state.source_surface=[];state.source_positions=[];state.role='input' if unit.text=='<BOI>' else 'outside'
+            elif unit.text=='<EOI>':state.role='outside'
+            elif unit.text=='<BOO>':break
+            if state.role=='input' or unit.text=='<EOI>':
+                state.source_surface.append((state.source_next_position,token));state.source_surface=state.source_surface[-self.capacity*8:]
+                if self.is_candidate(unit):
+                    state.entries.append((token,(),tuple(state.words.clause[-16:]),state.words.serial,tuple(e[0] for e in state.entries[-8:])))
+                    state.entries=state.entries[-self.capacity:];state.source_positions.append(state.source_next_position);state.source_positions=state.source_positions[-self.capacity:]
+                state.words.observe(token,unit);state.source_next_position+=1
+        return state
 
     def verify_answer_plan_start(self,state,plan,tokenizer):
         """Disagreement with a confident learned chain owner is uncertainty.

@@ -152,6 +152,72 @@ class QAGenerationFormatTests(unittest.TestCase):
         self.assertEqual(float(s.loss_mask[:len(p.token_ids)-1].sum()), 0.)
         self.assertGreater(float(s.loss_mask[len(p.token_ids)-1:].sum()), 0.)
 
+    def test_diverseqa_multiple_questions_share_only_the_document(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from data import parse_diverse_qa_record
+        raw='Lima is in Peru.\nQuestion: Which city?\nAnswer: Lima\n\nQuestion: Which country?\nAnswer: Peru'
+        self.assertEqual(parse_diverse_qa_record(raw),('Lima is in Peru.',[('Which city?','Lima'),('Which country?','Peru')]))
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'DiverseQA'/'part.parquet';path.parent.mkdir()
+            pq.write_table(pa.Table.from_pylist([dict(id='one',text=raw)]),path)
+            records=list(iter_text_corpus(path))
+        self.assertEqual(records,['<BOI>Context:\nLima is in Peru.\nQuestion:\nWhich city?<EOI><BOO>Lima<EOO>',
+                                  '<BOI>Context:\nLima is in Peru.\nQuestion:\nWhich country?<EOI><BOO>Peru<EOO>'])
+        for record,answer in zip(records,('Lima','Peru')):
+            self.assertEqual(record.split('<BOO>')[1],answer+'<EOO>')
+            self.assertEqual(record.count('Question:'),1)
+
+    def test_diverseqa_partial_trailing_pair_is_preserved(self):
+        from data import parse_diverse_qa_record,_normalize_diverse_qa_records
+        text='Document.\nQuestion: One?\nAnswer: Yes.\nQuestion: Two?\nAnswer:'
+        self.assertIsNone(parse_diverse_qa_record(text))
+        self.assertEqual(_normalize_diverse_qa_records(text),[text])
+
+    def test_full_context_qa_keeps_source_question_and_complete_answer(self):
+        t=PrismalTokenizer()
+        source='Lima is in Peru. '+('Ordinary reference details. '*40)
+        prompt='Context:\n'+source+'\nQuestion:\nWhich city is in Peru?'
+        text='<BOI>'+prompt+'<EOI><BOO>Lima<EOO>'
+        t.learn_from_texts([text],min_frequency=1,max_new_tokens=64)
+        windows=_build_window_samples_from_text(t,text,seq_len=32,max_samples=1,hierarchy_vector_dtype='float32',preserve_grounded_qa_context=True)
+        self.assertEqual(len(windows),1);sample=windows[0]
+        self.assertGreater(len(sample.input_ids),32)
+        for marker in ('<BOI>','<EOI>','<BOO>','<EOO>'):self.assertIn(t.special_tokens[marker],sample.input_ids.tolist())
+        generation=t.prepare_generation_hierarchy(prompt)
+        self.assertEqual(sample.input_ids[:len(generation.token_ids)].tolist(),generation.token_ids)
+        for name in TRACKS:self.assertEqual(getattr(sample,name)[:len(generation.token_ids)].tolist(),getattr(generation,name))
+        torch.testing.assert_close(sample.hierarchy_vectors[:len(generation.token_ids)],torch.tensor(generation.hierarchy_vectors),atol=1e-6,rtol=1e-6)
+        boo=sample.input_ids.tolist().index(t.special_tokens['<BOO>'])
+        self.assertEqual(float(sample.loss_mask[:boo].sum()),0.)
+        self.assertIsNotNone(sample.source_group)
+
+    def test_sibling_questions_stay_in_one_validation_partition(self):
+        from data import TextWindowDataset,split_text_window_dataset,StreamingTextCorpusDataset
+        texts=['<BOI>Context:\n'+c+'\nQuestion:\n'+q+'<EOI><BOO>'+a+'<EOO>'
+               for c,pairs in [('Lima is in Peru.',[('Which city?','Lima'),('Which country?','Peru')]),
+                               ('Oslo is in Norway.',[('Which city?','Oslo'),('Which country?','Norway')])] for q,a in pairs]
+        t=PrismalTokenizer();t.learn_from_texts(texts,min_frequency=1,max_new_tokens=64)
+        dataset=TextWindowDataset(texts,t,seq_len=64,preserve_grounded_qa_context=True)
+        train,val=split_text_window_dataset(dataset,val_fraction=.5,seed=7)
+        self.assertTrue({dataset[i].source_group for i in train.indices}.isdisjoint({dataset[i].source_group for i in val.indices}))
+        stream=StreamingTextCorpusDataset('unused',t,seq_len=64,split='train',val_fraction=.5,seed=7,preserve_grounded_qa_context=True)
+        self.assertEqual(stream._include_record(0,texts[0]),stream._include_record(1,texts[1]))
+        self.assertEqual(stream._include_record(2,texts[2]),stream._include_record(3,texts[3]))
+
+    def test_streaming_buffer_does_not_bypass_grounded_document_split(self):
+        from data import StreamingTextCorpusDataset
+        texts=['<BOI>Context:\nLima is in Peru.\nQuestion:\nWhich city?<EOI><BOO>Lima<EOO>',
+               '<BOI>Context:\nOslo is in Norway.\nQuestion:\nWhich city?<EOI><BOO>Oslo<EOO>']
+        t=PrismalTokenizer();t.learn_from_texts(texts,min_frequency=1,max_new_tokens=64)
+        stream=StreamingTextCorpusDataset('unused',t,seq_len=64,max_samples=10,split='train',val_fraction=.5,seed=3,shuffle_buffer_size=10,preserve_grounded_qa_context=True)
+        with mock.patch('data.iter_text_corpus',return_value=iter(texts)),mock.patch.object(stream,'_include_record',side_effect=lambda i,text:i==0):
+            samples=list(stream)
+        self.assertEqual(len(samples),1)
+        self.assertIn('Lima',t.decode(samples[0].input_ids.tolist(),clean_text=False))
+        with mock.patch('data.iter_text_corpus',return_value=iter(texts)),mock.patch.object(stream,'_include_record',return_value=False):
+            self.assertEqual(list(stream),[])
+
     def test_diverseqa_incomplete_record_retains_original_text(self):
         from data import _normalize_diverse_qa_record
         text = 'Document.\nQuestion: Missing response\nAnswer:'
