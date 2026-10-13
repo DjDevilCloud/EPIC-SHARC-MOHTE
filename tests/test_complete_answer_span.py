@@ -12,6 +12,50 @@ from train import save_checkpoint,load_bundle_from_checkpoint
 
 
 class CompleteAnswerSpanTests(unittest.TestCase):
+    def test_native_token_objective_bypasses_retrieval_without_disabling_span_gradients(self):
+        from data import _build_window_samples_from_text
+        t,m,_=self.fixture(general=True,unified=True)
+        m.eval();m.requires_grad_(True)
+        m.cfg.grounded_qa_full_context=True;m.cfg.grounded_qa_native_token_loss=True
+        text='<BOI>Context:\nThe budget is $75.\nQuestion:\nWhat is the budget?<EOI><BOO>$75<EOO>'
+        s=_build_window_samples_from_text(t,text,seq_len=16,preserve_grounded_qa_context=True,hierarchy_vector_dtype='float32')[0]
+        head=m.bounded_identity_readout
+        m.cfg.grounded_qa_span_loss_weight=0.;m.bounded_identity_readout=None
+        native,original=m.compute_loss(s.input_ids[None],s.labels[None],loss_mask=s.loss_mask[None],collect_telemetry=False)
+        m.bounded_identity_readout=head
+        span,_=head.complete_answer_span.supervised_qa_loss(s.input_ids[None],t,m.shared_signature_bank,m.construction_embedding,head.input_state_from_tokens)
+        m.cfg.grounded_qa_span_loss_weight=1.
+        with patch.object(head,'forward',side_effect=AssertionError('Retrieval must not satisfy native token loss')):
+            joint,out=m.compute_loss(s.input_ids[None],s.labels[None],loss_mask=s.loss_mask[None],collect_telemetry=False)
+        torch.testing.assert_close(out.logits,original.logits,rtol=0,atol=0)
+        torch.testing.assert_close(joint,native+span)
+        self.assertIs(m.bounded_identity_readout,head)
+        joint.backward()
+        self.assertGreater(sum(float(p.grad.abs().sum()) for p in m.construction_head.parameters() if p.grad is not None),0.)
+        self.assertGreater(float(head.complete_answer_span.unified_reader.query.weight.grad.abs().sum()),0.)
+        with patch.object(head,'forward',wraps=head.forward) as readout:
+            m(s.input_ids[None],collect_telemetry=False)
+            self.assertEqual(readout.call_count,1)
+
+    def test_joint_native_configuration_preserves_registry_freeze_after_reload(self):
+        t,m,_=self.fixture(general=True,unified=True)
+        m.cfg.binding_adapter_training=False;m.cfg.grounded_qa_full_context=True
+        m.cfg.grounded_qa_native_token_loss=True;m.cfg.grounded_qa_span_loss_weight=1.
+        m.cfg.freeze_registry_observations=True
+        with tempfile.TemporaryDirectory() as directory:
+            loaded,_,cfg=load_bundle_from_checkpoint(save_checkpoint(m,directory,tokenizer=t),device='cpu',load_training_state=False)
+            self.assertTrue(cfg.grounded_qa_native_token_loss)
+            self.assertFalse(cfg.binding_adapter_training)
+            self.assertFalse(loaded.registry.observation_updates_enabled)
+            buffers={n:v.clone() for n,v in loaded.registry.named_buffers()}
+            loaded.registry.observe(family_ids=torch.tensor([[1]]),level_ids=torch.tensor([[1]]),relation_ids=torch.tensor([[1]]),parent_ids=torch.tensor([[1]]))
+            for n,v in loaded.registry.named_buffers():torch.testing.assert_close(v,buffers[n],rtol=0,atol=0)
+
+    def test_native_token_training_rejects_adapter_only_configuration(self):
+        t,m,_=self.fixture(general=True,unified=True)
+        m.cfg.grounded_qa_full_context=True;m.cfg.grounded_qa_native_token_loss=True;m.cfg.binding_adapter_training=True
+        with self.assertRaisesRegex(ValueError,'disable binding_adapter_training'):m.cfg.__post_init__()
+
     def test_lexical_cue_configuration_checkpoint_roundtrip(self):
         t,m,module=self.requested_role_fixture('relation_decisions_v10')
         m.cfg.identity_readout_relation_lexical_cues=True

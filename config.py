@@ -81,6 +81,8 @@ class PrismalWaveConfig:
     identity_readout_condition_alignment: bool = False
     grounded_qa_span_loss_weight: float = 0.0
     grounded_qa_full_context: bool = False
+    grounded_qa_native_token_loss: bool = False  # Train token logits without identity retrieval; span loss stays active.
+    freeze_registry_observations: bool = False  # Preserve routing activity/promotions during joint QA fitting.
     identity_readout_answer_span_kinds: list[str] = field(default_factory=lambda: ['AMOUNT','BILL_CODE','DATE','INTERVAL','LEGAL_CODE','MEASUREMENT','PERSON','QUALIFIED_COUNT','YEAR'])
     identity_readout_context_units: int = 2
     identity_readout_query_units: int = 4
@@ -443,6 +445,10 @@ class PrismalWaveConfig:
             raise ValueError('Grounded QA span loss weight must be nonnegative')
         if self.grounded_qa_span_loss_weight and (not self.identity_readout_unified_span_reader or not self.grounded_qa_full_context):
             raise ValueError('Grounded QA span supervision requires the unified reader and full QA contexts')
+        if self.grounded_qa_native_token_loss and (not self.grounded_qa_full_context or not self.use_bounded_identity_readout):
+            raise ValueError('Native grounded QA token loss requires full QA contexts and the identity reader')
+        if self.grounded_qa_native_token_loss and self.binding_adapter_training:
+            raise ValueError('Native grounded QA token loss requires generator training; disable binding_adapter_training')
         if self.identity_readout_unified_reader_version not in {'aligned_v1','masked_relations_v2','scoped_relations_v3','semantic_scoped_v4','semantic_context_v5','requested_roles_v6','nonlinear_roles_v7','factored_matching_v8','structural_owner_v9','relation_decisions_v10'}:
             raise ValueError('Unknown unified span reader version')
         if self.identity_readout_relation_lexical_cues and (not self.identity_readout_unified_span_reader or self.identity_readout_unified_reader_version not in {'factored_matching_v8','structural_owner_v9','relation_decisions_v10'}):

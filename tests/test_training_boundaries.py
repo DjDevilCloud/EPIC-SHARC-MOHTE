@@ -33,6 +33,25 @@ from train import (
 
 
 class TrainingBoundaryTests(unittest.TestCase):
+    def test_completed_qa_supervises_final_eos_after_output_close(self) -> None:
+        tokenizer=PrismalTokenizer()
+        text='<BOI>Question<EOI><BOO>Answer<EOO>'
+        encoded=tokenizer.encode(text,add_special_tokens=True)
+        mask=_build_loss_mask(tokenizer,text,encoded)
+        self.assertEqual(encoded[-1],tokenizer.eos_id)
+        self.assertEqual(mask[-1],1.)
+        self.assertEqual(mask[encoded.index(tokenizer.special_tokens['<EOO>'])],1.)
+        self.assertEqual(mask[encoded.index(tokenizer.special_tokens['<EOI>'])],0.)
+
+    def test_unfinished_next_user_turn_does_not_supervise_final_eos(self) -> None:
+        tokenizer=PrismalTokenizer()
+        text='<BOI>First question<EOI><BOO>First answer<EOO><BOI>Next question<EOI>'
+        encoded=tokenizer.encode(text,add_special_tokens=True)
+        mask=_build_loss_mask(tokenizer,text,encoded)
+        self.assertEqual(mask[-1],0.)
+        last_input=len(encoded)-1-encoded[::-1].index(tokenizer.special_tokens['<BOI>'])
+        self.assertTrue(all(weight==0 for weight in mask[last_input:]))
+
     def _token_names(self, tokenizer: PrismalTokenizer, ids) -> list[str]:
         names: list[str] = []
         for token_id in ids:

@@ -6620,6 +6620,8 @@ class PrismalWaveModel(nn.Module):
         )
         if cfg.binding_adapter_training:
             self.freeze_binding_backbone()
+        if cfg.freeze_registry_observations:
+            self.registry.observation_updates_enabled = False
 
     def freeze_binding_backbone(self) -> None:
         """Retain learned weights AND registry promotion state while fitting binding adapters."""
@@ -9653,7 +9655,7 @@ class PrismalWaveModel(nn.Module):
         self.signature_bucket_vocab_size = new_bucket_vocab_size
         self.cfg.signature_bucket_vocab_size = new_bucket_vocab_size
 
-    def forward(self, input_ids: torch.Tensor, *args, runtime_signature_state=None, bounded_identity_state=None, **kwargs):
+    def forward(self, input_ids: torch.Tensor, *args, runtime_signature_state=None, bounded_identity_state=None, apply_identity_readout: bool = True, **kwargs):
         states = None
         if self.shared_signature_bank is not None and self.shared_signature_bank.runtime_enabled:
             if args:
@@ -9665,7 +9667,7 @@ class PrismalWaveModel(nn.Module):
             kwargs['hierarchy_vectors'] = features
         output = self._forward_impl(input_ids, *args, **kwargs)
         output.runtime_signature_state = states
-        if self.bounded_identity_readout is not None:
+        if apply_identity_readout and self.bounded_identity_readout is not None:
             binding_args = ({'lexical_embeddings': self.construction_embedding}
                             if self.bounded_identity_readout.binding_enabled else {})
             output.logits, output.bounded_identity_state = self.bounded_identity_readout(
@@ -11204,6 +11206,7 @@ class PrismalWaveModel(nn.Module):
             )
             output = self(
                 superposition.input_ids,
+                apply_identity_readout=not self.cfg.grounded_qa_native_token_loss,
                 signature_family_ids=superposition.signature_family_ids,
                 signature_ids=superposition.signature_ids,
                 signature_level_ids=superposition.signature_level_ids,
@@ -11234,6 +11237,7 @@ class PrismalWaveModel(nn.Module):
         else:
             output = self(
                 input_ids,
+                apply_identity_readout=not self.cfg.grounded_qa_native_token_loss,
                 signature_family_ids=signature_family_ids,
                 signature_ids=signature_ids,
                 signature_level_ids=signature_level_ids,

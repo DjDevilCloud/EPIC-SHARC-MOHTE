@@ -3635,15 +3635,26 @@ def _build_loss_mask(tokenizer: PrismalTokenizer, text: str, encoded_tokens: Seq
     if boo_id is not None and any(int(token_id) == int(boo_id) for token_id in encoded_tokens):
         mask: List[float] = []
         in_output = False
-        for token_id in encoded_tokens:
+        output_closed = False
+        input_boundaries = {tokenizer.special_tokens.get('<BOI>'), tokenizer.special_tokens.get('<EOI>')}
+        for index, token_id in enumerate(encoded_tokens):
             token_id = int(token_id)
+            if token_id in input_boundaries:
+                output_closed = False
             if token_id == int(boo_id):
                 in_output = True
+                output_closed = False
                 mask.append(0.0)
                 continue
             if eoo_id is not None and token_id == int(eoo_id):
                 in_output = False
+                output_closed = True
                 # The model must learn when the assistant span is complete.
+                mask.append(1.0)
+                continue
+            if token_id == tokenizer.eos_id and index == len(encoded_tokens) - 1 and output_closed:
+                # Generation stops on EOS, so a completed assistant frame must
+                # also teach the terminal transition after its output boundary.
                 mask.append(1.0)
                 continue
             mask.append(1.0 if in_output else 0.0)
