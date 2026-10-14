@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 try:
+    from .native_question_memory import NativeQuestionMemory
     from .signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor, BoundedIdentityReadout
     from .config import PrismalWaveConfig
     from .fused_finite import repair_transition as _repair_finite_transition_cuda
@@ -26,6 +27,7 @@ try:
     from .hierarchical_precision import HierarchicalPrecisionPolicy, HierarchicalPrecisionSpec, attach_precision_policy, current_precision_spec, dtype_name, is_float8_dtype
     from .quantization import QuantizationConfig, create_quantized_embedding, create_quantized_linear
 except ImportError:  # pragma: no cover - supports direct script launching.
+    from native_question_memory import NativeQuestionMemory
     from signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor, BoundedIdentityReadout
     from config import PrismalWaveConfig
     from fused_finite import repair_transition as _repair_finite_transition_cuda
@@ -4354,6 +4356,7 @@ class SignatureLatticeState:
     prev_signature_bucket: torch.Tensor
     prev_family_bucket: torch.Tensor
     cache_scale_phase: Optional[int] = None
+    native_question_state: Optional[list] = None
 
 
 @dataclass
@@ -6395,6 +6398,10 @@ class PrismalWaveModel(nn.Module):
     def __init__(self, cfg: PrismalWaveConfig):
         super().__init__()
         self.cfg = cfg
+        if cfg.use_native_question_memory and (not cfg.use_torus_core or not cfg.use_signature_lattice_attention or not cfg.use_signature_lattice_generation_cache):
+            raise ValueError('Native question memory requires the torus and carried signature lattice state.')
+        self.native_question_memory = (NativeQuestionMemory(cfg.d_model, cfg.native_question_memory_capacity, cfg.native_question_memory_question_capacity)
+                                       if cfg.use_native_question_memory else None)
         self.signature_level_to_id = dict(SIGNATURE_LEVEL_IDS)
         self.signature_relation_to_id = dict(SIGNATURE_RELATION_IDS)
         self.use_torus_core = bool(getattr(cfg, "use_torus_core", True))
@@ -9556,7 +9563,7 @@ class PrismalWaveModel(nn.Module):
             slot_state=final_slot_state,
             signature_lattice_state=final_signature_lattice_state,
             token_memory_state=frame.token_memory_state,
-            readout_hidden=final_hidden if self.bounded_identity_readout is not None else None,
+            readout_hidden=final_hidden if self.bounded_identity_readout is not None or self.native_question_memory is not None else None,
         )
 
     @property
@@ -9657,6 +9664,7 @@ class PrismalWaveModel(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, *args, runtime_signature_state=None, bounded_identity_state=None, apply_identity_readout: bool = True, **kwargs):
         states = None
+        carried_native_state = getattr(kwargs.get('signature_lattice_state'), 'native_question_state', None)
         if self.shared_signature_bank is not None and self.shared_signature_bank.runtime_enabled:
             if args:
                 raise ValueError('Runtime signatures require hierarchy arguments by keyword.')
@@ -9667,6 +9675,16 @@ class PrismalWaveModel(nn.Module):
             kwargs['hierarchy_vectors'] = features
         output = self._forward_impl(input_ids, *args, **kwargs)
         output.runtime_signature_state = states
+        if self.native_question_memory is not None and (not apply_identity_readout or self.bounded_identity_readout is None):
+            native_hidden, native_state = self.native_question_memory(input_ids, output.readout_hidden, self.construction_embedding,
+                getattr(self, '_prismal_tokenizer', None), carried_native_state)
+            output.logits = self._construction_logits_from_guided(native_hidden)
+            if output.signature_lattice_state is None and not self.training:
+                raise ValueError('Native question memory did not receive a carried lattice state.')
+            if output.signature_lattice_state is not None:
+                output.signature_lattice_state.native_question_state = native_state
+            if not apply_identity_readout or self.bounded_identity_readout is None:
+                output.readout_hidden = native_hidden
         if apply_identity_readout and self.bounded_identity_readout is not None:
             binding_args = ({'lexical_embeddings': self.construction_embedding}
                             if self.bounded_identity_readout.binding_enabled else {})
@@ -10120,7 +10138,7 @@ class PrismalWaveModel(nn.Module):
             aux_loss=aux_loss,
             slot_state=final_slot_state,
             signature_lattice_state=None,
-            readout_hidden=final_hidden if self.bounded_identity_readout is not None else None,
+            readout_hidden=final_hidden if self.bounded_identity_readout is not None or self.native_question_memory is not None else None,
         )
 
     def forward_incremental(

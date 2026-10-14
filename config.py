@@ -40,6 +40,9 @@ class PrismalWaveConfig:
     signature_representation: str = "legacy"  # legacy, catalog compositional_v1, causal runtime v2/v3
     signature_component_buckets: int = 8192
     use_bounded_identity_readout: bool = False
+    use_native_question_memory: bool = False
+    native_question_memory_capacity: int = 128
+    native_question_memory_question_capacity: int = 32
     identity_readout_capacity: int = 16
     identity_readout_rule: str = "mixture_v1"
     identity_readout_candidate_policy: str = "lexical_bytes_v2"
@@ -381,6 +384,8 @@ class PrismalWaveConfig:
     eos_id: int = 2
 
     def __post_init__(self) -> None:
+        if self.native_question_memory_capacity < 1 or self.native_question_memory_question_capacity < 1:
+            raise ValueError('Native question memory capacities must be positive')
         if self.use_bounded_identity_readout and self.signature_representation not in {'compositional_v2','compositional_v3'}:
             raise ValueError('Bounded identity readout requires runtime compositional signatures.')
         if self.identity_readout_capacity < 1:
