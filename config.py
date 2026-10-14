@@ -43,6 +43,13 @@ class PrismalWaveConfig:
     use_native_question_memory: bool = False
     native_question_memory_capacity: int = 128
     native_question_memory_question_capacity: int = 32
+    native_question_memory_span_readout: bool = False
+    native_question_memory_stable_span_gate: bool = False
+    native_question_memory_span_words: int = 16
+    native_question_memory_span_starts: int = 16
+    native_question_memory_lexical_cues: bool = False
+    native_question_memory_future_context: int = 0
+    native_question_memory_anchor_words: int = 0
     identity_readout_capacity: int = 16
     identity_readout_rule: str = "mixture_v1"
     identity_readout_candidate_policy: str = "lexical_bytes_v2"
@@ -386,6 +393,14 @@ class PrismalWaveConfig:
     def __post_init__(self) -> None:
         if self.native_question_memory_capacity < 1 or self.native_question_memory_question_capacity < 1:
             raise ValueError('Native question memory capacities must be positive')
+        if self.native_question_memory_span_words < 1 or self.native_question_memory_span_starts < 1:
+            raise ValueError('Native span budgets must be positive')
+        if self.native_question_memory_span_readout and not self.use_native_question_memory:
+            raise ValueError('Native span readout requires native question memory')
+        if self.native_question_memory_stable_span_gate and not self.native_question_memory_span_readout:
+            raise ValueError('Stable native span gating requires native span readout')
+        if self.native_question_memory_future_context < 0 or self.native_question_memory_anchor_words < 0:
+            raise ValueError('Native future-context window must be nonnegative')
         if self.use_bounded_identity_readout and self.signature_representation not in {'compositional_v2','compositional_v3'}:
             raise ValueError('Bounded identity readout requires runtime compositional signatures.')
         if self.identity_readout_capacity < 1:

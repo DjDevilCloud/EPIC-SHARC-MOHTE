@@ -6400,7 +6400,10 @@ class PrismalWaveModel(nn.Module):
         self.cfg = cfg
         if cfg.use_native_question_memory and (not cfg.use_torus_core or not cfg.use_signature_lattice_attention or not cfg.use_signature_lattice_generation_cache):
             raise ValueError('Native question memory requires the torus and carried signature lattice state.')
-        self.native_question_memory = (NativeQuestionMemory(cfg.d_model, cfg.native_question_memory_capacity, cfg.native_question_memory_question_capacity)
+        self.native_question_memory = (NativeQuestionMemory(cfg.d_model, cfg.native_question_memory_capacity, cfg.native_question_memory_question_capacity,
+                                       cfg.native_question_memory_span_readout, cfg.native_question_memory_span_words, cfg.native_question_memory_span_starts,
+                                       cfg.native_question_memory_lexical_cues, cfg.native_question_memory_future_context, cfg.native_question_memory_anchor_words,
+                                       cfg.native_question_memory_stable_span_gate)
                                        if cfg.use_native_question_memory else None)
         self.signature_level_to_id = dict(SIGNATURE_LEVEL_IDS)
         self.signature_relation_to_id = dict(SIGNATURE_RELATION_IDS)
@@ -9676,9 +9679,11 @@ class PrismalWaveModel(nn.Module):
         output = self._forward_impl(input_ids, *args, **kwargs)
         output.runtime_signature_state = states
         if self.native_question_memory is not None and (not apply_identity_readout or self.bounded_identity_readout is None):
-            native_hidden, native_state = self.native_question_memory(input_ids, output.readout_hidden, self.construction_embedding,
-                getattr(self, '_prismal_tokenizer', None), carried_native_state)
+            native_hidden, native_state, native_readout = self.native_question_memory(input_ids, output.readout_hidden, self.construction_embedding,
+                getattr(self, '_prismal_tokenizer', None), carried_native_state, return_readout=True)
             output.logits = self._construction_logits_from_guided(native_hidden)
+            if self.native_question_memory.span_readout is not None:
+                output.logits = self.native_question_memory.span_readout.mix(output.logits, native_readout)
             if output.signature_lattice_state is None and not self.training:
                 raise ValueError('Native question memory did not receive a carried lattice state.')
             if output.signature_lattice_state is not None:
