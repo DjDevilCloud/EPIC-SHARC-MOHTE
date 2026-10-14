@@ -118,7 +118,7 @@ class TrainingBoundaryTests(unittest.TestCase):
         # learned output terminator, so it is intentionally supervised.
         for index, token_id in enumerate(labels):
             name = self._token_names(tokenizer, [token_id])[0]
-            if name in {"<BOI>", "<EOI>", "<BOO>", "<BLO>"}:
+            if name in {"<BOI>", "<EOI>", "<BOO>"}:
                 self.assertEqual(float(mask[index]), 0.0, msg=f"structure target {name} supervised at {index}")
         eoo_targets = [i for i, token_id in enumerate(labels) if self._token_names(tokenizer, [token_id])[0] == "<EOO>"]
         self.assertTrue(eoo_targets)

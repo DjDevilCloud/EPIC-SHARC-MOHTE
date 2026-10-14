@@ -154,9 +154,10 @@ class CompleteAnswerSpanPredictor(nn.Module):
 
     @staticmethod
     def payload(tokenizer,text):
-        excluded={'<BOS>','<EOS>','<BOI>','<EOI>','<BOO>','<EOO>','<LINE>','<EOL>','<BOP>','<EOP>','<BLO>','<PAD>'}
-        tokens=tuple(i for i in tokenizer.encode(text) if tokenizer.construction_units[i].text not in excluded and tokenizer.construction_units[i].kind!='signature')
-        return tokens+(tokenizer.special_tokens['<EOL>'],tokenizer.special_tokens['<EOO>'],tokenizer.eos_id)
+        # The first LINE is prompt context. All later line/blank controls,
+        # separators and the closing boundary are actual training targets.
+        tokens=tokenizer.encode_hierarchy_bundle(f'<BOO>{text}<EOO>',add_special_tokens=False).token_ids
+        return tuple(tokens[2:])+(tokenizer.eos_id,)
 
     @staticmethod
     def properties(bank,keys):

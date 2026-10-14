@@ -33,6 +33,7 @@ try:
         iter_text_corpus,
         hierarchy_vector_torch_dtype,
         split_text_window_dataset,
+        format_structured_qa_prompt,
     )
     from .muon_optim import (
         MuonAdamW,
@@ -63,6 +64,7 @@ except ImportError:  # pragma: no cover - supports direct script launching.
         iter_text_corpus,
         hierarchy_vector_torch_dtype,
         split_text_window_dataset,
+        format_structured_qa_prompt,
     )
     from muon_optim import (
         MuonAdamW,
@@ -3183,14 +3185,20 @@ def run_benchmark(
 
 
 def _format_generation_prompt(prompt: str, *, template_prompt: bool = False) -> str:
+    if any(marker in prompt for marker in ('<BOI>', '<EOI>', '<BOO>', '<EOO>')):
+        # Output-prefill spaces/newlines are observed content, not formatting.
+        return prompt
     prompt = prompt.strip()
     lowered = prompt.lower()
+    input_text, separator, cue = prompt.rpartition('\n')
+    if separator and input_text.lower().startswith(('instruction:', 'question:', 'prompt:', 'context:')) and cue.lower() in {'response:', 'answer:', 'output:', 'completion:', 'target:'}:
+        return f'<BOI>{input_text}<EOI><BOO>{cue} '
     if any(marker in lowered for marker in ("instruction:", "response:", "prompt:", "context:", "answer:", "output:", "completion:", "target:")):
         if lowered.endswith(("response:", "answer:", "output:", "completion:", "target:")):
             return prompt + " "
         return prompt
     if template_prompt:
-        return f"Instruction: {prompt}\nResponse: "
+        return format_structured_qa_prompt(prompt)
     return prompt
 
 
@@ -3202,7 +3210,7 @@ def generate_text(
     device: torch.device,
     *,
     max_new_tokens: int = 64,
-    min_new_tokens: int = 24,
+    min_new_tokens: int = 1,
     top_k: int = 0,
     top_p: float = 1.0,
     temperature: float = 1.0,

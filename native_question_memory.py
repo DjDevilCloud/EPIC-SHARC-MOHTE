@@ -107,10 +107,15 @@ class NativeQuestionMemory(nn.Module):
         state.line_start = False
 
     def _observe(self, state, token, tokenizer):
+        if token == tokenizer.pad_id:
+            return state, False
+        if state.emitted and state.emitted[-1] == tokenizer.special_tokens['<EOO>']:
+            # Only the EOO position itself predicts the terminal EOS. Later
+            # tokens cannot reopen a closed answer except an explicit BOO.
+            state.emitting = False
         text = tokenizer.construction_units[token].text
-        # Dataset serialization inserts a leading LINE control; generation
-        # suppresses it. It carries no answer surface and must not invalidate
-        # the verified lexical prefix during teacher-forced training.
+        # Training and generation seed a leading LINE as prompt context. It
+        # carries no answer surface; internal LINE controls remain significant.
         leading_line = text == '<LINE>' and not state.emitted and not state.emission_invalid
         if self.span_readout is not None and state.emitting and text != '<BOO>' and not leading_line:
             if len(state.emitted) >= self.span_readout.max_words * 72 + 8:
@@ -139,11 +144,14 @@ class NativeQuestionMemory(nn.Module):
             state.emitting = state.has_question
             state.emitted = ()
             state.emission_invalid = False
-        elif text == '<EOO>' or token == tokenizer.eos_id:
+        elif text == '<EOO>':
+            # The supervised EOS is predicted *at* EOO. Keep the verified span
+            # available for that final step, then disable it when EOS arrives.
+            state.emitting = state.emitting and self.span_readout is not None
+            state.mode = 'outside'
+        elif token == tokenizer.eos_id:
             state.emitting = False
             state.mode = 'outside'
-        elif token == tokenizer.pad_id:
-            return state, False
         elif state.mode in {'source', 'question'}:
             if tokenizer.construction_units[token].is_lexical:
                 self._restore_header_word(state)
@@ -261,8 +269,12 @@ class NativeQuestionMemory(nn.Module):
                     question, recalled, probabilities, plan = packet(state)
                     if return_attention:
                         attention_records.append((row, position, [word for word, _ in state.source], probabilities))
-                    gate = self.gate(torch.cat((current, question))).sigmoid()
-                    current = current + gate * self.output(torch.cat((current, question, recalled)))
+                    # Legacy checkpoints never trained the residual at EOO.
+                    # Expose verified EOS support without changing that base
+                    # boundary prediction; the span gate receives EOS gradients.
+                    if tokenizer.construction_units[token].text != '<EOO>':
+                        gate = self.gate(torch.cat((current, question))).sigmoid()
+                        current = current + gate * self.output(torch.cat((current, question, recalled)))
                     if return_readout and plan is not None:
                         readout_records.append((row, position, question, current, plan, state.emitted))
                 sequence.append(current)

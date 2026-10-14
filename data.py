@@ -638,7 +638,9 @@ def _build_structured_qa_blocks(
     response: str | None,
     style: str = "mixed",
 ) -> tuple[str, str]:
-    resolved_style, variation_index = _resolve_qa_style(style, instruction, context, response)
+    # The answer is unavailable at inference. It must not select the question
+    # rewrite, input layout or output cue used to condition its own prediction.
+    resolved_style, variation_index = _resolve_qa_style(style, instruction, context)
     varied_instruction = _rewrite_instruction_for_diversity(instruction, variation_index)
     context_text = _clean_record_value(context)
     response_text = _rewrite_response_for_concision(response) if response is not None else ""
@@ -674,7 +676,9 @@ def format_structured_qa_prompt(instruction: str, context: str = "", *, style: s
         response=None,
         style=style,
     )
-    return f"{input_text}\n{output_cue}".strip()
+    if not output_cue.endswith(' '):
+        output_cue += ' '
+    return f'<BOI>{input_text}<EOI><BOO>{output_cue}'
 
 
 def _compose_structured_qa_record(
@@ -690,7 +694,7 @@ def _compose_structured_qa_record(
         response=response,
         style=style,
     )
-    return "\n".join(["<BOI>", input_text, "<EOI>", "<BOO>", output_text, "<EOO>"]).strip()
+    return f'<BOI>{input_text}<EOI><BOO>{output_text}<EOO>'
 
 
 def _compose_record_text(payload: Dict[str, Any], *, text_is_response: bool = False) -> str:
@@ -1403,6 +1407,17 @@ class PrismalTokenizer:
                 "family_vocab_size": max(self.signature_family_vocab_size, 1),
             }
         return dict(self._hierarchy_normalization)
+
+    def seed_output_line_frames(self, token_ids: List[int], *tracks: List[int]) -> None:
+        """Seed every output span identically, even for blank/empty answers."""
+        boo, line = self.special_tokens['<BOO>'], self.special_tokens['<LINE>']
+        for index in range(len(token_ids) - 1, -1, -1):
+            if token_ids[index] == boo and (index + 1 == len(token_ids) or token_ids[index + 1] != line):
+                token_ids.insert(index + 1, line)
+                for track in tracks:
+                    # Replaced by the causal transition below; no future line
+                    # profile enters the seeded frame.
+                    track.insert(index + 1, track[index])
 
     def apply_causal_output_hierarchy(
         self, token_ids: Sequence[int], signature_ids: List[int], level_ids: List[int],
@@ -2562,6 +2577,8 @@ class PrismalTokenizer:
             parent_signature_ids.append(self.signature_eos_id)
             signature_family_ids.append(self.signature_family_to_id["special"])
 
+        self.seed_output_line_frames(token_ids, signature_ids, signature_level_ids,
+                                     signature_relation_ids, parent_signature_ids, signature_family_ids)
         self.apply_causal_output_hierarchy(
             token_ids, signature_ids, signature_level_ids, signature_relation_ids,
             parent_signature_ids, signature_family_ids,
@@ -3818,6 +3835,8 @@ def _build_window_samples_from_text(
         encoded_parents,
         encoded_families,
     )
+    tokenizer.seed_output_line_frames(encoded, encoded_signatures, encoded_levels,
+                                      encoded_relations, encoded_parents, encoded_families)
     tokenizer.apply_causal_output_hierarchy(
         encoded, encoded_signatures, encoded_levels, encoded_relations, encoded_parents, encoded_families,
     )
@@ -3851,7 +3870,7 @@ def _build_window_samples_from_text(
 
     token_loss_mask = _build_loss_mask(tokenizer, merged, encoded)
     unsupervised_token_ids = _unsupervised_structure_token_ids(tokenizer)
-    output_structure_ids = {tokenizer.special_tokens.get(marker) for marker in ("<LINE>", "<EOL>", "<EOO>")}
+    output_structure_ids = {tokenizer.special_tokens.get(marker) for marker in ("<LINE>", "<EOL>", "<BLO>", "<EOO>")}
     boo_id = tokenizer.special_tokens.get("<BOO>")
     eoo_id = tokenizer.special_tokens.get("<EOO>")
     line_id = tokenizer.special_tokens.get("<LINE>")
@@ -4358,6 +4377,9 @@ def stream_pretokenized_windows(
     }
     if metadata:
         payload.update(metadata)
+    # Checkpoint tokenizer compatibility is separate from cached answer layout.
+    # Old arrays cannot acquire newly seeded frames merely by loading new code.
+    payload['output_seed_protocol_version'] = 1
     (output_path / "meta.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return output_path
 
@@ -4383,6 +4405,8 @@ class MemmapTokenDataset(Dataset):
         self.meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
         if int(self.meta.get("hierarchy_protocol_version", 0)) != 1:
             raise ValueError("Pretokenized hierarchy uses a legacy protocol; rebuild it from raw text with the causal hierarchy encoder.")
+        if int(self.meta.get('output_seed_protocol_version', 0)) != 1:
+            raise ValueError('Pretokenized answer frames use a legacy layout; rebuild the cache from raw text. Existing model/tokenizer checkpoints remain loadable.')
         self.seq_len = int(self.meta.get("seq_len", 0))
         self.total_samples = int(self.meta.get("num_samples", 0))
         self.split = split
