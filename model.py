@@ -6409,7 +6409,8 @@ class PrismalWaveModel(nn.Module):
                                        cfg.native_question_memory_antecedent_query, cfg.native_question_memory_conditional_endpoints,
                                        cfg.native_question_memory_relation_alignment, cfg.native_question_memory_source_roles,
                                        cfg.native_question_memory_owner_evidence, cfg.native_question_memory_marker_endpoints,
-                                       cfg.native_question_memory_semantic_alignment, cfg.native_question_memory_semantic_prior_scaling)
+                                       cfg.native_question_memory_semantic_alignment, cfg.native_question_memory_semantic_prior_scaling,
+                                       cfg.native_question_memory_semantic_decisions, cfg.native_question_memory_conditional_copy)
                                        if cfg.use_native_question_memory else None)
         self.signature_level_to_id = dict(SIGNATURE_LEVEL_IDS)
         self.signature_relation_to_id = dict(SIGNATURE_RELATION_IDS)

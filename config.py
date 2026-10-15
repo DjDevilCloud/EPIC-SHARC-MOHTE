@@ -52,6 +52,8 @@ class PrismalWaveConfig:
     native_question_memory_marker_endpoints: bool = False
     native_question_memory_semantic_alignment: bool = False
     native_question_memory_semantic_prior_scaling: bool = False
+    native_question_memory_semantic_decisions: bool = False
+    native_question_memory_conditional_copy: bool = False
     native_question_memory_matcher: str = 'combined_v1'
     native_question_memory_batch_encoders: bool = False
     native_question_memory_document_context: bool = False
@@ -424,6 +426,10 @@ class PrismalWaveConfig:
             raise ValueError('Native semantic alignment requires native question memory')
         if self.native_question_memory_semantic_prior_scaling and not self.native_question_memory_semantic_alignment:
             raise ValueError('Semantic prior scaling requires semantic alignment')
+        if self.native_question_memory_semantic_decisions and not (self.native_question_memory_semantic_alignment and self.native_question_memory_span_readout):
+            raise ValueError('Semantic decisions require semantic alignment and span readout')
+        if self.native_question_memory_conditional_copy and not (self.native_question_memory_span_readout and self.native_question_memory_stable_span_gate):
+            raise ValueError('Conditional copy requires span readout and a stable task gate')
         if self.native_question_memory_marker_endpoints and not self.native_question_memory_span_readout:
             raise ValueError('Native marker endpoints require native span readout')
         if self.native_question_memory_matcher not in {'combined_v1', 'owner_relation_v1'}:

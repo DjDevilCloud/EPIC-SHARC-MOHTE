@@ -39,7 +39,8 @@ class NativeSemanticAlignment(nn.Module):
                     source=torch.tensor([lookup[w] for w in source_words], device=device),
                     question=torch.tensor([lookup[w] for w in question_words], device=device))
 
-    def forward(self, inputs, prior=None):
+    def forward(self, inputs, prior=None, return_features=False):
+        """Score starts, optionally returning the same request and source states."""
         states, _ = self.word(inputs['units'])
         words = states[torch.arange(len(states), device=states.device), inputs['lengths'] - 1]
         source, _ = self.context(words[inputs['source']][None])
@@ -56,4 +57,6 @@ class NativeSemanticAlignment(nn.Module):
             # changes the strength, not the ordering, of the existing evidence.
             scale = torch.nn.functional.softplus(self.prior_scale(request)).squeeze(-1) / math.log(2.)
             residual = residual + (scale - 1.) * prior
+        if return_features:
+            return residual, request, source
         return residual

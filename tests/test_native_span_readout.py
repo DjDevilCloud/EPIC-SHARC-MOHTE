@@ -97,12 +97,17 @@ class NativeSpanReadoutTests(unittest.TestCase):
         model.cfg.native_question_memory_marker_endpoints = True
         model.cfg.native_question_memory_semantic_alignment = True
         model.cfg.native_question_memory_semantic_prior_scaling = True
+        model.cfg.native_question_memory_semantic_decisions = True
+        model.cfg.native_question_memory_conditional_copy = True
+        model.cfg.native_question_memory_stable_span_gate = True
         model.cfg.native_question_memory_lexical_cues = True
         model.cfg.native_question_memory_future_context = 3
         model.cfg.native_question_memory_anchor_words = 2
         model.cfg.freeze_registry_observations = True
         model.registry.observation_updates_enabled = False
-        model.native_question_memory = NativeQuestionMemory(model.cfg.d_model, span_readout=True, lexical_cues=True, future_context=3, anchor_words=2, conditional_endpoints=True, relation_alignment=True, source_roles=True, antecedent_memory=True, owner_evidence=True, marker_endpoints=True, semantic_alignment=True, semantic_prior_scaling=True)
+        model.native_question_memory = NativeQuestionMemory(model.cfg.d_model, span_readout=True, lexical_cues=True, future_context=3, anchor_words=2, conditional_endpoints=True, relation_alignment=True, source_roles=True, antecedent_memory=True, owner_evidence=True, marker_endpoints=True, semantic_alignment=True, semantic_prior_scaling=True, semantic_decisions=True, conditional_copy=True, stable_span_gate=True)
+        nn.init.normal_(model.native_question_memory.semantic_request.weight, std=.03)
+        nn.init.normal_(model.native_question_memory.semantic_source.weight, std=.03)
         nn.init.normal_(model.native_question_memory.semantic_alignment.prior_scale.weight, std=.02)
         nn.init.normal_(model.native_question_memory.semantic_alignment.score[-1].weight, std=.05)
         nn.init.normal_(model.native_question_memory.relation_alignment.output[-1].weight, std=.05)
@@ -119,6 +124,8 @@ class NativeSpanReadoutTests(unittest.TestCase):
             self.assertIsNotNone(loaded.native_question_memory.relation_alignment)
             self.assertIsNotNone(loaded.native_question_memory.source_roles)
             self.assertIsNotNone(loaded.native_question_memory.semantic_alignment)
+            self.assertIsNotNone(loaded.native_question_memory.semantic_request)
+            self.assertTrue(loaded.native_question_memory.span_readout.conditional_copy)
             self.assertIsNotNone(loaded.native_question_memory.span_readout.marker_endpoint)
             self.assertIsNotNone(loaded.native_question_memory.antecedent_memory.context_evidence)
             torch.testing.assert_close(loaded(ids).logits, expected)

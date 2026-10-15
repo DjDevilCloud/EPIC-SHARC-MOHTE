@@ -52,7 +52,7 @@ class NativeQuestionState:
 
 
 class NativeQuestionMemory(nn.Module):
-    def __init__(self, d_model, capacity=128, question_capacity=32, span_readout=False, span_words=16, span_starts=16, lexical_cues=False, future_context=0, anchor_words=0, stable_span_gate=False, matcher='combined_v1', batch_encoders=False, document_context=False, antecedent_memory=False, antecedent_capacity=64, antecedent_query='learned_v1', conditional_endpoints=False, relation_alignment=False, source_roles=False, owner_evidence=False, marker_endpoints=False, semantic_alignment=False, semantic_prior_scaling=False):
+    def __init__(self, d_model, capacity=128, question_capacity=32, span_readout=False, span_words=16, span_starts=16, lexical_cues=False, future_context=0, anchor_words=0, stable_span_gate=False, matcher='combined_v1', batch_encoders=False, document_context=False, antecedent_memory=False, antecedent_capacity=64, antecedent_query='learned_v1', conditional_endpoints=False, relation_alignment=False, source_roles=False, owner_evidence=False, marker_endpoints=False, semantic_alignment=False, semantic_prior_scaling=False, semantic_decisions=False, conditional_copy=False):
         super().__init__()
         if capacity < 1 or question_capacity < 1:
             raise ValueError('Native question memory capacities must be positive.')
@@ -77,7 +77,11 @@ class NativeQuestionMemory(nn.Module):
         if self.request_roles is not None:
             nn.init.zeros_(self.request_roles.weight)
             nn.init.zeros_(self.request_roles.bias)
-        self.span_readout = NativeSpanReadout(d_model, span_words, span_starts, stable_span_gate, conditional_endpoints, marker_endpoints) if span_readout else None
+        if semantic_decisions and not (semantic_alignment and span_readout):
+            raise ValueError('Semantic decisions require semantic alignment and span readout')
+        if conditional_copy and not (span_readout and stable_span_gate):
+            raise ValueError('Conditional copy requires span readout and a stable task gate')
+        self.span_readout = NativeSpanReadout(d_model, span_words, span_starts, stable_span_gate, conditional_endpoints, marker_endpoints, conditional_copy) if span_readout else None
         self.future_context = int(future_context)
         self.anchor_words = int(anchor_words)
         self.future_key = nn.Linear(d_model, d_model, bias=False) if future_context else None
@@ -100,6 +104,11 @@ class NativeQuestionMemory(nn.Module):
         if semantic_prior_scaling and not semantic_alignment:
             raise ValueError('Semantic prior scaling requires semantic alignment')
         self.semantic_alignment = NativeSemanticAlignment(d_model, semantic_prior_scaling) if semantic_alignment else None
+        self.semantic_request = nn.Linear(2 * d_model, d_model, bias=False) if semantic_decisions else None
+        self.semantic_source = nn.Linear(2 * d_model, d_model, bias=False) if semantic_decisions else None
+        if semantic_decisions:
+            nn.init.zeros_(self.semantic_request.weight)
+            nn.init.zeros_(self.semantic_source.weight)
         self.key = nn.Linear(2 * d_model, d_model, bias=False)
         self.value = nn.Linear(d_model, d_model, bias=False)
         self.output = nn.Sequential(nn.Linear(3 * d_model, 2 * d_model), nn.GELU(), nn.Linear(2 * d_model, d_model))
@@ -361,11 +370,19 @@ class NativeQuestionMemory(nn.Module):
                     source_logits = source_logits + self.antecedent_memory.scale * compatibility
                 if self.semantic_alignment is not None:
                     semantic_inputs = self.semantic_alignment.inputs([w for w, _ in state.source], state.question, lexical_embeddings)
-                    source_logits = source_logits + self.semantic_alignment(semantic_inputs, prior=source_logits)
+                    correction, request, source = self.semantic_alignment(semantic_inputs, prior=source_logits, return_features=True)
+                    source_logits = source_logits + correction
                 probabilities = source_logits.softmax(0)
                 recalled = probabilities @ torch.stack(values)
-                plan = self.span_readout.plan(state, tokenizer, question, torch.stack(words), probabilities, source_logits.log_softmax(0), marker_words=query_words) if self.span_readout is not None else None
+                decision_words = torch.stack(words)
+                if self.semantic_request is not None:
+                    # Share the observed-input request with extent, task gating
+                    # and native emission. Zero residuals preserve old features.
+                    question = question + self.semantic_request(request)
+                    decision_words = decision_words + self.semantic_source(source)
+                plan = self.span_readout.plan(state, tokenizer, question, decision_words, probabilities, source_logits.log_softmax(0), marker_words=query_words) if self.span_readout is not None else None
                 if plan is not None:
+                    plan['base_word_vectors'] = torch.stack(words)
                     plan['source_keys'] = keys
                     plan['copy_context'] = recalled
                     if role_scores is not None:

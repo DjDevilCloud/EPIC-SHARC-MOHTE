@@ -11,13 +11,16 @@ except ImportError:
 
 
 class NativeSpanReadout(nn.Module):
-    def __init__(self, width, max_words=16, starts=16, stable_gate=False, conditional_endpoints=False, marker_endpoints=False):
+    def __init__(self, width, max_words=16, starts=16, stable_gate=False, conditional_endpoints=False, marker_endpoints=False, conditional_copy=False):
         super().__init__()
         if max_words < 1 or starts < 1:
             raise ValueError('Native span budgets must be positive.')
         self.max_words = int(max_words)
         self.starts = int(starts)
         self.stable_gate = bool(stable_gate)
+        if conditional_copy and not stable_gate:
+            raise ValueError('Conditional copy requires a stable task gate')
+        self.conditional_copy = bool(conditional_copy)
         self.conditional_endpoints = bool(conditional_endpoints)
         self.endpoint = nn.Sequential(nn.Linear(4 * width + 12, 64), nn.GELU(), nn.Linear(64, 1))
         nn.init.zeros_(self.endpoint[-1].weight)
@@ -136,8 +139,9 @@ class NativeSpanReadout(nn.Module):
     def mix(self, logits, records):
         if not records:
             return logits
-        # Keep non-output positions untouched. Copy support retains its original
-        # plan probability: a low-probability surviving prefix cannot force a span.
+        # Keep non-output positions untouched. Legacy mode retains original
+        # support mass; conditional mode separates task confidence from prefix
+        # uncertainty, with the same stable task gate throughout the answer.
         result = logits.clone()
         for row, position, question, current, plan, emitted in records:
             supported = [(i, c['tokens'][len(emitted)]) for i, c in enumerate(plan['candidates'])
@@ -157,6 +161,10 @@ class NativeSpanReadout(nn.Module):
             if not finite.any():
                 continue
             selected, targets = selected[finite], targets[finite]
+            if self.conditional_copy:
+                # P(next | copying, verified emitted prefix). Rejected spans
+                # express continuation uncertainty, not native-task evidence.
+                selected = selected - selected.logsumexp(0)
             unique, inverse = targets.unique(return_inverse=True)
             maxima = selected.new_full((len(unique),), -torch.inf).scatter_reduce(0, inverse, selected, reduce='amax', include_self=True)
             totals = selected.new_zeros(len(unique)).scatter_add(0, inverse, (selected - maxima[inverse]).exp())
@@ -167,9 +175,11 @@ class NativeSpanReadout(nn.Module):
             context = plan['copy_context'] if self.stable_gate else current
             gate_logit = self.copy_gate(torch.cat((context, question))).squeeze()
             log_gate = F.logsigmoid(gate_logit)
-            # 1 - gate * support = (1 - gate) + gate * unsupported.
+            # Legacy: 1 - gate * support = (1 - gate) + gate * unsupported.
+            # Conditional mode keeps the independent task fallback 1 - gate.
             # Log space preserves native gradients even when sigmoid(gate)
             # rounds to one or the unsupported mass is below float epsilon.
-            log_native = torch.logaddexp(F.logsigmoid(-gate_logit), log_gate + log_unsupported)
+            log_native = (F.logsigmoid(-gate_logit) if self.conditional_copy else
+                          torch.logaddexp(F.logsigmoid(-gate_logit), log_gate + log_unsupported))
             result[row, position] = torch.logaddexp(log_native + logits[row, position].log_softmax(-1), log_gate + log_copy)
         return result
