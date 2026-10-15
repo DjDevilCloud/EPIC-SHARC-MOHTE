@@ -6403,7 +6403,13 @@ class PrismalWaveModel(nn.Module):
         self.native_question_memory = (NativeQuestionMemory(cfg.d_model, cfg.native_question_memory_capacity, cfg.native_question_memory_question_capacity,
                                        cfg.native_question_memory_span_readout, cfg.native_question_memory_span_words, cfg.native_question_memory_span_starts,
                                        cfg.native_question_memory_lexical_cues, cfg.native_question_memory_future_context, cfg.native_question_memory_anchor_words,
-                                       cfg.native_question_memory_stable_span_gate)
+                                       cfg.native_question_memory_stable_span_gate, cfg.native_question_memory_matcher,
+                                       cfg.native_question_memory_batch_encoders, cfg.native_question_memory_document_context,
+                                       cfg.native_question_memory_antecedent_memory, cfg.native_question_memory_antecedent_capacity,
+                                       cfg.native_question_memory_antecedent_query, cfg.native_question_memory_conditional_endpoints,
+                                       cfg.native_question_memory_relation_alignment, cfg.native_question_memory_source_roles,
+                                       cfg.native_question_memory_owner_evidence, cfg.native_question_memory_marker_endpoints,
+                                       cfg.native_question_memory_semantic_alignment, cfg.native_question_memory_semantic_prior_scaling)
                                        if cfg.use_native_question_memory else None)
         self.signature_level_to_id = dict(SIGNATURE_LEVEL_IDS)
         self.signature_relation_to_id = dict(SIGNATURE_RELATION_IDS)

@@ -89,18 +89,38 @@ class NativeSpanReadoutTests(unittest.TestCase):
         _, t, model = RuntimeSignatureTests().setup_model()
         model.cfg.use_native_question_memory = True
         model.cfg.native_question_memory_span_readout = True
+        model.cfg.native_question_memory_conditional_endpoints = True
+        model.cfg.native_question_memory_relation_alignment = True
+        model.cfg.native_question_memory_source_roles = True
+        model.cfg.native_question_memory_antecedent_memory = True
+        model.cfg.native_question_memory_owner_evidence = True
+        model.cfg.native_question_memory_marker_endpoints = True
+        model.cfg.native_question_memory_semantic_alignment = True
+        model.cfg.native_question_memory_semantic_prior_scaling = True
         model.cfg.native_question_memory_lexical_cues = True
         model.cfg.native_question_memory_future_context = 3
         model.cfg.native_question_memory_anchor_words = 2
         model.cfg.freeze_registry_observations = True
         model.registry.observation_updates_enabled = False
-        model.native_question_memory = NativeQuestionMemory(model.cfg.d_model, span_readout=True, lexical_cues=True, future_context=3, anchor_words=2)
+        model.native_question_memory = NativeQuestionMemory(model.cfg.d_model, span_readout=True, lexical_cues=True, future_context=3, anchor_words=2, conditional_endpoints=True, relation_alignment=True, source_roles=True, antecedent_memory=True, owner_evidence=True, marker_endpoints=True, semantic_alignment=True, semantic_prior_scaling=True)
+        nn.init.normal_(model.native_question_memory.semantic_alignment.prior_scale.weight, std=.02)
+        nn.init.normal_(model.native_question_memory.semantic_alignment.score[-1].weight, std=.05)
+        nn.init.normal_(model.native_question_memory.relation_alignment.output[-1].weight, std=.05)
+        nn.init.normal_(model.native_question_memory.source_roles.source[-1].weight, std=.05)
+        nn.init.normal_(model.native_question_memory.span_readout.marker_endpoint[-1].weight, std=.05)
+        nn.init.normal_(model.native_question_memory.antecedent_memory.context_evidence.classifier[-1].weight, std=.05)
         ids = torch.tensor([t.prepare_generation_hierarchy('Context:\nThe apple is red and blue.\nQuestion:\nWhat color is the apple?').token_ids])
         with torch.no_grad(), tempfile.TemporaryDirectory() as directory:
             expected = model(ids).logits
             save_checkpoint(model, directory, tokenizer=t)
             loaded, _, _ = load_bundle_from_checkpoint(Path(directory) / 'model.pt', device='cpu', load_training_state=False)
             loaded.eval()
+            self.assertTrue(loaded.native_question_memory.span_readout.conditional_endpoints)
+            self.assertIsNotNone(loaded.native_question_memory.relation_alignment)
+            self.assertIsNotNone(loaded.native_question_memory.source_roles)
+            self.assertIsNotNone(loaded.native_question_memory.semantic_alignment)
+            self.assertIsNotNone(loaded.native_question_memory.span_readout.marker_endpoint)
+            self.assertIsNotNone(loaded.native_question_memory.antecedent_memory.context_evidence)
             torch.testing.assert_close(loaded(ids).logits, expected)
         memory = model.native_question_memory
         hidden = torch.randn(1, ids.shape[1], model.cfg.d_model)
@@ -135,3 +155,29 @@ class NativeSpanReadoutTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ConditionalEndpointTests(unittest.TestCase):
+    def test_start_mass_offsets_and_endpoint_gradients(self):
+        decoder = NativeSpanReadout(4, conditional_endpoints=True)
+        class Energies(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.values = nn.Parameter(torch.tensor([2., 1., -3.]))
+            def forward(self, features):
+                return self.values[:, None]
+        decoder.endpoint = Energies()
+        candidates = [dict(start=a, end=a, properties=[0.]*12) for a in (0, 0, 1)]
+        question, words = torch.zeros(4), torch.zeros(2, 4)
+        prior = torch.tensor([.7, .3]).log()
+        scores = decoder.score_candidates(candidates, question, words, prior)
+        torch.testing.assert_close(scores.exp()[:2].sum(), prior[0].exp())
+        torch.testing.assert_close(scores.exp()[2], prior[1].exp())
+        (-scores[0]).backward()
+        self.assertLess(float(decoder.endpoint.values.grad[0]), 0.)
+        self.assertGreater(float(decoder.endpoint.values.grad[1]), 0.)
+        with torch.no_grad():
+            decoder.endpoint.values[:2] += 100.
+        torch.testing.assert_close(decoder.score_candidates(candidates, question, words, prior), scores.detach(), atol=1e-5, rtol=1e-5)
+        decoder.conditional_endpoints = False
+        torch.testing.assert_close(decoder.score_candidates(candidates, question, words, prior), prior[torch.tensor([0,0,1])] + decoder.endpoint.values)

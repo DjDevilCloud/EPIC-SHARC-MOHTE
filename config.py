@@ -45,6 +45,19 @@ class PrismalWaveConfig:
     native_question_memory_question_capacity: int = 32
     native_question_memory_span_readout: bool = False
     native_question_memory_stable_span_gate: bool = False
+    native_question_memory_conditional_endpoints: bool = False
+    native_question_memory_relation_alignment: bool = False
+    native_question_memory_source_roles: bool = False
+    native_question_memory_owner_evidence: bool = False
+    native_question_memory_marker_endpoints: bool = False
+    native_question_memory_semantic_alignment: bool = False
+    native_question_memory_semantic_prior_scaling: bool = False
+    native_question_memory_matcher: str = 'combined_v1'
+    native_question_memory_batch_encoders: bool = False
+    native_question_memory_document_context: bool = False
+    native_question_memory_antecedent_memory: bool = False
+    native_question_memory_antecedent_capacity: int = 64
+    native_question_memory_antecedent_query: str = 'learned_v1'
     native_question_memory_span_words: int = 16
     native_question_memory_span_starts: int = 16
     native_question_memory_lexical_cues: bool = False
@@ -399,6 +412,22 @@ class PrismalWaveConfig:
             raise ValueError('Native span readout requires native question memory')
         if self.native_question_memory_stable_span_gate and not self.native_question_memory_span_readout:
             raise ValueError('Stable native span gating requires native span readout')
+        if self.native_question_memory_conditional_endpoints and not self.native_question_memory_span_readout:
+            raise ValueError('Conditional native endpoints require native span readout')
+        if self.native_question_memory_relation_alignment and (not self.use_native_question_memory or self.native_question_memory_matcher != 'combined_v1'):
+            raise ValueError('Native relation alignment requires native memory with the combined base matcher')
+        if self.native_question_memory_source_roles and (not self.use_native_question_memory or self.native_question_memory_matcher != 'combined_v1'):
+            raise ValueError('Native source roles require native memory with the combined base matcher')
+        if self.native_question_memory_owner_evidence and (not self.use_native_question_memory or not self.native_question_memory_antecedent_memory):
+            raise ValueError('Native owner evidence requires the native antecedent bank')
+        if self.native_question_memory_semantic_alignment and not self.use_native_question_memory:
+            raise ValueError('Native semantic alignment requires native question memory')
+        if self.native_question_memory_semantic_prior_scaling and not self.native_question_memory_semantic_alignment:
+            raise ValueError('Semantic prior scaling requires semantic alignment')
+        if self.native_question_memory_marker_endpoints and not self.native_question_memory_span_readout:
+            raise ValueError('Native marker endpoints require native span readout')
+        if self.native_question_memory_matcher not in {'combined_v1', 'owner_relation_v1'}:
+            raise ValueError('Unknown native question/source matcher')
         if self.native_question_memory_future_context < 0 or self.native_question_memory_anchor_words < 0:
             raise ValueError('Native future-context window must be nonnegative')
         if self.use_bounded_identity_readout and self.signature_representation not in {'compositional_v2','compositional_v3'}:

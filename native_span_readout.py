@@ -3,6 +3,7 @@ import math
 from collections import OrderedDict
 import torch
 from torch import nn
+import torch.nn.functional as F
 try:
     from .source_answer_span import CompleteAnswerSpanPredictor
 except ImportError:
@@ -10,16 +11,24 @@ except ImportError:
 
 
 class NativeSpanReadout(nn.Module):
-    def __init__(self, width, max_words=16, starts=16, stable_gate=False):
+    def __init__(self, width, max_words=16, starts=16, stable_gate=False, conditional_endpoints=False, marker_endpoints=False):
         super().__init__()
         if max_words < 1 or starts < 1:
             raise ValueError('Native span budgets must be positive.')
         self.max_words = int(max_words)
         self.starts = int(starts)
         self.stable_gate = bool(stable_gate)
+        self.conditional_endpoints = bool(conditional_endpoints)
         self.endpoint = nn.Sequential(nn.Linear(4 * width + 12, 64), nn.GELU(), nn.Linear(64, 1))
         nn.init.zeros_(self.endpoint[-1].weight)
         nn.init.zeros_(self.endpoint[-1].bias)
+        self.marker_query = nn.Linear(width, 1) if marker_endpoints else None
+        self.marker_endpoint = nn.Sequential(nn.Linear(2 * width + 8, 2 * width), nn.GELU(), nn.Linear(2 * width, 1)) if marker_endpoints else None
+        if self.marker_endpoint is not None:
+            nn.init.zeros_(self.marker_query.weight)
+            nn.init.zeros_(self.marker_query.bias)
+            nn.init.zeros_(self.marker_endpoint[-1].weight)
+            nn.init.zeros_(self.marker_endpoint[-1].bias)
         self.copy_gate = nn.Linear(2 * width, 1)
         nn.init.zeros_(self.copy_gate.weight)
         nn.init.constant_(self.copy_gate.bias, -8.)
@@ -77,25 +86,52 @@ class NativeSpanReadout(nn.Module):
                                     float(any(u.render in {'$', '+', '-'} for u in prefix)),
                                     float(any(u.render in {'"', "'", '('} for u in prefix)),
                                     float(numeric_join), float(len(last_text) == 1 and last_text.isalpha() and next_unit is not None and next_unit.render == '.'), float(next_case), float(start_join))
-                        result.append(dict(start=start, end=end, text=text, tokens=self._payloads[cache_key], properties=features))
+                        suffix = [unit(p) for p in range(stop, finish)]
+                        markers = (float(any(u.render in {'%', '‰'} for u in suffix)),
+                                   float(next_unit is not None and next_unit.render in {'%', '‰'}),
+                                   float(any(u.render in {'.', '!', '?'} for u in suffix)),
+                                   float(any(u.render in {')', ']', '}', '"', "'"} for u in suffix)),
+                                   float(any(u.render in {'$', '€', '£', '¥'} for u in prefix)),
+                                   float(unit(stop - 1).kind == 'digit'), float(numeric_join), float(start_join))
+                        result.append(dict(start=start, end=end, text=text, tokens=self._payloads[cache_key], properties=features, marker_properties=markers))
         self._candidates[key] = result
         if len(self._candidates) > 16:
             self._candidates.popitem(last=False)
         return result
 
-    def plan(self, state, tokenizer, question, word_vectors, start_probabilities, start_log_probabilities):
+    def plan(self, state, tokenizer, question, word_vectors, start_probabilities, start_log_probabilities, marker_words=None):
         selected = start_probabilities.detach().topk(min(len(state.source), self.starts)).indices.cpu().tolist()
         candidates = self.candidates(state, tokenizer, selected)
         if not candidates:
             return None
+        logits = self.score_candidates(candidates, question, word_vectors, start_log_probabilities, marker_words=marker_words)
+        return dict(candidates=candidates, probabilities=logits.softmax(0), log_probabilities=logits.log_softmax(0), source_words=[word for word, _ in state.source], start_log_probabilities=start_log_probabilities, word_vectors=word_vectors, marker_words=marker_words)
+
+    def score_candidates(self, candidates, question, word_vectors, start_log_probabilities, marker_words=None):
+        """One scorer for inferred spans and explicit training/diagnostic labels."""
         starts = torch.tensor([c['start'] for c in candidates], device=question.device)
         ends = torch.tensor([c['end'] for c in candidates], device=question.device)
         prefix = torch.cat((word_vectors.new_zeros(1, word_vectors.shape[1]), word_vectors.cumsum(0)))
         means = (prefix[ends + 1] - prefix[starts]) / (ends - starts + 1)[:, None]
         properties = question.new_tensor([c['properties'] for c in candidates])
         features = torch.cat((question.expand(len(candidates), -1), word_vectors[starts], word_vectors[ends], means, properties), -1)
-        logits = start_log_probabilities[starts] + self.endpoint(features).squeeze(-1)
-        return dict(candidates=candidates, probabilities=logits.softmax(0), log_probabilities=logits.log_softmax(0), source_words=[word for word, _ in state.source], start_log_probabilities=start_log_probabilities)
+        energies = self.endpoint(features).squeeze(-1)
+        if self.marker_endpoint is not None:
+            if marker_words is None:
+                raise ValueError('Marker endpoint scoring requires complete question-word features')
+            cue = self.marker_query(marker_words).squeeze(-1).softmax(0) @ marker_words
+            markers = question.new_tensor([c.get('marker_properties', (0.,) * 8) for c in candidates])
+            energies = energies + self.marker_endpoint(torch.cat((question.expand(len(candidates), -1), cue.expand(len(candidates), -1), markers), -1)).squeeze(-1)
+        if self.conditional_endpoints:
+            # Endpoint supervision is conditional on a source start. Its arbitrary
+            # per-start energy offset must not override the learned start prior.
+            normalizers = torch.zeros_like(energies)
+            for start in starts.unique():
+                mask = starts == start
+                normalizers[mask] = energies[mask].logsumexp(0)
+            energies = energies - normalizers
+        logits = start_log_probabilities[starts] + energies
+        return logits
 
     def mix(self, logits, records):
         if not records:
@@ -110,11 +146,30 @@ class NativeSpanReadout(nn.Module):
                 continue
             indices = torch.tensor([i for i, _ in supported], device=logits.device)
             targets = torch.tensor([token for _, token in supported], device=logits.device)
-            mass = plan['probabilities'][indices]
-            support = mass.sum()
-            copy = logits.new_zeros(logits.shape[-1]).scatter_add(0, targets, mass) / support.clamp_min(1e-12)
+            log_weights = plan.get('log_probabilities')
+            if log_weights is None:
+                weights = plan['probabilities']
+                positive = weights > 0
+                log_weights = weights.new_full(weights.shape, -torch.inf)
+                log_weights[positive] = weights[positive].log()
+            selected = log_weights[indices]
+            finite = torch.isfinite(selected)
+            if not finite.any():
+                continue
+            selected, targets = selected[finite], targets[finite]
+            unique, inverse = targets.unique(return_inverse=True)
+            maxima = selected.new_full((len(unique),), -torch.inf).scatter_reduce(0, inverse, selected, reduce='amax', include_self=True)
+            totals = selected.new_zeros(len(unique)).scatter_add(0, inverse, (selected - maxima[inverse]).exp())
+            log_copy = logits.new_full((logits.shape[-1],), -torch.inf).scatter(0, unique, maxima + totals.log())
+            unsupported = torch.ones(len(log_weights), dtype=torch.bool, device=logits.device)
+            unsupported[indices] = False
+            log_unsupported = log_weights[unsupported].logsumexp(0) if unsupported.any() else logits.new_tensor(-torch.inf)
             context = plan['copy_context'] if self.stable_gate else current
-            gate = self.copy_gate(torch.cat((context, question))).sigmoid().squeeze() * support
-            distribution = (1 - gate) * logits[row, position].softmax(-1) + gate * copy
-            result[row, position] = distribution.clamp_min(1e-12).log()
+            gate_logit = self.copy_gate(torch.cat((context, question))).squeeze()
+            log_gate = F.logsigmoid(gate_logit)
+            # 1 - gate * support = (1 - gate) + gate * unsupported.
+            # Log space preserves native gradients even when sigmoid(gate)
+            # rounds to one or the unsupported mass is below float epsilon.
+            log_native = torch.logaddexp(F.logsigmoid(-gate_logit), log_gate + log_unsupported)
+            result[row, position] = torch.logaddexp(log_native + logits[row, position].log_softmax(-1), log_gate + log_copy)
         return result
