@@ -49,15 +49,55 @@ class NativeQuestionState:
     source_ordinals: list = field(default_factory=list)
     source_seen: int = 0
     next_word_case: bool = False
+    source_vectors: list = field(default_factory=list)
+    source_summaries: list = field(default_factory=list)
+    source_segments: list = field(default_factory=list)
+    source_lines: list = field(default_factory=list)
+    question_vectors: list = field(default_factory=list)
+    pending_vector: object = None
+    header_vector: object = None
+    source_tail: object = None
+    request_vector: object = None
+    segment: int = 0
+    line: int = 0
+    context_generation: object = None
+    input_blocks: int = 0
+    input_block_open: bool = False
+    input_complete: bool = False
+    period_pending: bool = False
+    period_left: str = ''
+    period_left_case: bool = False
+    period_separated: bool = False
+    last_word_surface: str = ''
+    last_word_case: bool = False
 
 
 class NativeQuestionMemory(nn.Module):
-    def __init__(self, d_model, capacity=128, question_capacity=32, span_readout=False, span_words=16, span_starts=16, lexical_cues=False, future_context=0, anchor_words=0, stable_span_gate=False, matcher='combined_v1', batch_encoders=False, document_context=False, antecedent_memory=False, antecedent_capacity=64, antecedent_query='learned_v1', conditional_endpoints=False, relation_alignment=False, source_roles=False, owner_evidence=False, marker_endpoints=False, semantic_alignment=False, semantic_prior_scaling=False, semantic_decisions=False, conditional_copy=False):
+    def __init__(self, d_model, capacity=128, question_capacity=32, span_readout=False, span_words=16, span_starts=16, lexical_cues=False, future_context=0, anchor_words=0, stable_span_gate=False, matcher='combined_v1', batch_encoders=False, document_context=False, antecedent_memory=False, antecedent_capacity=64, antecedent_query='learned_v1', conditional_endpoints=False, relation_alignment=False, source_roles=False, owner_evidence=False, marker_endpoints=False, semantic_alignment=False, semantic_prior_scaling=False, semantic_decisions=False, conditional_copy=False, semantic_structure=False, question_attention=False, normalized_fusion=False, fusion_experts='legacy_semantic_v1', question_attention_stage='post_context', representation='legacy_gru_v1', backbone_context='completed_line_v1', copy_context='retrieved_v1', framing='legacy', events='legacy'):
         super().__init__()
         if capacity < 1 or question_capacity < 1:
             raise ValueError('Native question memory capacities must be positive.')
         self.capacity = int(capacity)
         self.question_capacity = int(question_capacity)
+        if representation not in {'legacy_gru_v1','backbone_context_v1'}:
+            raise ValueError('Unknown native question representation')
+        if representation == 'backbone_context_v1' and (not span_readout or semantic_alignment or semantic_prior_scaling or semantic_decisions):
+            raise ValueError('Backbone representation requires spans and replaces the independent semantic encoder')
+        self.representation = representation
+        if framing not in {'legacy','blocks_v1'} or events not in {'legacy','causal_clause_v2'}:
+            raise ValueError('Unknown native input framing or event policy')
+        if (framing != 'legacy' or events != 'legacy') and representation != 'backbone_context_v1':
+            raise ValueError('Explicit native framing/events require backbone observations')
+        self.framing = framing
+        self.events = events
+        if backbone_context not in {'completed_line_v1','candidate_local_clause_v1'}:
+            raise ValueError('Unknown native backbone key context policy')
+        if backbone_context != 'completed_line_v1' and representation != 'backbone_context_v1':
+            raise ValueError('Candidate-local context requires the backbone native representation')
+        self.backbone_context = backbone_context
+        if copy_context != 'retrieved_v1' and representation != 'backbone_context_v1':
+            raise ValueError('Observed copy confidence requires the backbone native representation')
+        self.copy_context = copy_context
         if matcher not in {'combined_v1', 'owner_relation_v1'}:
             raise ValueError('Unknown native question/source matcher')
         self.matcher = matcher
@@ -66,7 +106,7 @@ class NativeQuestionMemory(nn.Module):
             raise ValueError('Native owner evidence requires the antecedent bank')
         if marker_endpoints and not span_readout:
             raise ValueError('Native marker endpoints require span readout')
-        self.antecedent_memory = NativeAntecedentMemory(d_model, antecedent_capacity, identity_query=antecedent_query, context_evidence=owner_evidence) if antecedent_memory else None
+        self.antecedent_memory = NativeAntecedentMemory(d_model, antecedent_capacity, identity_query=antecedent_query, context_evidence=owner_evidence, contextual_policy=events) if antecedent_memory else None
         # Reuse the ordered context encoder across sentence boundaries. A
         # bounded recurrent summary survives occurrence eviction; exact source
         # identities and span surfaces stay in their existing bounded channels.
@@ -81,7 +121,7 @@ class NativeQuestionMemory(nn.Module):
             raise ValueError('Semantic decisions require semantic alignment and span readout')
         if conditional_copy and not (span_readout and stable_span_gate):
             raise ValueError('Conditional copy requires span readout and a stable task gate')
-        self.span_readout = NativeSpanReadout(d_model, span_words, span_starts, stable_span_gate, conditional_endpoints, marker_endpoints, conditional_copy) if span_readout else None
+        self.span_readout = NativeSpanReadout(d_model, span_words, span_starts, stable_span_gate, conditional_endpoints, marker_endpoints, conditional_copy, copy_context) if span_readout else None
         self.future_context = int(future_context)
         self.anchor_words = int(anchor_words)
         self.future_key = nn.Linear(d_model, d_model, bias=False) if future_context else None
@@ -91,9 +131,9 @@ class NativeQuestionMemory(nn.Module):
         self.previous_key = nn.Linear(d_model, d_model, bias=False) if lexical_cues else None
         if self.previous_key is not None:
             nn.init.zeros_(self.previous_key.weight)
-        self.word_encoder = nn.GRU(d_model, d_model, batch_first=True)
-        self.context_encoder = nn.GRU(d_model, d_model, batch_first=True)
-        self.question_encoder = nn.GRU(d_model, d_model, batch_first=True)
+        self.word_encoder = nn.GRU(d_model, d_model, batch_first=True) if representation == 'legacy_gru_v1' else None
+        self.context_encoder = nn.GRU(d_model, d_model, batch_first=True) if representation == 'legacy_gru_v1' else None
+        self.question_encoder = nn.GRU(d_model, d_model, batch_first=True) if representation == 'legacy_gru_v1' else None
         self.query = nn.Linear(d_model, d_model, bias=False)
         if relation_alignment and matcher != 'combined_v1':
             raise ValueError('Native relation alignment requires the combined base matcher')
@@ -103,7 +143,9 @@ class NativeQuestionMemory(nn.Module):
         self.source_roles = NativeSourceRole(d_model) if source_roles else None
         if semantic_prior_scaling and not semantic_alignment:
             raise ValueError('Semantic prior scaling requires semantic alignment')
-        self.semantic_alignment = NativeSemanticAlignment(d_model, semantic_prior_scaling) if semantic_alignment else None
+        if any((semantic_structure, question_attention, normalized_fusion)) and not semantic_alignment:
+            raise ValueError('Semantic experiment features require semantic alignment')
+        self.semantic_alignment = NativeSemanticAlignment(d_model, semantic_prior_scaling, semantic_structure, question_attention, normalized_fusion, fusion_experts, question_attention_stage) if semantic_alignment else None
         self.semantic_request = nn.Linear(2 * d_model, d_model, bias=False) if semantic_decisions else None
         self.semantic_source = nn.Linear(2 * d_model, d_model, bias=False) if semantic_decisions else None
         if semantic_decisions:
@@ -116,15 +158,23 @@ class NativeQuestionMemory(nn.Module):
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
 
-    def _store_word(self, state, word, positions=(), complete=True, properties=(0., 0., 0., 0.)):
+    def _store_word(self, state, word, positions=(), complete=True, properties=(0., 0., 0., 0.), contextual=None):
         if state.mode == 'source':
             state.cached_packet = None
             before = tuple(state.anchors[:max(0, state.clause_seen - len(state.clause))] + state.clause)
             state.source.append((word, before))
             state.source = state.source[-self.capacity:]
+            if self.representation == 'backbone_context_v1':
+                if contextual is None:
+                    raise ValueError('Backbone word observation requires its aligned contextual state')
+                state.source_vectors = (state.source_vectors + [contextual])[-self.capacity:]
+                state.source_summaries = (state.source_summaries + [contextual])[-self.capacity:]
+                state.source_segments = (state.source_segments + [state.segment])[-self.capacity:]
+                state.source_lines = (state.source_lines + [state.line])[-self.capacity:]
+                state.source_tail = contextual
             if self.antecedent_memory is not None:
-                self.antecedent_memory.observe(state, word, properties)
-            if self.document_key is not None:
+                self.antecedent_memory.observe(state, word, properties, contextual=contextual)
+            if self.document_key is not None and self.representation == 'legacy_gru_v1':
                 state.document_pending.append(word)
             if self.span_readout is not None:
                 state.source_ranges.append((positions[0], positions[-1] + 1, complete))
@@ -136,36 +186,75 @@ class NativeQuestionMemory(nn.Module):
         elif state.mode == 'question':
             state.cached_packet = None
             state.question = (state.question + [word])[-self.question_capacity:]
+            if self.representation == 'backbone_context_v1':
+                if contextual is None:
+                    raise ValueError('Backbone question word requires an aligned contextual state')
+                state.question_vectors = (state.question_vectors + [contextual])[-self.question_capacity:]
+
+    def _complete_source_context(self, state, contextual):
+        if self.representation == 'backbone_context_v1' and contextual is not None:
+            contextual = self._observed_vector(contextual)
+            state.source_summaries = [contextual if s == state.line else v
+                                      for s,v in zip(state.source_lines,state.source_summaries)]
+            state.source_tail = contextual
+            state.line += 1
+
+    @staticmethod
+    def _observed_vector(contextual):
+        # Inference state must not pin an entire prefill tensor through a word
+        # view. Training deliberately keeps the live graph for backbone learning.
+        return contextual if torch.is_grad_enabled() else contextual.clone()
 
     def _restore_header_word(self, state):
         if state.header_word:
-            self._store_word(state, state.header_word, state.header_positions)
+            self._store_word(state, state.header_word, state.header_positions, contextual=state.header_vector)
         state.header = ''
         state.header_word = ()
         state.header_positions = ()
+        state.header_vector = None
 
     def _flush(self, state, tokenizer):
         if not state.pending:
             return
         word = tuple(state.pending)
         positions = tuple(state.pending_positions)
+        contextual = state.pending_vector
+        state.pending_vector = None
         complete = state.pending_count <= 64
         state.pending = []
         state.pending_positions = []
         state.pending_count = 0
         surface = tokenizer.decode(list(word), clean_text=False, collapse_structure=False)
         text = surface.casefold()
-        if state.line_start and text in {'question', 'context'}:
+        if self.events == 'causal_clause_v2' and state.mode == 'source':
+            if state.period_pending:
+                decimal = state.period_left.isdigit() and surface.isdigit() and not state.period_separated
+                initial = (len(state.period_left) == 1 and state.period_left.isalpha() and state.period_left_case
+                           and bool(state.next_word_case or surface[:1].isupper()))
+                if not (decimal or initial):
+                    self._clause_boundary(state)
+                state.period_pending = False
+            state.last_word_surface = surface
+            state.last_word_case = bool(state.next_word_case or surface[:1].isupper())
+        if self.framing == 'legacy' and state.line_start and text in {'question', 'context'}:
             state.header = text
             state.header_word = word
             state.header_positions = positions
+            state.header_vector = contextual
         else:
             properties = (min(len(surface), 32) / 32., float(state.next_word_case or bool(surface[:1].isupper())), float(any(c.isdigit() for c in surface)), min(len(word), 16) / 16.)
-            self._store_word(state, word, positions, complete, properties)
+            self._store_word(state, word, positions, complete, properties, contextual)
         state.next_word_case = False
         state.line_start = False
 
-    def _observe(self, state, token, tokenizer):
+    @staticmethod
+    def _clause_boundary(state):
+        state.segment += 1
+        state.clause = []
+        state.anchors = []
+        state.clause_seen = 0
+
+    def _observe(self, state, token, tokenizer, contextual=None):
         if token == tokenizer.pad_id:
             return state, False
         if state.emitted and state.emitted[-1] == tokenizer.special_tokens['<EOO>']:
@@ -183,20 +272,45 @@ class NativeQuestionMemory(nn.Module):
             elif not state.emission_invalid:
                 state.emitted = state.emitted + (token,)
         if token == tokenizer.bos_id or text == '<BOI>':
-            state = NativeQuestionState(mode='source')
+            state = NativeQuestionState(mode='outside' if self.framing == 'blocks_v1' else 'source')
         position = state.position
-        if self.span_readout is not None and state.mode in {'source', 'question'}:
+        if self.span_readout is not None and (state.mode in {'source', 'question'} or self.framing == 'blocks_v1' and not state.input_complete):
             state.surface.append((position, token))
             if len(state.surface) > self.capacity * 80:
                 del state.surface[:-self.capacity * 80]
             state.position += 1
         if token == tokenizer.bos_id or text == '<BOI>':
             pass  # Reset above, before recording this input boundary.
+        elif self.framing == 'blocks_v1' and text in {'<BOP>','<EOP>'} and not state.input_complete:
+            self._flush(state, tokenizer)
+            if text == '<BOP>':
+                if state.input_block_open or state.input_blocks >= 2:
+                    raise ValueError('Native QA requires exactly two input blocks')
+                state.input_blocks += 1
+                state.input_block_open = True
+                state.mode = 'source' if state.input_blocks == 1 else 'question'
+                state.has_question = state.input_blocks == 2
+                state.line_start = True
+            else:
+                if not state.input_block_open:
+                    raise ValueError('Native QA input block is not open')
+                if state.mode == 'source':
+                    self._complete_source_context(state, contextual)
+                state.input_block_open = False
+                state.mode = 'outside'
         elif text == '<EOI>':
+            if self.framing == 'blocks_v1':
+                if state.input_blocks != 2 or state.input_block_open:
+                    raise ValueError('Native QA requires closed source and question blocks before EOI')
+                state.input_complete = True
             self._flush(state, tokenizer)
             self._restore_header_word(state)
+            if self.representation == 'backbone_context_v1' and state.has_question:
+                state.request_vector = self._observed_vector(contextual)
             state.mode = 'outside'
         elif text == '<BOO>':
+            if self.framing == 'blocks_v1' and not state.input_complete:
+                raise ValueError('Native QA output requires a complete framed input')
             self._flush(state, tokenizer)
             self._restore_header_word(state)
             state.mode = 'outside'
@@ -211,12 +325,17 @@ class NativeQuestionMemory(nn.Module):
         elif token == tokenizer.eos_id:
             state.emitting = False
             state.mode = 'outside'
+        elif (self.framing == 'blocks_v1' and not state.input_complete and state.mode == 'outside'
+              and tokenizer.construction_units[token].is_lexical):
+            raise ValueError('Native QA text must be inside source or question blocks')
         elif state.mode in {'source', 'question'}:
             if tokenizer.construction_units[token].is_lexical:
                 self._restore_header_word(state)
                 state.pending = (state.pending + [token])[-64:]
                 state.pending_positions = (state.pending_positions + [position])[-64:]
                 state.pending_count += 1
+                if self.representation == 'backbone_context_v1':
+                    state.pending_vector = self._observed_vector(contextual)
             else:
                 self._flush(state, tokenizer)
                 if tokenizer.construction_units[token].kind == 'case':
@@ -224,17 +343,43 @@ class NativeQuestionMemory(nn.Module):
                 surface = tokenizer.decode([token], clean_text=False, collapse_structure=False)
                 if ':' in surface and state.header:
                     if state.header == 'question':
+                        self._complete_source_context(state,state.source_tail)
                         state.mode = 'question'
                         state.has_question = True
                         state.question = []
+                        state.question_vectors = []
                         state.cached_packet = None
                     else:
                         state.mode = 'source'
                     state.header = ''
                     state.header_word = ()
                     state.header_positions = ()
-                if any(char in surface for char in '.!?\n'):
+                    state.header_vector = None
+                boundary = any(char in surface for char in '.!?\n')
+                if self.events == 'causal_clause_v2' and state.mode == 'source':
+                    # Resolve an ambiguous period only when the next word is
+                    # observed. No later word changes any earlier source state.
+                    if surface == '.':
+                        if state.period_pending:
+                            self._clause_boundary(state)
+                        state.period_pending = True
+                        state.period_left = state.last_word_surface
+                        state.period_left_case = state.last_word_case
+                        state.period_separated = False
+                        boundary = False
+                    elif any(char in surface for char in '!?\n;'):
+                        state.period_pending = False
+                        boundary = True
+                    elif state.period_pending and any(char.isspace() for char in surface):
+                        state.period_separated = True
+                if boundary:
                     self._restore_header_word(state)
+                    if state.mode == 'source':
+                        if '\n' in surface:
+                            self._complete_source_context(state, contextual)
+                        if self.representation == 'backbone_context_v1':
+                            state.source_tail = self._observed_vector(contextual)
+                        state.segment += 1
                     state.clause = []
                     state.anchors = []
                     state.clause_seen = 0
@@ -242,12 +387,81 @@ class NativeQuestionMemory(nn.Module):
                     state.line_start = True
         return state, state.emitting and bool(state.source) and bool(state.question)
 
-    def forward(self, input_ids, hidden, lexical_embeddings, tokenizer, states=None, return_attention=False, return_readout=False):
+    def score_sources(self, question, legacy_logits, semantic_inputs):
+        """Single source-score implementation shared by fitting and inference."""
+        if self.semantic_alignment is None:
+            return dict(legacy=legacy_logits, semantic=None, fused=legacy_logits)
+        return self.semantic_alignment.score_details(semantic_inputs, legacy_logits, question)
+
+    def score_sources_many(self, questions, legacy_logits, semantic_inputs):
+        """Batch frozen input features through the same source scoring rule."""
+        if not (len(questions)==len(legacy_logits)==len(semantic_inputs)):
+            raise ValueError('Source batches must have aligned inputs')
+        if self.semantic_alignment is None:
+            return [self.score_sources(q,p,x) for q,p,x in zip(questions,legacy_logits,semantic_inputs)]
+        encoded=self.semantic_alignment.encode_many(semantic_inputs)
+        return [self.semantic_alignment.score_details(x,p,q,e) for q,p,x,e in zip(questions,legacy_logits,semantic_inputs,encoded)]
+
+    def decision_packet(self, question, word_vectors, values, legacy_logits, marker_words,
+                        semantic_inputs, candidates_for_starts=None, source_words=None,
+                        diagnostics=False):
+        """Shared live/cached decision path. Inputs contain observed, frozen features only."""
+        original_question = question
+        details = self.score_sources(question, legacy_logits, semantic_inputs)
+        source_logits = details['fused']
+        probabilities = source_logits.softmax(0)
+        recalled = probabilities @ values
+        decision_words = word_vectors
+        if self.semantic_request is not None:
+            question = question + self.semantic_request(details['request'])
+            decision_words = decision_words + self.semantic_source(details['source'])
+        plan = None
+        if self.span_readout is not None and candidates_for_starts is not None:
+            selected = probabilities.detach().topk(min(len(probabilities), self.span_readout.starts)).indices.tolist()
+            candidates = candidates_for_starts(selected)
+            if candidates:
+                logits = self.span_readout.score_candidates(candidates, question, decision_words,
+                                                           source_logits.log_softmax(0), marker_words)
+                plan = dict(candidates=candidates, probabilities=logits.softmax(0),
+                            log_probabilities=logits.log_softmax(0), source_words=source_words,
+                            start_log_probabilities=source_logits.log_softmax(0),
+                            word_vectors=decision_words, base_word_vectors=word_vectors,
+                            marker_words=marker_words, copy_context=recalled,
+                            legacy_question=original_question, legacy_start_logits=legacy_logits,
+                            semantic_inputs=semantic_inputs, selected_starts=selected)
+                if self.copy_context == 'observed_mean_v1':
+                    # Observed document support, independent of source ranking,
+                    # proposal selection, endpoint scores and emitted prefixes.
+                    plan['copy_gate_context'] = values.mean(0)
+                if diagnostics:
+                    plan['diagnostics'] = dict(legacy_start_logits=legacy_logits.detach(),
+                        semantic_start_logits=None if details['semantic'] is None else details['semantic'].detach(),
+                        fused_start_logits=source_logits.detach(), shortlist=selected,
+                        endpoint_probabilities=logits.softmax(0).detach())
+        return question, recalled, probabilities, plan
+
+    def guide_readout(self, current, question, recalled, apply_residual=True):
+        """Shared observed-plan guidance for live and cached adapter execution."""
+        if isinstance(apply_residual,bool) and not apply_residual:
+            return current
+        question = question.expand_as(current)
+        recalled = recalled.expand_as(current)
+        gate = self.gate(torch.cat((current,question),-1)).sigmoid()
+        guided = current + gate * self.output(torch.cat((current,question,recalled),-1))
+        if isinstance(apply_residual,bool):
+            return guided
+        return torch.where(apply_residual.bool()[...,None],guided,current)
+
+    def forward(self, input_ids, hidden, lexical_embeddings, tokenizer, states=None, return_attention=False, return_readout=False, diagnostics=False, context_generation=None):
         if tokenizer is None:
             raise ValueError('Native question memory requires the checkpoint tokenizer.')
         batch, length, width = hidden.shape
         if states is not None and len(states) != batch:
             raise ValueError('Native question state batch size must match input tokens.')
+        context_generation=context_generation if context_generation is not None else (id(self),0,self.backbone_context,self.copy_context,self.framing,self.events)
+        if self.representation=='backbone_context_v1' and states is not None:
+            if any(state.source_vectors and state.context_generation!=context_generation for state in states):
+                raise ValueError('Native backbone context is stale or belongs to another producer')
         next_states = []
         outputs = []
         word_cache = {}
@@ -263,6 +477,8 @@ class NativeQuestionMemory(nn.Module):
             return word_cache[word]
 
         def advance_document(state):
+            if self.representation == 'backbone_context_v1':
+                return
             if not state.document_pending:
                 return
             if self.batch_encoders:
@@ -278,8 +494,22 @@ class NativeQuestionMemory(nn.Module):
 
         def packet(state):
             cacheable = not self.training and not torch.is_grad_enabled()
-            if cacheable and state.cached_packet is not None and state.cached_packet[0].device == hidden.device and state.cached_packet[0].dtype == hidden.dtype:
+            if cacheable and state.cached_packet is not None and state.cached_packet[0].device == hidden.device and state.cached_packet[0].dtype == hidden.dtype and (not diagnostics or state.cached_packet[3] is None or 'diagnostics' in state.cached_packet[3]):
                 return state.cached_packet
+            if self.representation == 'backbone_context_v1':
+                try:
+                    from .native_backbone_readout import contextual_plan
+                except ImportError:
+                    from native_backbone_readout import contextual_plan
+                # Request tensor identity scopes this cache to actual backbone
+                # observations, including repeated QA blocks with identical text.
+                request = state.request_vector if state.request_vector is not None else state.question_vectors[-1]
+                if request not in packet_cache:
+                    packet_cache[request] = contextual_plan(self,state,tokenizer,diagnostics)
+                result = packet_cache[request]
+                if cacheable:
+                    state.cached_packet = result
+                return result
             identity = (tuple(state.source), tuple(state.question), tuple(state.surface) if self.span_readout is not None else (), tuple(state.document_contexts), tuple(state.antecedents), tuple(state.source_ordinals))
             if identity not in packet_cache:
                 if self.batch_encoders:
@@ -368,19 +598,16 @@ class NativeQuestionMemory(nn.Module):
                 if self.antecedent_memory is not None:
                     compatibility, antecedent = self.antecedent_memory.access(state, state.question, word_vector, self.context_encoder, self.encode_sequences)
                     source_logits = source_logits + self.antecedent_memory.scale * compatibility
+                semantic_inputs = None
                 if self.semantic_alignment is not None:
                     semantic_inputs = self.semantic_alignment.inputs([w for w, _ in state.source], state.question, lexical_embeddings)
-                    correction, request, source = self.semantic_alignment(semantic_inputs, prior=source_logits, return_features=True)
-                    source_logits = source_logits + correction
-                probabilities = source_logits.softmax(0)
-                recalled = probabilities @ torch.stack(values)
-                decision_words = torch.stack(words)
-                if self.semantic_request is not None:
-                    # Share the observed-input request with extent, task gating
-                    # and native emission. Zero residuals preserve old features.
-                    question = question + self.semantic_request(request)
-                    decision_words = decision_words + self.semantic_source(source)
-                plan = self.span_readout.plan(state, tokenizer, question, decision_words, probabilities, source_logits.log_softmax(0), marker_words=query_words) if self.span_readout is not None else None
+                    if self.semantic_alignment.structure is not None:
+                        semantic_inputs['structure'] = self.semantic_alignment.observed_structure(state, tokenizer, semantic_inputs['units'])
+                question, recalled, probabilities, plan = self.decision_packet(
+                    question, torch.stack(words), torch.stack(values), source_logits,
+                    query_words, semantic_inputs,
+                    (lambda selected: self.span_readout.candidates(state, tokenizer, selected)) if self.span_readout is not None else None,
+                    [w for w, _ in state.source], diagnostics)
                 if plan is not None:
                     plan['base_word_vectors'] = torch.stack(words)
                     plan['source_keys'] = keys
@@ -412,9 +639,16 @@ class NativeQuestionMemory(nn.Module):
             state.document_pending = list(state.document_pending)
             state.antecedents = list(state.antecedents)
             state.source_ordinals = list(state.source_ordinals)
+            state.source_vectors = list(state.source_vectors)
+            state.source_summaries = list(state.source_summaries)
+            state.source_segments = list(state.source_segments)
+            state.source_lines = list(state.source_lines)
+            state.question_vectors = list(state.question_vectors)
             sequence = []
             for position, token in enumerate(tokens):
-                state, active = self._observe(state, token, tokenizer)
+                state, active = self._observe(state, token, tokenizer, hidden[row,position])
+                if self.representation=='backbone_context_v1':
+                    state.context_generation=context_generation
                 # Only completed source words advance this causal state. Neither
                 # the question nor generated answer can alter occurrence keys.
                 # Batch a full prefix when available, while bounding pending
@@ -429,9 +663,8 @@ class NativeQuestionMemory(nn.Module):
                     # Legacy checkpoints never trained the residual at EOO.
                     # Expose verified EOS support without changing that base
                     # boundary prediction; the span gate receives EOS gradients.
-                    if tokenizer.construction_units[token].text != '<EOO>':
-                        gate = self.gate(torch.cat((current, question))).sigmoid()
-                        current = current + gate * self.output(torch.cat((current, question, recalled)))
+                    current = self.guide_readout(current,question,recalled,
+                        tokenizer.construction_units[token].text != '<EOO>')
                     if return_readout and plan is not None:
                         readout_records.append((row, position, question, current, plan, state.emitted))
                 sequence.append(current)

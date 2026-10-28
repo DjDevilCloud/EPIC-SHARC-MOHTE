@@ -11,6 +11,7 @@ from typing import List
 import torch
 
 try:
+    from .qa_generation import resolve_generation_options, CLI_LEGACY
     from .config import PrismalWaveConfig
     from .data import ByteTokenizer
     from .model import PrismalWaveModel
@@ -29,6 +30,7 @@ try:
         train_model,
     )
 except ImportError:  # pragma: no cover - supports direct script launching.
+    from qa_generation import resolve_generation_options, CLI_LEGACY
     from config import PrismalWaveConfig
     from data import ByteTokenizer
     from model import PrismalWaveModel
@@ -713,21 +715,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_model_args(train_p)
 
     infer_p = sub.add_parser("infer", help="Generate from a checkpoint")
+    infer_p.add_argument('--qa-readout-route', choices=('legacy', 'native', 'identity', 'backbone'), default=None,
+                         help='Override the checkpoint QA readout route for this run')
+    infer_p.add_argument('--qa-generation-profile', choices=('legacy','native_qa_eval_v1'), default=None,
+                         help='Override the saved generation profile for this run')
+    infer_p.add_argument('--generation-json', action='store_true', help='Print raw continuation tokens and generation settings as JSON')
     infer_p.add_argument("--checkpoint", required=True)
     infer_p.add_argument("--prompt", required=True)
+    infer_p.add_argument('--qa-context-file', default=None, help='Read document context as UTF-8; --prompt supplies its question')
     infer_p.add_argument("--prompt-mode", choices=("answer", "continuation"), default="answer",
                          help="Answer a question or continue text inside its existing output span.")
-    infer_p.add_argument("--max-new-tokens", type=int, default=64)
-    infer_p.add_argument("--min-new-tokens", type=int, default=1)
-    infer_p.add_argument("--temperature", type=float, default=0.9)
-    infer_p.add_argument("--top-k", type=int, default=8)
-    infer_p.add_argument("--top-p", type=float, default=0.92)
-    infer_p.add_argument("--repetition-penalty", type=float, default=1.1)
-    infer_p.add_argument("--no-repeat-ngram-size", type=int, default=4)
-    infer_p.add_argument("--beam-size", type=int, default=1)
+    infer_p.add_argument("--max-new-tokens", type=int, default=None)
+    infer_p.add_argument("--min-new-tokens", type=int, default=None)
+    infer_p.add_argument("--temperature", type=float, default=None)
+    infer_p.add_argument("--top-k", type=int, default=None)
+    infer_p.add_argument("--top-p", type=float, default=None)
+    infer_p.add_argument("--repetition-penalty", type=float, default=None)
+    infer_p.add_argument("--no-repeat-ngram-size", type=int, default=None)
+    infer_p.add_argument("--beam-size", type=int, default=None)
     infer_p.add_argument("--use-speculative-decoding", dest="use_speculative_decoding", action="store_true")
     infer_p.add_argument("--no-speculative-decoding", dest="use_speculative_decoding", action="store_false")
-    infer_p.set_defaults(use_speculative_decoding=default_cfg.use_speculative_decoding)
+    infer_p.set_defaults(use_speculative_decoding=None)
     infer_p.add_argument("--speculative-draft-tokens", type=int, default=default_cfg.speculative_draft_tokens)
     infer_p.add_argument("--speculative-temperature", type=float, default=default_cfg.speculative_temperature)
     infer_p.add_argument(
@@ -1133,6 +1141,13 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.command == "infer":
         model, tokenizer, _raw_cfg = load_bundle_from_checkpoint(args.checkpoint, device=device)
+        if args.qa_readout_route is not None:
+            model.cfg.qa_readout_route = args.qa_readout_route
+        if args.qa_generation_profile is not None:
+            model.cfg.qa_generation_profile = args.qa_generation_profile
+        generation_options, _ = resolve_generation_options(model.cfg.qa_generation_profile,
+            {k:getattr(args,k) for k in CLI_LEGACY},
+            dict(CLI_LEGACY,use_speculative_decoding=default_cfg.use_speculative_decoding))
         # load_bundle_from_checkpoint already resolves the runtime config.
         model = model.to(device)
         model = maybe_compile_model(model, enabled=args.torch_compile)
@@ -1141,21 +1156,15 @@ def main(argv: List[str] | None = None) -> int:
             tokenizer,
             args.prompt,
             device,
-            max_new_tokens=args.max_new_tokens,
-            min_new_tokens=args.min_new_tokens,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            beam_size=args.beam_size,
-            use_speculative_decoding=args.use_speculative_decoding,
+            **generation_options,
+            return_generation_record=args.generation_json,
             speculative_draft_tokens=args.speculative_draft_tokens,
             speculative_temperature=args.speculative_temperature,
             template_prompt=args.template_prompt,
             prompt_mode=args.prompt_mode,
+            qa_context=Path(args.qa_context_file).read_text(encoding='utf-8') if args.qa_context_file else None,
         )
-        print(text)
+        print(json.dumps(text,ensure_ascii=False) if args.generation_json else text)
         return 0
 
     if args.command == "gui":

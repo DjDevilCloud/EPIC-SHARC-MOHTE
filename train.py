@@ -18,6 +18,7 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
+    from .qa_generation import resolve_generation_options, API_LEGACY
     from .config import PrismalWaveConfig, save_config
     from .data import (
         ByteTokenizer,
@@ -38,6 +39,7 @@ try:
     from .muon_optim import (
         MuonAdamW,
         PrecisionAdaptiveHierarchicalOptimizer,
+        OptimizerStateVersionError,
         _nested_learning_beta_for,
         _nested_learning_interval_for,
         split_muon_parameter_groups,
@@ -49,6 +51,7 @@ try:
     from .model import PrismalWaveModel
     from .quantization import refresh_quantized_caches
 except ImportError:  # pragma: no cover - supports direct script launching.
+    from qa_generation import resolve_generation_options, API_LEGACY
     from config import PrismalWaveConfig, save_config
     from data import (
         ByteTokenizer,
@@ -69,6 +72,7 @@ except ImportError:  # pragma: no cover - supports direct script launching.
     from muon_optim import (
         MuonAdamW,
         PrecisionAdaptiveHierarchicalOptimizer,
+        OptimizerStateVersionError,
         _nested_learning_beta_for,
         _nested_learning_interval_for,
         split_muon_parameter_groups,
@@ -480,11 +484,29 @@ def _fast_context_generation_prompt(
     return f"{prefix}\n\n{prompt}"
 
 
+def _native_batch_kwargs(batch):
+    if not isinstance(batch,dict):
+        return {}
+    if 'tensors' not in batch or set(batch)-{'tensors','native_source_targets','native_source_weight','native_replay_targets','native_replay_weight'}:
+        raise ValueError('Annotated native batches require tensors and explicit native source/replay metadata only')
+    if batch.get('native_source_targets') is None:
+        if batch.get('native_replay_targets') is not None:
+            raise ValueError('Native replay batches require explicit source labels')
+        return {}
+    result = dict(native_source_targets=batch['native_source_targets'],native_source_weight=batch.get('native_source_weight',1.))
+    if batch.get('native_replay_targets') is not None:
+        result.update(native_replay_targets=batch['native_replay_targets'],native_replay_weight=batch.get('native_replay_weight',1.))
+    return result
+
+
 def _normalize_training_batch(
     batch: Sequence[torch.Tensor],
     *,
     hierarchy_vector_dim: int = DEFAULT_HIERARCHY_VECTOR_DIM,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if isinstance(batch,dict):
+        _native_batch_kwargs(batch)
+        batch=batch['tensors']
     if len(batch) == 9:
         return tuple(batch)  # type: ignore[return-value]
     if len(batch) == 8:
@@ -703,6 +725,51 @@ def _apply_nested_optimizer_settings(optimizer: torch.optim.Optimizer, cfg: Pris
             group["_nested_group_step"] = 0
 
 
+def _assert_optimizer_parameter_coverage(model, optimizer):
+    """Reject missing, duplicate and stale parameter identities before an update."""
+    named = dict(model.named_parameters())
+    current = {id(p): name for name, p in named.items()}
+    seen = set()
+    duplicates = []
+    stale = []
+    for group in optimizer.param_groups:
+        for parameter in group['params']:
+            identity = id(parameter)
+            if identity in seen:
+                duplicates.append(current.get(identity, '<stale>'))
+            seen.add(identity)
+            if identity not in current:
+                stale.append(tuple(parameter.shape))
+    missing = [name for name, p in named.items() if p.requires_grad and id(p) not in seen]
+    if missing or duplicates or stale:
+        raise RuntimeError(f'Optimizer parameter coverage failed: missing={missing}, duplicate={duplicates}, '
+                           f'stale_shapes={stale}. Materialize enabled modules and finalize capacities '
+                           'before optimizer construction; rebuild after changing trainable parameters.')
+
+
+def _optimizer_parameter_manifest(model, optimizer):
+    names = {id(p): name for name, p in model.named_parameters()}
+    return dict(optimizer=type(optimizer).__name__, groups=[dict(
+        names=[names[id(p)] for p in group['params']],
+        parameters=sum(p.numel() for p in group['params']),
+        lr=float(group['lr']), initial_lr=float(group.get('initial_lr',group['lr'])),
+        weight_decay=float(group.get('weight_decay', 0.)),
+        rule=group.get('update_rule', 'muon' if group.get('use_muon') else 'adamw'),
+        role=group.get('parameter_role'), tier=group.get('hierarchy_tier'),
+        nested=bool(group.get('nested_learning_enabled', False)),
+        interval=int(group.get('nested_update_interval', 1)),
+        ema_beta=group.get('nested_update_ema_beta')) for group in optimizer.param_groups])
+
+
+def _materialize_optimizer_modules(model):
+    pending = getattr(model, 'unmaterialized_parameter_modules', lambda: [])()
+    if pending and any(not p.requires_grad for p in model.parameters()):
+        raise RuntimeError('Materialize enabled modules before selecting/freezing trainable parameters: '
+                           + ', '.join(pending))
+    if hasattr(model, 'materialize_enabled_modules'):
+        model.materialize_enabled_modules()
+
+
 def _build_optimizer(
     model: PrismalWaveModel,
     *,
@@ -712,8 +779,21 @@ def _build_optimizer(
     precision_policy: HierarchicalPrecisionPolicy | None = None,
 ) -> torch.optim.Optimizer:
     name = optimizer_name.strip().lower()
+    _materialize_optimizer_modules(model)
+    def finalize(optimizer):
+        _assert_optimizer_parameter_coverage(model, optimizer)
+        model._prismal_optimizer_manifest = _optimizer_parameter_manifest(model, optimizer)
+        if hasattr(model,'invalidate_native_context'):
+            import weakref
+            reference=weakref.ref(model)
+            def invalidate_after_step(_optimizer,_args,_kwargs):
+                owner=reference()
+                if owner is not None:
+                    owner.invalidate_native_context()
+            optimizer.register_step_post_hook(invalidate_after_step)
+        return optimizer
     if name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=base_lr)
+        return finalize(torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=base_lr))
     if name == "hierarchical":
         param_groups = split_precision_adaptive_parameter_groups(
             model.named_parameters(),
@@ -736,10 +816,10 @@ def _build_optimizer(
             precision_policy=precision_policy,
         )
         if not param_groups:
-            return torch.optim.AdamW(model.parameters(), lr=base_lr)
+            return finalize(torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=base_lr))
         optimizer = PrecisionAdaptiveHierarchicalOptimizer(param_groups)
         _apply_nested_optimizer_settings(optimizer, cfg)
-        return optimizer
+        return finalize(optimizer)
     if name != "muon":
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
@@ -756,8 +836,8 @@ def _build_optimizer(
         scalar_optimizer=str(getattr(cfg, "muon_scalar_optimizer", "adamw")),
     )
     if not param_groups:
-        return torch.optim.AdamW(model.parameters(), lr=base_lr)
-    return MuonAdamW(param_groups)
+        return finalize(torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=base_lr))
+    return finalize(MuonAdamW(param_groups))
 
 
 def maybe_compile_model(model: PrismalWaveModel, *, enabled: bool = True) -> PrismalWaveModel:
@@ -1163,6 +1243,9 @@ def save_checkpoint(
             "muon_ns_steps",
             "muon_extra_scale_factor",
             "muon_scalar_optimizer",
+            "use_nested_learning",
+            "nested_learning_local_interval", "nested_learning_mid_interval", "nested_learning_global_interval",
+            "nested_learning_local_ema_beta", "nested_learning_mid_ema_beta", "nested_learning_global_ema_beta",
         ):
             if hasattr(config, field_name):
                 setattr(cfg, field_name, getattr(config, field_name))
@@ -1700,12 +1783,13 @@ def _optimizer_state_is_shape_compatible(optimizer: torch.optim.Optimizer) -> bo
             state = optimizer.state.get(param)
             if not state:
                 continue
-            for value in state.values():
+            for key, value in state.items():
                 if not torch.is_tensor(value):
                     continue
                 if value.ndim == 0:
                     continue
-                if value.shape != param.shape:
+                expected = (param.shape[0], 1) if key == 'exp_avg_sq_row' and group.get('update_rule') == 'rowwise' and param.ndim == 2 else param.shape
+                if value.shape != expected:
                     return False
     return True
 
@@ -2094,6 +2178,7 @@ def evaluate_model(
                     signature_family_ids=signature_family_ids,
                     hierarchy_vectors=hierarchy_vectors,
                     loss_mask=loss_mask,
+                    **_native_batch_kwargs(batch),
                 )
             losses.append(float(loss.item()))
             ce_losses.append(float(output.ce_loss.item()))
@@ -2198,6 +2283,9 @@ def train_model(
         "muon_ns_steps",
         "muon_extra_scale_factor",
         "muon_scalar_optimizer",
+        "use_nested_learning",
+        "nested_learning_local_interval", "nested_learning_mid_interval", "nested_learning_global_interval",
+        "nested_learning_local_ema_beta", "nested_learning_mid_ema_beta", "nested_learning_global_ema_beta",
         "use_bitsandbytes_leaf_precision",
         "bitsandbytes_leaf_precision_mode",
         "bitsandbytes_leaf_quant_type",
@@ -2232,6 +2320,23 @@ def train_model(
     tokenizer = getattr(runtime_model, "_prismal_tokenizer", None)
     if isinstance(tokenizer, PrismalTokenizer) and hasattr(runtime_model, "prepare_capacity_for_tokenizer"):
         runtime_model.prepare_capacity_for_tokenizer(tokenizer)
+    # Finalize known positional capacity and all lazy weights before optimizer
+    # registration. Streaming datasets expose seq_len without consuming a batch.
+    dataset = getattr(dataloader, 'dataset', None)
+    visited = set()
+    while dataset is not None and id(dataset) not in visited:
+        visited.add(id(dataset))
+        sequence_length = getattr(dataset, 'seq_len', None)
+        if isinstance(sequence_length, int) and sequence_length > 0 and hasattr(runtime_model, '_ensure_position_embedding_capacity'):
+            runtime_model._ensure_position_embedding_capacity(sequence_length)
+        dataset = getattr(dataset, 'dataset', None)
+    _materialize_optimizer_modules(runtime_model)
+    resume_state = getattr(runtime_model, "_prismal_training_state", None)
+    if hasattr(runtime_model, "configure_precision"):
+        runtime_model.configure_precision(
+            device, enabled=bool(precision_policy is not None and precision_policy.enabled),
+            checkpoint_precision_state=resume_state if isinstance(resume_state, dict) else None)
+    precision_policy = getattr(runtime_model, "precision_policy", None)
     optimizer = _build_optimizer(
         runtime_model,
         optimizer_name=optimizer_name_norm,
@@ -2251,7 +2356,6 @@ def train_model(
     else:
         requested_grad_accum_steps = max(1, int(getattr(cfg, "gradient_accumulation_steps", 1)))
     grad_accum_steps = max(1, requested_grad_accum_steps if use_grad_accum else 1)
-    resume_state = getattr(runtime_model, "_prismal_training_state", None)
     resume_global_step = 0
     optimizer_state_loaded = False
     if isinstance(resume_state, dict):
@@ -2265,13 +2369,13 @@ def train_model(
                 if _optimizer_state_is_shape_compatible(optimizer):
                     optimizer_state_loaded = True
                 else:
-                    print(
-                        "[Prismal] optimizer state restore skipped: loaded state tensor shapes do not match current parameters",
-                        flush=True,
-                    )
-                    optimizer.state.clear()
+                    raise ValueError('loaded state tensor shapes do not match current parameters')
+            except OptimizerStateVersionError:
+                raise
             except Exception as exc:
-                print(f"[Prismal] optimizer state restore skipped: {exc}", flush=True)
+                raise OptimizerStateVersionError(
+                    f'Cannot resume {optimizer_name_norm} optimizer state: {exc}. '
+                    'Use --continue-checkpoint to load weights with an explicitly fresh optimizer.') from exc
         elif resume_optimizer_state is not None:
             print(
                 f"[Prismal] skipping optimizer state restore because checkpoint optimizer={resume_optimizer_name or 'unknown'} "
@@ -2295,13 +2399,7 @@ def train_model(
     )
     if fast_context_state is not None:
         runtime_model._prismal_fast_context_state = fast_context_state
-    if hasattr(runtime_model, "configure_precision"):
-        runtime_model.configure_precision(
-            device,
-            enabled=bool(precision_policy is not None and precision_policy.enabled),
-            checkpoint_precision_state=resume_state if isinstance(resume_state, dict) else None,
-        )
-    precision_policy = getattr(runtime_model, "precision_policy", None)
+    _assert_optimizer_parameter_coverage(runtime_model, optimizer)
     diagnostic_interval = max(1, int(diagnostic_interval))
     loss_sum: Optional[float] = None
     ce_loss_sum: Optional[float] = None
@@ -2429,6 +2527,10 @@ def train_model(
     accumulation_step = 0
     optimizer_step = 0
     pending_qa_supervision=False
+    native_source_examples_presented=0
+    native_replay_examples_presented=0
+    native_replay_weights_presented=set()
+    native_source_weights_presented=set()
 
     def _finish_optimizer_step() -> tuple[bool, int]:
         nonlocal accumulation_step, optimizer_step, pending_qa_supervision
@@ -2437,6 +2539,7 @@ def train_model(
         nonlocal last_stability_text
         if accumulation_step <= 0:
             return False, 0
+        _assert_optimizer_parameter_coverage(runtime_model, optimizer)
         should_step_scheduler = True
         step_scaler_enabled = _current_scaler_enabled()
         if step_scaler_enabled:
@@ -2552,8 +2655,14 @@ def train_model(
         *,
         epoch_idx: int,
         batch_idx: int,
+        native_source_targets=None,
+        native_source_weight=1.,
+        native_replay_targets=None,
+        native_replay_weight=1.,
     ) -> None:
         nonlocal step
+        nonlocal native_source_examples_presented
+        nonlocal native_replay_examples_presented
         nonlocal accumulation_step
         nonlocal optimizer_step, pending_qa_supervision
         nonlocal last_stability_text
@@ -2580,6 +2689,8 @@ def train_model(
         hierarchy_vectors = hierarchy_vectors.to(device)
         loss_mask = loss_mask.to(device)
         if fast_context_state is not None:
+            if native_source_targets is not None and fast_context_state.get('enabled',True) and fast_context_state.get('use_training_prefix',True):
+                raise ValueError('Explicit native source positions require disabling FST training prefixes')
             (
                 input_ids,
                 labels,
@@ -2666,6 +2777,10 @@ def train_model(
                 loss_mask=loss_mask,
                 superposition_bag_size=token_superposition_bag_size,
                 collect_telemetry=should_collect,
+                **(dict(native_source_targets=native_source_targets,native_source_weight=native_source_weight)
+                   if native_source_targets is not None else {}),
+                **(dict(native_replay_targets=native_replay_targets,native_replay_weight=native_replay_weight)
+                   if native_replay_targets is not None else {}),
             )
         if batch_vram_enabled:
             forward_stats = torch.cuda.memory_stats(device)
@@ -2684,6 +2799,13 @@ def train_model(
                 }
             )
             torch.cuda.reset_peak_memory_stats(device)
+        _assert_optimizer_parameter_coverage(runtime_model, optimizer)
+        if native_source_targets is not None:
+            native_source_examples_presented+=len(native_source_targets)
+            native_source_weights_presented.add(float(native_source_weight))
+        if native_replay_targets is not None:
+            native_replay_examples_presented+=len(native_replay_targets)
+            native_replay_weights_presented.add(float(native_replay_weight))
         host_metrics = _train_step_host_metrics(loss, output.ce_loss, output.aux_loss, output.route_stats)
         repair_count = int(max(0.0, host_metrics["stability_nonfinite_repair_count"]))
         if repair_count > 0:
@@ -2910,6 +3032,7 @@ def train_model(
                     loss_mask,
                     epoch_idx=epoch_idx,
                     batch_idx=batch_idx,
+                    **_native_batch_kwargs(batch),
                 )
                 while validation_point_index < len(validation_points) and batch_idx >= validation_points[validation_point_index]:
                     _finish_optimizer_step()
@@ -2957,6 +3080,7 @@ def train_model(
                 loss_mask,
                 epoch_idx=epoch_idx,
                 batch_idx=batch_idx,
+                **_native_batch_kwargs(batch),
             )
         _finish_optimizer_step()
 
@@ -2967,6 +3091,11 @@ def train_model(
     runtime_model._prismal_training_state = {
         "optimizer_name": optimizer_name_norm,
         "optimizer_state": optimizer.state_dict(),
+        "optimizer_manifest": _optimizer_parameter_manifest(runtime_model, optimizer),
+        "native_source_supervision": dict(contract='explicit_readout_targets_v1',
+            examples_presented=native_source_examples_presented,weights_presented=sorted(native_source_weights_presented)),
+        "native_functional_replay": dict(contract='native_live_replay_v1',
+            examples_presented=native_replay_examples_presented,weights_presented=sorted(native_replay_weights_presented)),
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state": scaler.state_dict() if scaler is not None else None,
         "global_step": int(resume_global_step + optimizer_step),
@@ -3144,6 +3273,7 @@ def run_benchmark(
             signature_family_ids=signature_family_ids,
             hierarchy_vectors=hierarchy_vectors,
             loss_mask=loss_mask,
+            **_native_batch_kwargs(batch),
         )
         losses.append(float(loss.item()))
         path_diversity.append(float(output.route_stats["pairwise_diversity"].item()))
@@ -3209,21 +3339,38 @@ def generate_text(
     prompt: str,
     device: torch.device,
     *,
-    max_new_tokens: int = 64,
-    min_new_tokens: int = 1,
-    top_k: int = 0,
-    top_p: float = 1.0,
-    temperature: float = 1.0,
-    repetition_penalty: float = 1.08,
-    no_repeat_ngram_size: int = 4,
-    beam_size: int = 1,
+    max_new_tokens: Optional[int] = None,
+    min_new_tokens: Optional[int] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    temperature: Optional[float] = None,
+    repetition_penalty: Optional[float] = None,
+    no_repeat_ngram_size: Optional[int] = None,
+    beam_size: Optional[int] = None,
     use_speculative_decoding: Optional[bool] = None,
     speculative_draft_tokens: Optional[int] = None,
     speculative_temperature: Optional[float] = None,
     template_prompt: bool = False,
     fast_context_state: Optional[Dict[str, object]] = None,
     prompt_mode: str = "answer",
-) -> str:
+    qa_generation_profile: Optional[str] = None,
+    return_generation_record: bool = False,
+    qa_context: Optional[str] = None,
+) -> str | dict:
+    if qa_context is not None:
+        if prompt_mode != 'answer' or template_prompt or fast_context_state is not None:
+            raise ValueError('Explicit document QA requires answer mode without prompt templating or fast context')
+        try:
+            from .native_qa_format import format_native_qa
+        except ImportError:
+            from native_qa_format import format_native_qa
+        prompt = format_native_qa(qa_context,prompt,framing=getattr(model.cfg,'native_question_memory_framing','legacy'))
+    profile = getattr(model.cfg,'qa_generation_profile','legacy') if qa_generation_profile is None else qa_generation_profile
+    options, profile_record = resolve_generation_options(profile, dict(
+        max_new_tokens=max_new_tokens,min_new_tokens=min_new_tokens,top_k=top_k,top_p=top_p,
+        temperature=temperature,repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,beam_size=beam_size,
+        use_speculative_decoding=use_speculative_decoding),API_LEGACY)
     model.eval()
     if prompt_mode == "answer":
         prompt = _format_generation_prompt(prompt, template_prompt=template_prompt)
@@ -3261,25 +3408,26 @@ def generate_text(
         signature_relation_ids=signature_relation_ids,
         parent_signature_ids=parent_signature_ids,
         hierarchy_vectors=prompt_hierarchy_vectors.unsqueeze(0),
-        max_new_tokens=max_new_tokens,
-        min_new_tokens=min_new_tokens,
-        top_k=top_k,
+        **options,
+        qa_generation_profile=profile,
         token_signature_lookup=tokenizer.signature_lookup_by_token_id(),
         token_family_lookup=tokenizer.signature_family_lookup_by_token_id(),
         token_level_lookup=tokenizer.signature_level_lookup_by_token_id(),
         token_relation_lookup=tokenizer.signature_relation_lookup_by_token_id(),
         suppressed_token_ids=tokenizer.generation_suppressed_token_ids(),
-        top_p=top_p,
-        temperature=temperature,
-        repetition_penalty=repetition_penalty,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-        beam_size=beam_size,
-        use_speculative_decoding=False if use_speculative_decoding is None else bool(use_speculative_decoding),
         speculative_draft_tokens=speculative_draft_tokens,
         speculative_temperature=speculative_temperature,
     )
     generated_ids = generated[0].tolist()
     continuation = generated_ids[len(prompt_ids):]
+    if return_generation_record:
+        return dict(profile_record, route=getattr(model.cfg,'qa_readout_route','legacy'),
+                    native_framing=getattr(model.cfg,'native_question_memory_framing','legacy'),
+                    native_events=getattr(model.cfg,'native_question_memory_events','legacy'),
+                    prompt_ids=prompt_ids, tokens=continuation,
+                    raw=tokenizer.decode(continuation,clean_text=False,collapse_structure=False),
+                    ended=bool(continuation and continuation[-1]==tokenizer.eos_id),
+                    cap_hit=len(continuation)>=options['max_new_tokens'] and not (continuation and continuation[-1]==tokenizer.eos_id))
     prompt_text = prompt
     continuation_text = tokenizer.decode(continuation)
     lines: list[str] = []
@@ -3292,4 +3440,6 @@ def generate_text(
     lines.append(f"Prompt token IDs: {prompt_ids}")
     lines.append(f"Generated token IDs: {generated_ids}")
     lines.append(f"Continuation token IDs: {continuation}")
+    if profile!='legacy':
+        lines.append(f"QA generation profile: {profile}; canonical: {profile_record['canonical']}; overrides: {profile_record['overrides']}")
     return "\n".join(lines).strip()

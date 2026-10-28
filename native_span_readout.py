@@ -11,13 +11,18 @@ except ImportError:
 
 
 class NativeSpanReadout(nn.Module):
-    def __init__(self, width, max_words=16, starts=16, stable_gate=False, conditional_endpoints=False, marker_endpoints=False, conditional_copy=False):
+    def __init__(self, width, max_words=16, starts=16, stable_gate=False, conditional_endpoints=False, marker_endpoints=False, conditional_copy=False, confidence_context='retrieved_v1'):
         super().__init__()
         if max_words < 1 or starts < 1:
             raise ValueError('Native span budgets must be positive.')
         self.max_words = int(max_words)
         self.starts = int(starts)
         self.stable_gate = bool(stable_gate)
+        if confidence_context not in {'retrieved_v1','observed_mean_v1'}:
+            raise ValueError('Unknown native copy confidence context policy')
+        if confidence_context != 'retrieved_v1' and not (stable_gate and conditional_copy):
+            raise ValueError('Observed copy confidence requires stable conditional copying')
+        self.confidence_context = confidence_context
         if conditional_copy and not stable_gate:
             raise ValueError('Conditional copy requires a stable task gate')
         self.conditional_copy = bool(conditional_copy)
@@ -136,7 +141,17 @@ class NativeSpanReadout(nn.Module):
         logits = start_log_probabilities[starts] + energies
         return logits
 
-    def mix(self, logits, records):
+    def gate_logit(self, question, current, plan):
+        """The same task-confidence decision for live emission and replay."""
+        if self.confidence_context == 'observed_mean_v1':
+            if 'copy_gate_context' not in plan:
+                raise ValueError('Observed copy confidence requires its input-only source summary')
+            context = plan['copy_gate_context']
+        else:
+            context = plan['copy_context'] if self.stable_gate else current
+        return self.copy_gate(torch.cat((context, question))).squeeze()
+
+    def mix(self, logits, records, diagnostics=None):
         if not records:
             return logits
         # Keep non-output positions untouched. Legacy mode retains original
@@ -144,6 +159,11 @@ class NativeSpanReadout(nn.Module):
         # uncertainty, with the same stable task gate throughout the answer.
         result = logits.clone()
         for row, position, question, current, plan, emitted in records:
+            diagnostic = None
+            if diagnostics is not None:
+                diagnostic = dict(row=row, position=position, emitted_prefix=emitted,
+                                  source=plan.get('diagnostics'), surviving_prefix_mass=0., copy_gate=None)
+                diagnostics.append(diagnostic)
             supported = [(i, c['tokens'][len(emitted)]) for i, c in enumerate(plan['candidates'])
                          if len(emitted) < len(c['tokens']) and c['tokens'][:len(emitted)] == emitted]
             if not supported:
@@ -161,6 +181,8 @@ class NativeSpanReadout(nn.Module):
             if not finite.any():
                 continue
             selected, targets = selected[finite], targets[finite]
+            if diagnostic is not None:
+                diagnostic['surviving_prefix_mass'] = float(selected.logsumexp(0).exp().detach())
             if self.conditional_copy:
                 # P(next | copying, verified emitted prefix). Rejected spans
                 # express continuation uncertainty, not native-task evidence.
@@ -172,8 +194,9 @@ class NativeSpanReadout(nn.Module):
             unsupported = torch.ones(len(log_weights), dtype=torch.bool, device=logits.device)
             unsupported[indices] = False
             log_unsupported = log_weights[unsupported].logsumexp(0) if unsupported.any() else logits.new_tensor(-torch.inf)
-            context = plan['copy_context'] if self.stable_gate else current
-            gate_logit = self.copy_gate(torch.cat((context, question))).squeeze()
+            gate_logit = self.gate_logit(question, current, plan)
+            if diagnostic is not None:
+                diagnostic['copy_gate'] = float(gate_logit.sigmoid().detach())
             log_gate = F.logsigmoid(gate_logit)
             # Legacy: 1 - gate * support = (1 - gate) + gate * unsupported.
             # Conditional mode keeps the independent task fallback 1 - gate.

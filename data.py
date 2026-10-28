@@ -3790,6 +3790,10 @@ def _grounded_qa_source_group(text: str) -> str | None:
     """Group sibling questions by the observed document, never by their answers."""
     if not text.startswith('<BOI>') or '<EOI>' not in text:return None
     prefix=text[:text.index('<EOI>')]
+    blocks=re.fullmatch(r'<BOI><BOP>(.*?)<EOP><BOP>(.*?)<EOP>',prefix,re.DOTALL)
+    if blocks is not None:
+        canonical=' '.join(blocks.group(1).split()).casefold()
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
     match=re.match(r"<BOI>\s*Context:\s*(.*)\nQuestion:\s*.+\Z",prefix,re.DOTALL|re.IGNORECASE)
     if match is None:return None
     canonical=' '.join(match.group(1).split()).casefold()

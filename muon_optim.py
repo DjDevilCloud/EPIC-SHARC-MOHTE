@@ -474,6 +474,10 @@ class MuonAdamW(torch.optim.Optimizer):
             p.addcdiv_(exp_avg, denom, value=-step_size)
 
 
+class OptimizerStateVersionError(ValueError):
+    """An optimizer state cannot be resumed under the current update contract."""
+
+
 class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
     """Role-aware optimizer for quantized bases, adapters, tables, and scalars."""
 
@@ -481,6 +485,22 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         if defaults is None:
             defaults = {}
         super().__init__(params, defaults)
+
+    STATE_SCHEMA_VERSION = 2
+
+    def state_dict(self):
+        result = super().state_dict()
+        result['precision_adaptive_schema_version'] = self.STATE_SCHEMA_VERSION
+        return result
+
+    def load_state_dict(self, state_dict):
+        if state_dict.get('precision_adaptive_schema_version') != self.STATE_SCHEMA_VERSION:
+            raise OptimizerStateVersionError(
+                'Hierarchical optimizer state schema/version is incompatible with v2 '
+                '(elementwise table momentum and effective nested EMA). '
+                'Load model weights with a fresh optimizer, e.g. --continue-checkpoint; '
+                'legacy optimizer state cannot be resumed silently.')
+        return super().load_state_dict(state_dict)
 
     def step(self, closure=None):
         loss = None
@@ -528,25 +548,32 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         self,
         group: dict,
         param: torch.nn.Parameter,
-        grad: torch.Tensor,
+        grad: torch.Tensor | None,
         *,
         update_due: bool,
     ) -> torch.Tensor | None:
+        if grad is not None and grad.is_sparse:
+            raise RuntimeError('PrecisionAdaptiveHierarchicalOptimizer does not support sparse gradients.')
         if not self._nested_group_enabled(group):
             return grad
 
         state = self.state[param]
         state_dtype = self._state_dtype(group)
         if "nested_grad_buffer" not in state:
+            if grad is None:
+                return None
             state["nested_window_count"] = 0
             state["nested_grad_buffer"] = torch.zeros_like(param, dtype=state_dtype)
             state["nested_grad_ema"] = torch.zeros_like(param, dtype=state_dtype)
+            state['nested_ema_decay_product'] = 1.0
+            state['nested_ema_updates'] = 0
 
         buffer = state["nested_grad_buffer"]
-        buffer.add_(grad.to(buffer.dtype))
-        state["nested_window_count"] = int(state.get("nested_window_count", 0)) + 1
+        if grad is not None:
+            buffer.add_(grad.to(buffer.dtype))
+            state["nested_window_count"] = int(state.get("nested_window_count", 0)) + 1
 
-        if not update_due:
+        if not update_due or not state['nested_window_count']:
             return None
 
         window_count = max(int(state.get("nested_window_count", 0)), 1)
@@ -554,9 +581,15 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         ema = state["nested_grad_ema"]
         beta = self._nested_group_beta(group)
         ema.mul_(beta).add_(window_grad.to(ema.dtype), alpha=1.0 - beta)
+        # Product correction remains valid if an explicitly resumed run changes
+        # beta. Windows average observed gradients; missing expert gradients do
+        # not contribute synthetic zeros. Pending work flushes on its group clock.
+        state['nested_ema_decay_product'] *= beta
+        state['nested_ema_updates'] += 1
+        corrected = ema / (1.0 - state['nested_ema_decay_product'])
         state["nested_window_count"] = 0
         buffer.zero_()
-        return window_grad
+        return corrected
 
     def _step_muon_group(self, group: dict, params: Sequence[torch.nn.Parameter]) -> None:
         lr = float(group.get("lr", 1e-3))
@@ -569,9 +602,7 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         nested_update_due = self._nested_group_update_due(group)
 
         for p in params:
-            if p.grad is None:
-                continue
-            grad = self._nested_prepare_grad(group, p, p.grad.detach(), update_due=nested_update_due)
+            grad = self._nested_prepare_grad(group, p, None if p.grad is None else p.grad.detach(), update_due=nested_update_due)
             if grad is None:
                 continue
             if grad.is_sparse:
@@ -608,9 +639,7 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         nested_update_due = self._nested_group_update_due(group)
 
         for p in params:
-            if p.grad is None:
-                continue
-            grad = self._nested_prepare_grad(group, p, p.grad.detach(), update_due=nested_update_due)
+            grad = self._nested_prepare_grad(group, p, None if p.grad is None else p.grad.detach(), update_due=nested_update_due)
             if grad is None:
                 continue
             if grad.is_sparse:
@@ -619,29 +648,31 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
                 raise RuntimeError("Row-wise parameters must be matrix-shaped.")
 
             state = self.state[p]
-            if "exp_avg_row" not in state:
+            if "exp_avg" not in state:
                 state["step"] = 0
                 row_shape = (p.shape[0], 1)
-                state["exp_avg_row"] = torch.zeros(row_shape, dtype=state_dtype, device=p.device)
+                state["exp_avg"] = torch.zeros_like(p, dtype=state_dtype)
                 state["exp_avg_sq_row"] = torch.zeros(row_shape, dtype=state_dtype, device=p.device)
-            exp_avg_row = state["exp_avg_row"]
+            exp_avg = state["exp_avg"]
             exp_avg_sq_row = state["exp_avg_sq_row"]
             state["step"] += 1
 
             grad_float = grad.float()
-            row_grad = grad_float.mean(dim=1, keepdim=True)
             row_rms = grad_float.pow(2).mean(dim=1, keepdim=True)
 
             if weight_decay:
                 p.mul_(1.0 - lr * weight_decay)
 
-            exp_avg_row.mul_(beta1).add_(row_grad.to(exp_avg_row.dtype), alpha=1.0 - beta1)
+            # Preserve each coordinate's direction. A signed row mean can
+            # reverse descent or erase an entire nonzero zero-mean gradient.
+            exp_avg.mul_(beta1).add_(grad_float.to(exp_avg.dtype), alpha=1.0 - beta1)
             exp_avg_sq_row.mul_(beta2).add_(row_rms.to(exp_avg_sq_row.dtype), alpha=1.0 - beta2)
 
             denom = exp_avg_sq_row.float().sqrt().add_(eps)
-            row_scale = exp_avg_row.float() / denom
-            update = grad_float * row_scale
-            p.add_(update.to(p.dtype), alpha=-lr)
+            correction1 = 1.0 - beta1 ** state['step']
+            correction2 = 1.0 - beta2 ** state['step']
+            update = exp_avg.float() / denom
+            p.add_(update.to(p.dtype), alpha=-lr * correction2 ** .5 / max(correction1, 1e-8))
 
     def _step_adamw_group(self, group: dict, params: Sequence[torch.nn.Parameter]) -> None:
         lr = float(group.get("lr", 1e-3))
@@ -653,9 +684,7 @@ class PrecisionAdaptiveHierarchicalOptimizer(torch.optim.Optimizer):
         nested_update_due = self._nested_group_update_due(group)
 
         for p in params:
-            if p.grad is None:
-                continue
-            grad = self._nested_prepare_grad(group, p, p.grad.detach(), update_due=nested_update_due)
+            grad = self._nested_prepare_grad(group, p, None if p.grad is None else p.grad.detach(), update_due=nested_update_due)
             if grad is None:
                 continue
             if grad.is_sparse:

@@ -41,7 +41,14 @@ class PrismalWaveConfig:
     signature_component_buckets: int = 8192
     use_bounded_identity_readout: bool = False
     use_native_question_memory: bool = False
+    qa_readout_route: str = 'legacy'
+    qa_generation_profile: str = 'legacy'
+    native_question_memory_framing: str = 'legacy'
+    native_question_memory_events: str = 'legacy'
     native_question_memory_capacity: int = 128
+    native_question_memory_representation: str = 'legacy_gru_v1'
+    native_question_memory_backbone_context: str = 'completed_line_v1'
+    native_question_memory_copy_context: str = 'retrieved_v1'
     native_question_memory_question_capacity: int = 32
     native_question_memory_span_readout: bool = False
     native_question_memory_stable_span_gate: bool = False
@@ -54,6 +61,11 @@ class PrismalWaveConfig:
     native_question_memory_semantic_prior_scaling: bool = False
     native_question_memory_semantic_decisions: bool = False
     native_question_memory_conditional_copy: bool = False
+    native_question_memory_semantic_structure: bool = False
+    native_question_memory_question_attention: bool = False
+    native_question_memory_question_attention_stage: str = 'post_context'
+    native_question_memory_normalized_fusion: bool = False
+    native_question_memory_fusion_experts: str = 'legacy_semantic_v1'
     native_question_memory_matcher: str = 'combined_v1'
     native_question_memory_batch_encoders: bool = False
     native_question_memory_document_context: bool = False
@@ -406,6 +418,52 @@ class PrismalWaveConfig:
     eos_id: int = 2
 
     def __post_init__(self) -> None:
+        if self.native_question_memory_framing not in {'legacy', 'blocks_v1'}:
+            raise ValueError('Unknown native QA framing policy')
+        if self.native_question_memory_events not in {'legacy', 'causal_clause_v2'}:
+            raise ValueError('Unknown native QA event policy')
+        if (self.native_question_memory_framing != 'legacy' or self.native_question_memory_events != 'legacy') and not (
+            self.use_native_question_memory and self.native_question_memory_representation == 'backbone_context_v1'
+        ):
+            raise ValueError('Explicit native framing/events require backbone question memory')
+        if self.native_question_memory_copy_context not in {'retrieved_v1','observed_mean_v1'}:
+            raise ValueError('Unknown native copy confidence context policy')
+        if self.native_question_memory_copy_context != 'retrieved_v1' and not (
+            self.native_question_memory_representation == 'backbone_context_v1'
+            and self.native_question_memory_stable_span_gate and self.native_question_memory_conditional_copy
+        ):
+            raise ValueError('Observed copy confidence requires backbone representation and stable conditional copying')
+        if self.native_question_memory_backbone_context not in {'completed_line_v1','candidate_local_clause_v1'}:
+            raise ValueError('Unknown native backbone key context policy')
+        if self.native_question_memory_backbone_context != 'completed_line_v1' and self.native_question_memory_representation != 'backbone_context_v1':
+            raise ValueError('Candidate-local context requires the backbone native representation')
+        if self.native_question_memory_representation not in {'legacy_gru_v1','backbone_context_v1'}:
+            raise ValueError('Unknown native question representation')
+        if self.native_question_memory_representation == 'backbone_context_v1':
+            if not (self.use_native_question_memory and self.native_question_memory_span_readout and self.qa_readout_route == 'native'):
+                raise ValueError('Backbone question representation requires native memory, spans and a saved native route')
+            if self.native_question_memory_semantic_alignment or self.native_question_memory_semantic_prior_scaling or self.native_question_memory_semantic_decisions:
+                raise ValueError('Backbone question representation replaces the independent semantic encoder; disable its legacy flags explicitly')
+            if self.grounded_qa_span_loss_weight:
+                raise ValueError('Identity span supervision is incompatible with backbone native mode; use live native source targets')
+        if self.native_question_memory_question_attention_stage not in {'post_context','pre_context'}:
+            raise ValueError('Unknown question attention stage')
+        if self.native_question_memory_question_attention_stage == 'pre_context' and not self.native_question_memory_question_attention:
+            raise ValueError('Pre-context conditioning requires question attention')
+        if self.native_question_memory_fusion_experts not in {'legacy_semantic_v1','corrected_legacy_v1'}:
+            raise ValueError('Unknown native source fusion experts')
+        if self.qa_generation_profile not in {'legacy','native_qa_eval_v1'}:
+            raise ValueError('Unknown QA generation profile')
+        if self.qa_readout_route not in {'legacy', 'native', 'identity', 'backbone'}:
+            raise ValueError('Unknown QA readout route')
+        if self.qa_readout_route == 'native' and not self.use_native_question_memory:
+            raise ValueError('Native QA route requires native question memory')
+        if self.qa_readout_route == 'identity' and not self.use_bounded_identity_readout:
+            raise ValueError('Identity QA route requires bounded identity readout')
+        if any((self.native_question_memory_semantic_structure,
+                self.native_question_memory_question_attention,
+                self.native_question_memory_normalized_fusion)) and not self.native_question_memory_semantic_alignment:
+            raise ValueError('Semantic experiment features require semantic alignment')
         if self.native_question_memory_capacity < 1 or self.native_question_memory_question_capacity < 1:
             raise ValueError('Native question memory capacities must be positive')
         if self.native_question_memory_span_words < 1 or self.native_question_memory_span_starts < 1:

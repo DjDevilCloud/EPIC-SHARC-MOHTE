@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 try:
+    from .qa_generation import resolve_generation_options
     from .native_question_memory import NativeQuestionMemory
     from .signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor, BoundedIdentityReadout
     from .config import PrismalWaveConfig
@@ -27,6 +28,7 @@ try:
     from .hierarchical_precision import HierarchicalPrecisionPolicy, HierarchicalPrecisionSpec, attach_precision_policy, current_precision_spec, dtype_name, is_float8_dtype
     from .quantization import QuantizationConfig, create_quantized_embedding, create_quantized_linear
 except ImportError:  # pragma: no cover - supports direct script launching.
+    from qa_generation import resolve_generation_options
     from native_question_memory import NativeQuestionMemory
     from signature_bank import SharedSignatureBank, SignatureBankView, SignatureSpanMemory, VerifiedSpanCursor, BoundedIdentityReadout
     from config import PrismalWaveConfig
@@ -2407,7 +2409,8 @@ class DynamicPositionEmbedding(nn.Module):
         if new_size <= self.embedding.num_embeddings:
             return
         old_embedding = self.embedding
-        new_embedding = self._make_embedding(new_size).to(old_embedding.weight.device)
+        new_embedding = self._make_embedding(new_size).to(device=old_embedding.weight.device, dtype=old_embedding.weight.dtype)
+        new_embedding.requires_grad_(old_embedding.weight.requires_grad)
         with torch.no_grad():
             dense_weight = new_embedding.weight.detach()
             dense_weight[: old_embedding.num_embeddings].copy_(old_embedding.weight.detach())
@@ -5435,6 +5438,8 @@ class PrismalWaveOutput:
     runtime_signature_state: Optional[list] = None
     bounded_identity_state: Optional[list] = None
     readout_hidden: Optional[torch.Tensor] = None
+    qa_diagnostics: Optional[list] = None
+    native_qa_readouts: Optional[list] = None
 
 
 @dataclass
@@ -6400,6 +6405,7 @@ class PrismalWaveModel(nn.Module):
         self.cfg = cfg
         if cfg.use_native_question_memory and (not cfg.use_torus_core or not cfg.use_signature_lattice_attention or not cfg.use_signature_lattice_generation_cache):
             raise ValueError('Native question memory requires the torus and carried signature lattice state.')
+        self._native_context_revision = 0
         self.native_question_memory = (NativeQuestionMemory(cfg.d_model, cfg.native_question_memory_capacity, cfg.native_question_memory_question_capacity,
                                        cfg.native_question_memory_span_readout, cfg.native_question_memory_span_words, cfg.native_question_memory_span_starts,
                                        cfg.native_question_memory_lexical_cues, cfg.native_question_memory_future_context, cfg.native_question_memory_anchor_words,
@@ -6410,7 +6416,13 @@ class PrismalWaveModel(nn.Module):
                                        cfg.native_question_memory_relation_alignment, cfg.native_question_memory_source_roles,
                                        cfg.native_question_memory_owner_evidence, cfg.native_question_memory_marker_endpoints,
                                        cfg.native_question_memory_semantic_alignment, cfg.native_question_memory_semantic_prior_scaling,
-                                       cfg.native_question_memory_semantic_decisions, cfg.native_question_memory_conditional_copy)
+                                       cfg.native_question_memory_semantic_decisions, cfg.native_question_memory_conditional_copy,
+                                       cfg.native_question_memory_semantic_structure, cfg.native_question_memory_question_attention,
+                                       cfg.native_question_memory_normalized_fusion,cfg.native_question_memory_fusion_experts,
+                                       cfg.native_question_memory_question_attention_stage, cfg.native_question_memory_representation,
+                                       cfg.native_question_memory_backbone_context,
+                                       cfg.native_question_memory_copy_context,
+                                       cfg.native_question_memory_framing, cfg.native_question_memory_events)
                                        if cfg.use_native_question_memory else None)
         self.signature_level_to_id = dict(SIGNATURE_LEVEL_IDS)
         self.signature_relation_to_id = dict(SIGNATURE_RELATION_IDS)
@@ -6690,13 +6702,56 @@ class PrismalWaveModel(nn.Module):
 
     def _build_signature_lattice_attention(self) -> SignatureLatticeAttention:
         module = SignatureLatticeAttention(self.cfg, quantization_config=self.quantization_config, shared_bank=self.shared_signature_bank)
-        module.to(device=self._lazy_attention_device())
+        reference = next(self.construction_embedding.parameters())
+        module.to(device=reference.device, dtype=reference.dtype)
+        module.train(self.training)
         return module
+
+    def invalidate_native_context(self):
+        """Call after external weight changes before reusing request-local state."""
+        self._native_context_revision = getattr(self,'_native_context_revision',0) + 1
+
+    def train(self, mode=True):
+        changed=self.training!=mode
+        result=super().train(mode)
+        if changed:
+            self.invalidate_native_context()
+        return result
+
+    def _apply(self, fn, recurse=True):
+        result=super()._apply(fn,recurse=recurse)
+        self.invalidate_native_context()
+        return result
 
     def _build_token_memory_attention(self) -> TokenMemoryCrossAttention:
         module = TokenMemoryCrossAttention(self.cfg, quantization_config=self.quantization_config)
-        module.to(device=self._lazy_attention_device())
+        reference = next(self.construction_embedding.parameters())
+        module.to(device=reference.device, dtype=reference.dtype)
+        module.train(self.training)
         return module
+
+    def unmaterialized_parameter_modules(self):
+        """Inspect enabled lazy modules without allocating their parameters."""
+        pending = []
+        for prefix, owner in self.named_modules():
+            if not isinstance(owner, PrismalWaveModel):
+                continue
+            for name, enabled in (('signature_lattice_attention', owner._signature_lattice_attention_enabled),
+                                  ('token_memory_attention', owner._token_memory_attention_enabled)):
+                if enabled and name not in owner._modules:
+                    pending.append((prefix + '.' if prefix else '') + name)
+        return pending
+
+    def materialize_enabled_modules(self):
+        """Finalize enabled attention parameters before freezing/building an optimizer."""
+        created = self.unmaterialized_parameter_modules()
+        for owner in tuple(self.modules()):
+            if isinstance(owner, PrismalWaveModel):
+                if owner._signature_lattice_attention_enabled:
+                    _ = owner.signature_lattice_attention
+                if owner._token_memory_attention_enabled:
+                    _ = owner.token_memory_attention
+        return created
 
     @property
     def signature_lattice_attention(self) -> Optional[SignatureLatticeAttention]:
@@ -6728,6 +6783,7 @@ class PrismalWaveModel(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        self.invalidate_native_context()
         signature_lattice_prefix = prefix + "signature_lattice_attention."
         token_memory_prefix = prefix + "token_memory_attention."
         if self._signature_lattice_attention_enabled and any(key.startswith(signature_lattice_prefix) for key in state_dict):
@@ -8882,6 +8938,12 @@ class PrismalWaveModel(nn.Module):
                 }
             )
         path_stats.update(lattice_stats)
+        path_stats['sharc_router_enabled'] = hidden.new_tensor(float(self.router is not None and self.use_torus_sharc_router)).detach()
+        if collect_telemetry:
+            # Keep augmentation statistics separate from torus emitter losses.
+            # They originate in this path scope, rather than the outer forward.
+            path_stats.update({f'sharc_router_{key}': value.detach() for key,value in router_aug_stats.items()
+                               if torch.is_tensor(value) and value.numel() == 1})
         if chunk_solver_iterations:
             path_stats["fixed_point_iterations"] = torch.stack(chunk_solver_iterations).mean().detach()
         if chunk_solver_residuals:
@@ -8975,6 +9037,7 @@ class PrismalWaveModel(nn.Module):
         path_signature_lattice_candidate_count: List[torch.Tensor] = []
         path_signature_lattice_enabled: List[torch.Tensor] = []
         path_mot_active_experts: List[torch.Tensor] = []
+        path_sharc_router_stats: Dict[str, List[torch.Tensor]] = {}
         recursive_stat_terms: Dict[str, List[torch.Tensor]] = {}
         path_vram_terms: Dict[str, List[torch.Tensor]] = {}
         aggregate_vram: Dict[str, float] = {}
@@ -9100,6 +9163,8 @@ class PrismalWaveModel(nn.Module):
                 if "specialist_family_specialist_gate_mean" in path_stats:
                     path_family_gate_means.append(path_stats["specialist_family_specialist_gate_mean"].float())
             for key, value in path_stats.items():
+                if key.startswith('sharc_router_') and torch.is_tensor(value) and value.numel() == 1:
+                    path_sharc_router_stats.setdefault(key,[]).append(value.detach().float().reshape(()))
                 if collect_telemetry and key.startswith("recursive_") and torch.is_tensor(value) and value.numel() == 1:
                     recursive_stat_terms.setdefault(key, []).append(value.detach().float().reshape(()))
                 if profile_vram and key.startswith("vram_") and torch.is_tensor(value) and value.numel() == 1:
@@ -9471,16 +9536,8 @@ class PrismalWaveModel(nn.Module):
                     ).detach(),
                 }
             )
-        sharc_router_aug_stats = locals().get("router_aug_stats", {})
-        if sharc_router_aug_stats:
-            route_stats.update(sharc_router_aug_stats)
-            for key, value in sharc_router_aug_stats.items():
-                if key.startswith("sharc_router_"):
-                    continue
-                route_stats[f"sharc_router_{key}"] = value.detach() if torch.is_tensor(value) else value
-            route_stats["sharc_router_enabled"] = torch.tensor(1.0, device=input_ids.device)
-        else:
-            route_stats["sharc_router_enabled"] = torch.tensor(0.0, device=input_ids.device)
+        route_stats.update({key:torch.stack(values).mean() for key,values in path_sharc_router_stats.items()})
+        route_stats.setdefault('sharc_router_enabled',torch.tensor(0.0,device=input_ids.device))
         learned_residency_stats, learned_residency_loss = self._learned_residency_outputs(final_hidden, route_stats)
         route_stats.update(learned_residency_stats)
         residency_controller = self._active_residency_controller()
@@ -9672,9 +9729,24 @@ class PrismalWaveModel(nn.Module):
         self.signature_bucket_vocab_size = new_bucket_vocab_size
         self.cfg.signature_bucket_vocab_size = new_bucket_vocab_size
 
-    def forward(self, input_ids: torch.Tensor, *args, runtime_signature_state=None, bounded_identity_state=None, apply_identity_readout: bool = True, **kwargs):
+    def forward(self, input_ids: torch.Tensor, *args, runtime_signature_state=None, bounded_identity_state=None, apply_identity_readout: bool = True, qa_readout_route=None, return_qa_diagnostics=False, return_native_readouts=False, **kwargs):
+        route = self.cfg.qa_readout_route if qa_readout_route is None else qa_readout_route
+        if route not in {'legacy', 'native', 'identity', 'backbone'}:
+            raise ValueError('Unknown QA readout route')
+        use_native = route == 'native' or (route == 'legacy' and (not apply_identity_readout or self.bounded_identity_readout is None))
+        use_identity = route == 'identity' or (route == 'legacy' and apply_identity_readout and self.bounded_identity_readout is not None)
+        if route == 'native' and self.native_question_memory is None:
+            raise ValueError('Native QA route requires native question memory')
+        if route == 'identity' and self.bounded_identity_readout is None:
+            raise ValueError('Identity QA route requires bounded identity readout')
         states = None
         carried_native_state = getattr(kwargs.get('signature_lattice_state'), 'native_question_state', None)
+        context_generation=(id(self),getattr(self,'_native_context_revision',0))
+        if self.native_question_memory is not None and self.native_question_memory.representation=='backbone_context_v1':
+            context_generation=context_generation+(self.native_question_memory.backbone_context,self.native_question_memory.copy_context,self.native_question_memory.framing,self.native_question_memory.events)
+        if use_native and self.native_question_memory is not None and self.native_question_memory.representation=='backbone_context_v1' and carried_native_state is not None:
+            if any(state.context_generation!=context_generation for state in carried_native_state):
+                raise ValueError('Native backbone context is stale or belongs to another producer; rebuild the observed prefix')
         if self.shared_signature_bank is not None and self.shared_signature_bank.runtime_enabled:
             if args:
                 raise ValueError('Runtime signatures require hierarchy arguments by keyword.')
@@ -9685,19 +9757,22 @@ class PrismalWaveModel(nn.Module):
             kwargs['hierarchy_vectors'] = features
         output = self._forward_impl(input_ids, *args, **kwargs)
         output.runtime_signature_state = states
-        if self.native_question_memory is not None and (not apply_identity_readout or self.bounded_identity_readout is None):
+        if self.native_question_memory is not None and use_native:
             native_hidden, native_state, native_readout = self.native_question_memory(input_ids, output.readout_hidden, self.construction_embedding,
-                getattr(self, '_prismal_tokenizer', None), carried_native_state, return_readout=True)
+                getattr(self, '_prismal_tokenizer', None), carried_native_state, return_readout=True, diagnostics=return_qa_diagnostics,
+                context_generation=context_generation)
             output.logits = self._construction_logits_from_guided(native_hidden)
             if self.native_question_memory.span_readout is not None:
-                output.logits = self.native_question_memory.span_readout.mix(output.logits, native_readout)
+                output.qa_diagnostics = [] if return_qa_diagnostics else None
+                output.logits = self.native_question_memory.span_readout.mix(output.logits, native_readout, diagnostics=output.qa_diagnostics)
             if output.signature_lattice_state is None and not self.training:
                 raise ValueError('Native question memory did not receive a carried lattice state.')
             if output.signature_lattice_state is not None:
                 output.signature_lattice_state.native_question_state = native_state
-            if not apply_identity_readout or self.bounded_identity_readout is None:
-                output.readout_hidden = native_hidden
-        if apply_identity_readout and self.bounded_identity_readout is not None:
+            output.readout_hidden = native_hidden
+            if return_native_readouts:
+                output.native_qa_readouts = native_readout
+        if use_identity:
             binding_args = ({'lexical_embeddings': self.construction_embedding}
                             if self.bounded_identity_readout.binding_enabled else {})
             output.logits, output.bounded_identity_state = self.bounded_identity_readout(
@@ -10169,11 +10244,14 @@ class PrismalWaveModel(nn.Module):
         position_index: int = 0,
         runtime_signature_state: Optional[list] = None,
         bounded_identity_state: Optional[list] = None,
+        qa_readout_route: Optional[str] = None,
+        return_qa_diagnostics: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, PrismalWaveOutput]:
         if (self.cfg.signature_representation in {'compositional_v2', 'compositional_v3'}
                 and position_index > 0 and runtime_signature_state is None):
             raise ValueError('Carry output.runtime_signature_state between incremental runtime-signature calls.')
-        if self.bounded_identity_readout is not None and position_index > 0 and bounded_identity_state is None:
+        route = self.cfg.qa_readout_route if qa_readout_route is None else qa_readout_route
+        if route in {'legacy', 'identity'} and self.bounded_identity_readout is not None and position_index > 0 and bounded_identity_state is None:
             raise ValueError('Carry output.bounded_identity_state between incremental identity-readout calls.')
         output = self.forward(
             input_ids,
@@ -10190,6 +10268,8 @@ class PrismalWaveModel(nn.Module):
             position_index=position_index,
             runtime_signature_state=runtime_signature_state,
             bounded_identity_state=bounded_identity_state,
+            qa_readout_route=qa_readout_route,
+            return_qa_diagnostics=return_qa_diagnostics,
         )
         logits = output.logits[:, -1, :]
         next_slot_state = output.slot_state if output.slot_state is not None else slot_state
@@ -11213,7 +11293,21 @@ class PrismalWaveModel(nn.Module):
         loss_mask: Optional[torch.Tensor] = None,
         superposition_bag_size: int = 1,
         collect_telemetry: bool = True,
+        native_source_targets: Optional[list] = None,
+        native_source_weight: float = 1.0,
+        native_replay_targets: Optional[list] = None,
+        native_replay_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, PrismalWaveOutput]:
+        if native_replay_targets is not None:
+            if not native_source_targets or loss_mask is None or native_source_weight <= 0:
+                raise ValueError('Live native replay requires source labels, positive source weight and an output mask')
+            if not math.isfinite(native_replay_weight) or native_replay_weight < 0:
+                raise ValueError('Native replay weight must be finite and nonnegative')
+        if native_source_targets is not None:
+            if self.native_question_memory is None or self.native_question_memory.representation != 'backbone_context_v1':
+                raise ValueError('Live native source targets require backbone_context_v1')
+            if not math.isfinite(native_source_weight) or native_source_weight<0:
+                raise ValueError('Native source weight must be finite and nonnegative')
         superposition_bag_size = max(1, int(superposition_bag_size))
         use_superposition = (
             bool(getattr(self.cfg, "use_token_superposition_training", False))
@@ -11222,6 +11316,8 @@ class PrismalWaveModel(nn.Module):
         )
         if use_superposition and self.cfg.signature_representation in {'compositional_v2', 'compositional_v3'}:
             raise ValueError('Runtime signatures require individual token transitions; use superposition_bag_size=1.')
+        if use_superposition and native_source_targets is not None:
+            raise ValueError('Explicit native source targets require individual token transitions')
         if use_superposition:
             superposition = self._build_superposition_batch(
                 input_ids,
@@ -11276,6 +11372,7 @@ class PrismalWaveModel(nn.Module):
                 hierarchy_vectors=hierarchy_vectors,
                 loss_mask=loss_mask,
                 collect_telemetry=collect_telemetry,
+                **({'return_native_readouts': True} if native_source_targets is not None else {}),
             )
             token_losses = F.cross_entropy(
                 output.logits.reshape(-1, output.logits.size(-1)),
@@ -11315,6 +11412,29 @@ class PrismalWaveModel(nn.Module):
             output.route_stats.update(qa_stats)
             output.route_stats['aux_grounded_qa_span_term']=qa_weight*qa_loss.detach()
             if 'aux_loss_total' in output.route_stats:output.route_stats['aux_loss_total']=output.aux_loss.detach()
+        if native_source_targets is not None:
+            try:
+                from .native_training_objectives import native_source_supervision
+            except ImportError:
+                from native_training_objectives import native_source_supervision
+            source_loss=native_source_supervision(output.native_qa_readouts,native_source_targets)
+            output.aux_loss=output.aux_loss+native_source_weight*source_loss
+            output.route_stats['supervised_native_source_term']=(native_source_weight*source_loss).detach()
+            output.route_stats['supervised_native_source_examples']=source_loss.new_tensor(len(native_source_targets))
+            output.route_stats['aux_loss_total']=output.aux_loss.detach()
+        if native_replay_targets is not None:
+            try:
+                from .native_live_replay import live_replay, balanced_output_ce, boundary_ids
+            except ImportError:
+                from native_live_replay import live_replay, balanced_output_ce, boundary_ids
+            ce = balanced_output_ce(token_losses, labels, loss_mask, self.cfg.pad_id, boundary_ids(self._prismal_tokenizer))
+            replay_loss, replay_stats = live_replay(self, output, input_ids, labels, loss_mask,
+                                                  native_source_targets, native_replay_targets)
+            output.aux_loss = output.aux_loss + native_replay_weight * replay_loss
+            for name, value in replay_stats.items():
+                output.route_stats['native_replay_' + name] = torch.as_tensor(value, device=ce.device).detach()
+            output.route_stats['native_replay_term'] = (native_replay_weight * replay_loss).detach()
+            output.route_stats['aux_loss_total'] = output.aux_loss.detach()
         loss = ce + output.aux_loss
         output.ce_loss = ce.detach()
         # Registry birth/activity statistics are training observations, not a
@@ -11341,13 +11461,13 @@ class PrismalWaveModel(nn.Module):
         parent_signature_ids: Optional[torch.Tensor] = None,
         hierarchy_vectors: Optional[torch.Tensor] = None,
         slot_state: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 64,
-        min_new_tokens: int = 1,
-        top_k: int = 0,
-        top_p: float = 1.0,
-        temperature: float = 1.0,
-        repetition_penalty: float = 1.08,
-        no_repeat_ngram_size: int = 4,
+        max_new_tokens: Optional[int] = None,
+        min_new_tokens: Optional[int] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        temperature: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None,
         token_signature_lookup: Optional[Dict[int, int]] = None,
         token_family_lookup: Optional[Dict[int, int]] = None,
         token_level_lookup: Optional[Dict[int, int]] = None,
@@ -11355,13 +11475,24 @@ class PrismalWaveModel(nn.Module):
         suppressed_token_ids: Optional[Sequence[int]] = None,
         recommit_interval: int = 0,
         recommit_signature_threshold: float = 0.65,
-        beam_size: int = 1,
+        beam_size: Optional[int] = None,
         use_speculative_decoding: Optional[bool] = None,
         speculative_draft_tokens: Optional[int] = None,
         speculative_temperature: Optional[float] = None,
         signature_lattice_state: Optional[SignatureLatticeState] = None,
         token_memory_state: Optional[TokenMemoryState] = None,
+        qa_generation_profile: Optional[str] = None,
     ) -> torch.Tensor:
+        profile = self.cfg.qa_generation_profile if qa_generation_profile is None else qa_generation_profile
+        options, self.last_generation_settings = resolve_generation_options(profile, dict(
+            max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens, top_k=top_k, top_p=top_p,
+            temperature=temperature, repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size, beam_size=beam_size,
+            use_speculative_decoding=use_speculative_decoding))
+        max_new_tokens, min_new_tokens = options['max_new_tokens'], options['min_new_tokens']
+        top_k, top_p, temperature = options['top_k'], options['top_p'], options['temperature']
+        repetition_penalty, no_repeat_ngram_size = options['repetition_penalty'], options['no_repeat_ngram_size']
+        beam_size, use_speculative_decoding = options['beam_size'], options['use_speculative_decoding']
         _validate_aligned_signature_tensors(
             input_ids,
             signature_family_ids=signature_family_ids,
